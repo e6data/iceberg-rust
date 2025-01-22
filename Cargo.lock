@@ -2958,6 +2958,8 @@ name = "iceberg-catalog-glue"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
  "async-trait",
  "aws-config",
  "aws-sdk-glue",
@@ -2965,6 +2967,7 @@ dependencies = [
  "iceberg",
  "iceberg_test_utils",
  "log",
+ "parquet",
  "port_scanner",
  "serde_json",
  "tokio",

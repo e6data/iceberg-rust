@@ -19,40 +19,50 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use ctor::{ctor, dtor};
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::transaction::Transaction;
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, Namespace, NamespaceIdent, Result, TableCreation, TableIdent};
 use iceberg_catalog_glue::{
     GlueCatalog, GlueCatalogConfig, AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY,
 };
 use iceberg_test_utils::docker::DockerCompose;
 use iceberg_test_utils::{normalize_test_name, set_up};
+use parquet::file::properties::WriterProperties;
 use port_scanner::scan_port_addr;
 use tokio::time::sleep;
+use uuid::Uuid;
 
 const GLUE_CATALOG_PORT: u16 = 5000;
 const MINIO_PORT: u16 = 9000;
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
 
-#[ctor]
-fn before_all() {
-    let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
-    let docker_compose = DockerCompose::new(
-        normalize_test_name(module_path!()),
-        format!("{}/testdata/glue_catalog", env!("CARGO_MANIFEST_DIR")),
-    );
-    docker_compose.run();
-    guard.replace(docker_compose);
-}
-
-#[dtor]
-fn after_all() {
-    let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
-    guard.take();
-}
+// #[ctor]
+// fn before_all() {
+//     let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
+//     let docker_compose = DockerCompose::new(
+//         normalize_test_name(module_path!()),
+//         format!("{}/testdata/glue_catalog", env!("CARGO_MANIFEST_DIR")),
+//     );
+//     docker_compose.run();
+//     guard.replace(docker_compose);
+// }
+//
+// #[dtor]
+// fn after_all() {
+//     let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
+//     guard.take();
+// }
 
 async fn get_catalog() -> GlueCatalog {
     set_up();
@@ -362,6 +372,167 @@ async fn test_list_namespace() -> Result<()> {
 
     let empty_result = catalog.list_namespaces(Some(&namespace)).await?;
     assert!(empty_result.is_empty());
+
+    Ok(())
+}
+
+// fn get_external_glue_catalog() -> (GlueCatalog, String, String) {
+//     let hms_ip = Ipv4Addr::new(44, 196, 250, 225);
+//     let hms_socket_addr = SocketAddr::new(IpAddr::V4(hms_ip), 9083);
+//
+//     let warehouse = String::from("s3a://kafka-testing-files/iceberg_glue_test");
+//
+//     let catalog_config = HmsCatalogConfig::builder()
+//         // .address(hive_catalog_addr.to_string())
+//         .address(hms_socket_addr.to_string())
+//         .warehouse(warehouse)
+//         .thrift_transport(HmsThriftTransport::Buffered)
+//         .props(HashMap::from([
+//             (
+//                 "s3.endpoint".to_string(),
+//                 "https://s3.us-east-1.amazonaws.com/".to_string(),
+//             ),
+//             ("s3.region".to_string(), "us-east-1".to_string()),
+//             ("s3.access-key-id".to_string(), "adming".to_string()),
+//             ("s3.secret-access-key".to_string(), "password".to_string()),
+//         ]))
+//         .build();
+//
+//     let catalog = HmsCatalog::new(catalog_config).expect("could not create catalog");
+//
+//     (
+//         catalog,
+//         String::from("risingwave_iceberg_hive"),
+//         String::from("local_auth_t1"),
+//     )
+// }
+
+async fn get_internal_glue_catalog() -> (GlueCatalog, String, String) {
+    let warehouse = String::from("s3a://kafka-testing-files/iceberg_glue_test");
+
+    let props = HashMap::from([]); // TODO: fill this
+
+    let catalog_config = GlueCatalogConfig::builder()
+        .warehouse(warehouse)
+        .props(props)
+        .build();
+
+    let catalog = GlueCatalog::new(catalog_config)
+        .await
+        .expect("could not create catalog");
+
+    (catalog, String::from("ns"), String::from("local_t1"))
+}
+
+#[tokio::test]
+async fn test_load_qh_table() -> Result<()> {
+    let (catalog, namespace, tbl_name) = get_internal_glue_catalog().await;
+
+    let namespace_id = NamespaceIdent::new(namespace);
+
+    let result = catalog
+        .load_table(&TableIdent::new(namespace_id.clone(), tbl_name))
+        .await?;
+
+    println!("DEBUG: result identifier: {:?}", result.identifier());
+    println!(
+        "DEBUG: result metadata location: {:?}",
+        result.metadata_location()
+    );
+    println!("DEBUG: result metadata: {:?}", result.metadata());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_write_table() -> Result<()> {
+    let (catalog, namespace, tbl_name) = get_internal_glue_catalog().await;
+
+    let namespace_id = NamespaceIdent::new(namespace);
+
+    let table_id = TableIdent::new(namespace_id, tbl_name);
+
+    let table = catalog
+        .load_table(&table_id)
+        .await
+        .expect("could not load table");
+
+    // =====================
+
+    let schema: Arc<arrow_schema::Schema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
+
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let file_name_generator = DefaultFileNameGenerator::new(
+        Uuid::new_v4().to_string(),
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::default(),
+        table.metadata().current_schema().clone(),
+        table.file_io().clone(),
+        location_generator.clone(),
+        file_name_generator.clone(),
+    );
+
+    let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None);
+    let mut data_file_writer = data_file_writer_builder.build().await.unwrap();
+    let col1 = Int32Array::from(vec![Some(0), Some(1), Some(2)]);
+    let col2 = StringArray::from(vec![Some("foo"), Some("bar"), Some("baz")]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![
+        Arc::new(col1) as ArrayRef,
+        Arc::new(col2) as ArrayRef,
+    ])
+    .unwrap();
+
+    data_file_writer.write(batch.clone()).await.unwrap();
+    let data_file = data_file_writer.close().await.unwrap();
+
+    let tx = Transaction::new(&table);
+    let mut append_action = tx.fast_append(None, vec![]).unwrap();
+    append_action.add_data_files(data_file.clone()).unwrap();
+    let tx = append_action.apply().await.unwrap();
+    let _ = tx.commit(&catalog).await.unwrap();
+
+    // =====================
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_ns() -> Result<()> {
+    let (catalog, ns, _) = get_internal_glue_catalog().await;
+
+    let properties = HashMap::from([("key1".into(), "value1".into())]);
+    let namespace = NamespaceIdent::new(ns.into());
+
+    catalog.create_namespace(&namespace, properties).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_tbl() -> Result<()> {
+    let (catalog, ns, table_name) = get_internal_glue_catalog().await;
+    let namespace = NamespaceIdent::new(ns);
+
+    let creation = set_table_creation("s3a://kafka-testing-files/iceberg_glue_test", table_name)?;
+
+    let result = catalog.create_table(&namespace, creation).await?;
+
+    println!(">>>> DEBUG: name: {:?}", result.identifier().name());
+    println!(
+        ">>>> DEBUG: metadata location: {:?}",
+        result.metadata_location()
+    );
 
     Ok(())
 }

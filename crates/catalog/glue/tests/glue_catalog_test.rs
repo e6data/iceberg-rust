@@ -425,7 +425,7 @@ async fn get_internal_glue_catalog() -> (GlueCatalog, String, String) {
 }
 
 #[tokio::test]
-async fn test_load_qh_table() -> Result<()> {
+async fn test_load_tbl() -> Result<()> {
     let (catalog, namespace, tbl_name) = get_internal_glue_catalog().await;
 
     let namespace_id = NamespaceIdent::new(namespace);
@@ -524,7 +524,10 @@ async fn test_create_tbl() -> Result<()> {
     let (catalog, ns, table_name) = get_internal_glue_catalog().await;
     let namespace = NamespaceIdent::new(ns);
 
-    let creation = set_table_creation("s3a://kafka-testing-files/iceberg_glue_test", table_name)?;
+    let creation = set_table_creation(
+        format!("s3a://kafka-testing-files/iceberg_glue_test/{}", table_name),
+        table_name,
+    )?;
 
     let result = catalog.create_table(&namespace, creation).await?;
 

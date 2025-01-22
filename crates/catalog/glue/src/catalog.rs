@@ -593,10 +593,77 @@ impl Catalog for GlueCatalog {
         }
     }
 
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
+    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
+        // check if table exists
+        let identifier = commit.identifier().clone();
+        if !self.table_exists(&identifier).await? {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("No such table: {:?}", identifier),
+            ));
+        }
+
+        // load table
+        let iceberg_table = self.load_table(&identifier).await?;
+
+        let requirements = commit.take_requirements();
+        let table_updates = commit.take_updates();
+
+        let mut update_table_metadata_builder = TableMetadataBuilder::new_from_metadata(
+            iceberg_table.metadata().clone(),
+            iceberg_table.metadata_location().map(|x| x.to_string()),
+        );
+
+        // apply table updates
+        for table_update in table_updates {
+            update_table_metadata_builder = table_update.apply(update_table_metadata_builder)?;
+        }
+
+        // check table requirements
+        for table_requirement in requirements {
+            table_requirement.check(Some(iceberg_table.metadata()))?;
+        }
+
+        // write new metadata file
+        let tbl_location = iceberg_table.metadata().location();
+        let new_metadata_location = create_metadata_location(
+            &tbl_location,
+            iceberg_table.metadata().next_sequence_number() as i32,
+        )?;
+
+        let file = self.file_io.new_output(&new_metadata_location)?;
+        let update_table_metadata = update_table_metadata_builder.build()?;
+        file.write(serde_json::to_vec(&update_table_metadata.metadata)?.into())
+            .await?;
+
+        let db_name = validate_namespace(iceberg_table.identifier().namespace())?;
+        let tbl_name = iceberg_table.identifier().clone().name().to_string();
+
+        // convert iceberg table to glue table
+        let glue_table = convert_to_glue_table(
+            tbl_name,
+            new_metadata_location.to_string(),
+            &update_table_metadata.metadata,
+            &update_table_metadata.metadata.properties(),
+            iceberg_table.metadata_location().map(|x| x.to_string()),
+        )?;
+
+        // run alter table on hive
+        let update_tbl_res = self
+            .client
+            .0
+            .update_table()
+            .database_name(&db_name)
+            .table_input(glue_table)
+            .send()
+            .await
+            .map_err(from_aws_sdk_error)?;
+
+        Ok(Table::builder()
+            .file_io(self.file_io.clone())
+            .identifier(identifier)
+            .metadata_location(new_metadata_location)
+            .metadata(update_table_metadata.metadata)
+            .build()?)
     }
 }

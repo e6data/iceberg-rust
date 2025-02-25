@@ -633,97 +633,6 @@
 <a href="#633" id="633">633</a>
 <a href="#634" id="634">634</a>
 <a href="#635" id="635">635</a>
-<a href="#636" id="636">636</a>
-<a href="#637" id="637">637</a>
-<a href="#638" id="638">638</a>
-<a href="#639" id="639">639</a>
-<a href="#640" id="640">640</a>
-<a href="#641" id="641">641</a>
-<a href="#642" id="642">642</a>
-<a href="#643" id="643">643</a>
-<a href="#644" id="644">644</a>
-<a href="#645" id="645">645</a>
-<a href="#646" id="646">646</a>
-<a href="#647" id="647">647</a>
-<a href="#648" id="648">648</a>
-<a href="#649" id="649">649</a>
-<a href="#650" id="650">650</a>
-<a href="#651" id="651">651</a>
-<a href="#652" id="652">652</a>
-<a href="#653" id="653">653</a>
-<a href="#654" id="654">654</a>
-<a href="#655" id="655">655</a>
-<a href="#656" id="656">656</a>
-<a href="#657" id="657">657</a>
-<a href="#658" id="658">658</a>
-<a href="#659" id="659">659</a>
-<a href="#660" id="660">660</a>
-<a href="#661" id="661">661</a>
-<a href="#662" id="662">662</a>
-<a href="#663" id="663">663</a>
-<a href="#664" id="664">664</a>
-<a href="#665" id="665">665</a>
-<a href="#666" id="666">666</a>
-<a href="#667" id="667">667</a>
-<a href="#668" id="668">668</a>
-<a href="#669" id="669">669</a>
-<a href="#670" id="670">670</a>
-<a href="#671" id="671">671</a>
-<a href="#672" id="672">672</a>
-<a href="#673" id="673">673</a>
-<a href="#674" id="674">674</a>
-<a href="#675" id="675">675</a>
-<a href="#676" id="676">676</a>
-<a href="#677" id="677">677</a>
-<a href="#678" id="678">678</a>
-<a href="#679" id="679">679</a>
-<a href="#680" id="680">680</a>
-<a href="#681" id="681">681</a>
-<a href="#682" id="682">682</a>
-<a href="#683" id="683">683</a>
-<a href="#684" id="684">684</a>
-<a href="#685" id="685">685</a>
-<a href="#686" id="686">686</a>
-<a href="#687" id="687">687</a>
-<a href="#688" id="688">688</a>
-<a href="#689" id="689">689</a>
-<a href="#690" id="690">690</a>
-<a href="#691" id="691">691</a>
-<a href="#692" id="692">692</a>
-<a href="#693" id="693">693</a>
-<a href="#694" id="694">694</a>
-<a href="#695" id="695">695</a>
-<a href="#696" id="696">696</a>
-<a href="#697" id="697">697</a>
-<a href="#698" id="698">698</a>
-<a href="#699" id="699">699</a>
-<a href="#700" id="700">700</a>
-<a href="#701" id="701">701</a>
-<a href="#702" id="702">702</a>
-<a href="#703" id="703">703</a>
-<a href="#704" id="704">704</a>
-<a href="#705" id="705">705</a>
-<a href="#706" id="706">706</a>
-<a href="#707" id="707">707</a>
-<a href="#708" id="708">708</a>
-<a href="#709" id="709">709</a>
-<a href="#710" id="710">710</a>
-<a href="#711" id="711">711</a>
-<a href="#712" id="712">712</a>
-<a href="#713" id="713">713</a>
-<a href="#714" id="714">714</a>
-<a href="#715" id="715">715</a>
-<a href="#716" id="716">716</a>
-<a href="#717" id="717">717</a>
-<a href="#718" id="718">718</a>
-<a href="#719" id="719">719</a>
-<a href="#720" id="720">720</a>
-<a href="#721" id="721">721</a>
-<a href="#722" id="722">722</a>
-<a href="#723" id="723">723</a>
-<a href="#724" id="724">724</a>
-<a href="#725" id="725">725</a>
-<a href="#726" id="726">726</a>
 </pre></div><pre class="rust"><code><span class="comment">// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -747,8 +656,7 @@
 <span class="kw">use </span>async_trait::async_trait;
 <span class="kw">use </span>aws_sdk_glue::types::TableInput;
 <span class="kw">use </span>iceberg::io::{
-    FileIO, S3_ACCESS_KEY_ID, S3_ASSUME_ROLE_ARN, S3_ASSUME_ROLE_EXTERNAL_ID,
-    S3_ASSUME_ROLE_SESSION_NAME, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
+    FileIO, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
 };
 <span class="kw">use </span>iceberg::spec::{TableMetadata, TableMetadataBuilder};
 <span class="kw">use </span>iceberg::table::Table;
@@ -764,8 +672,7 @@
     create_sdk_config, get_default_table_location, get_metadata_location, validate_namespace,
 };
 <span class="kw">use crate</span>::{
-    with_catalog_id, AWS_ACCESS_KEY_ID, AWS_ASSUME_ROLE_ARN, AWS_ASSUME_ROLE_EXTERNAL_ID,
-    AWS_ASSUME_ROLE_SESSION_NAME, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+    with_catalog_id, AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
 };
 
 <span class="attr">#[derive(Debug, TypedBuilder)]
@@ -828,28 +735,6 @@
         <span class="kw">if </span>!file_io_props.contains_key(S3_ENDPOINT) {
             <span class="kw">if let </span><span class="prelude-val">Some</span>(aws_endpoint) = config.uri.as_ref() {
                 file_io_props.insert(S3_ENDPOINT.to_string(), aws_endpoint.to_string());
-            }
-        }
-        <span class="kw">if </span>!file_io_props.contains_key(S3_ASSUME_ROLE_ARN) {
-            <span class="kw">if let </span><span class="prelude-val">Some</span>(assume_role_arn) = file_io_props.get(AWS_ASSUME_ROLE_ARN) {
-                file_io_props.insert(S3_ASSUME_ROLE_ARN.to_string(), assume_role_arn.to_string());
-            }
-        }
-        <span class="kw">if </span>!file_io_props.contains_key(S3_ASSUME_ROLE_EXTERNAL_ID) {
-            <span class="kw">if let </span><span class="prelude-val">Some</span>(assume_role_external_id) = file_io_props.get(AWS_ASSUME_ROLE_EXTERNAL_ID) {
-                file_io_props.insert(
-                    S3_ASSUME_ROLE_EXTERNAL_ID.to_string(),
-                    assume_role_external_id.to_string(),
-                );
-            }
-        }
-        <span class="kw">if </span>!file_io_props.contains_key(S3_ASSUME_ROLE_SESSION_NAME) {
-            <span class="kw">if let </span><span class="prelude-val">Some</span>(assume_role_session_name) = file_io_props.get(AWS_ASSUME_ROLE_SESSION_NAME)
-            {
-                file_io_props.insert(
-                    S3_ASSUME_ROLE_SESSION_NAME.to_string(),
-                    assume_role_session_name.to_string(),
-                );
             }
         }
 
@@ -1376,78 +1261,11 @@
         }
     }
 
-    <span class="kw">async fn </span>update_table(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="kw-2">mut </span>commit: TableCommit) -&gt; <span class="prelude-ty">Result</span>&lt;Table&gt; {
-        <span class="comment">// check if table exists
-        </span><span class="kw">let </span>identifier = commit.identifier().clone();
-        <span class="kw">if </span>!<span class="self">self</span>.table_exists(<span class="kw-2">&amp;</span>identifier).<span class="kw">await</span><span class="question-mark">? </span>{
-            <span class="kw">return </span><span class="prelude-val">Err</span>(Error::new(
-                ErrorKind::Unexpected,
-                <span class="macro">format!</span>(<span class="string">"No such table: {:?}"</span>, identifier),
-            ));
-        }
-
-        <span class="comment">// load table
-        </span><span class="kw">let </span>iceberg_table = <span class="self">self</span>.load_table(<span class="kw-2">&amp;</span>identifier).<span class="kw">await</span><span class="question-mark">?</span>;
-
-        <span class="kw">let </span>requirements = commit.take_requirements();
-        <span class="kw">let </span>table_updates = commit.take_updates();
-
-        <span class="kw">let </span><span class="kw-2">mut </span>update_table_metadata_builder = TableMetadataBuilder::new_from_metadata(
-            iceberg_table.metadata().clone(),
-            iceberg_table.metadata_location().map(|x| x.to_string()),
-        );
-
-        <span class="comment">// apply table updates
-        </span><span class="kw">for </span>table_update <span class="kw">in </span>table_updates {
-            update_table_metadata_builder = table_update.apply(update_table_metadata_builder)<span class="question-mark">?</span>;
-        }
-
-        <span class="comment">// check table requirements
-        </span><span class="kw">for </span>table_requirement <span class="kw">in </span>requirements {
-            table_requirement.check(<span class="prelude-val">Some</span>(iceberg_table.metadata()))<span class="question-mark">?</span>;
-        }
-
-        <span class="comment">// write new metadata file
-        </span><span class="kw">let </span>tbl_location = iceberg_table.metadata().location();
-        <span class="kw">let </span>new_metadata_location = create_metadata_location(
-            <span class="kw-2">&amp;</span>tbl_location,
-            iceberg_table.metadata().next_sequence_number() <span class="kw">as </span>i32,
-        )<span class="question-mark">?</span>;
-
-        <span class="kw">let </span>file = <span class="self">self</span>.file_io.new_output(<span class="kw-2">&amp;</span>new_metadata_location)<span class="question-mark">?</span>;
-        <span class="kw">let </span>update_table_metadata = update_table_metadata_builder.build()<span class="question-mark">?</span>;
-        file.write(serde_json::to_vec(<span class="kw-2">&amp;</span>update_table_metadata.metadata)<span class="question-mark">?</span>.into())
-            .<span class="kw">await</span><span class="question-mark">?</span>;
-
-        <span class="kw">let </span>db_name = validate_namespace(iceberg_table.identifier().namespace())<span class="question-mark">?</span>;
-        <span class="kw">let </span>tbl_name = iceberg_table.identifier().clone().name().to_string();
-
-        <span class="comment">// convert iceberg table to glue table
-        </span><span class="kw">let </span>glue_table = convert_to_glue_table(
-            tbl_name,
-            new_metadata_location.to_string(),
-            <span class="kw-2">&amp;</span>update_table_metadata.metadata,
-            <span class="kw-2">&amp;</span>update_table_metadata.metadata.properties(),
-            iceberg_table.metadata_location().map(|x| x.to_string()),
-        )<span class="question-mark">?</span>;
-
-        <span class="comment">// run alter table on hive
-        </span><span class="kw">let </span>update_tbl_res = <span class="self">self
-            </span>.client
-            .<span class="number">0
-            </span>.update_table()
-            .database_name(<span class="kw-2">&amp;</span>db_name)
-            .table_input(glue_table)
-            .send()
-            .<span class="kw">await
-            </span>.map_err(from_aws_sdk_error)<span class="question-mark">?</span>;
-
-        <span class="prelude-val">Ok</span>(Table::builder()
-            .file_io(<span class="self">self</span>.file_io.clone())
-            .identifier(identifier)
-            .metadata_location(new_metadata_location)
-            .metadata(update_table_metadata.metadata)
-            .build()<span class="question-mark">?</span>)
+    <span class="kw">async fn </span>update_table(<span class="kw-2">&amp;</span><span class="self">self</span>, _commit: TableCommit) -&gt; <span class="prelude-ty">Result</span>&lt;Table&gt; {
+        <span class="prelude-val">Err</span>(Error::new(
+            ErrorKind::FeatureUnsupported,
+            <span class="string">"Updating a table is not supported yet"</span>,
+        ))
     }
 }
 </code></pre></div></section></main></body></html>

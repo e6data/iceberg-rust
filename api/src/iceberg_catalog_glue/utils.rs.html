@@ -518,28 +518,6 @@
 <a href="#518" id="518">518</a>
 <a href="#519" id="519">519</a>
 <a href="#520" id="520">520</a>
-<a href="#521" id="521">521</a>
-<a href="#522" id="522">522</a>
-<a href="#523" id="523">523</a>
-<a href="#524" id="524">524</a>
-<a href="#525" id="525">525</a>
-<a href="#526" id="526">526</a>
-<a href="#527" id="527">527</a>
-<a href="#528" id="528">528</a>
-<a href="#529" id="529">529</a>
-<a href="#530" id="530">530</a>
-<a href="#531" id="531">531</a>
-<a href="#532" id="532">532</a>
-<a href="#533" id="533">533</a>
-<a href="#534" id="534">534</a>
-<a href="#535" id="535">535</a>
-<a href="#536" id="536">536</a>
-<a href="#537" id="537">537</a>
-<a href="#538" id="538">538</a>
-<a href="#539" id="539">539</a>
-<a href="#540" id="540">540</a>
-<a href="#541" id="541">541</a>
-<a href="#542" id="542">542</a>
 </pre></div><pre class="rust"><code><span class="comment">// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -559,7 +537,6 @@
 
 </span><span class="kw">use </span>std::collections::HashMap;
 
-<span class="kw">use </span>aws_config::sts::AssumeRoleProvider;
 <span class="kw">use </span>aws_config::{BehaviorVersion, Region, SdkConfig};
 <span class="kw">use </span>aws_sdk_glue::config::Credentials;
 <span class="kw">use </span>aws_sdk_glue::types::{Database, DatabaseInput, StorageDescriptor, TableInput};
@@ -594,12 +571,6 @@
 </span><span class="kw">const </span>TABLE_TYPE: <span class="kw-2">&amp;</span>str = <span class="string">"table_type"</span>;
 <span class="doccomment">/// Parameter value `table_type` for `TableInput`
 </span><span class="kw">const </span>ICEBERG: <span class="kw-2">&amp;</span>str = <span class="string">"ICEBERG"</span>;
-<span class="doccomment">/// Parameter assume role ARN
-</span><span class="kw">pub const </span>AWS_ASSUME_ROLE_ARN: <span class="kw-2">&amp;</span>str = <span class="string">"aws_assume_role_arn"</span>;
-<span class="doccomment">/// Parameter assume role ARN's external ID
-</span><span class="kw">pub const </span>AWS_ASSUME_ROLE_EXTERNAL_ID: <span class="kw-2">&amp;</span>str = <span class="string">"aws_assume_role_external_id"</span>;
-<span class="doccomment">/// Parameter assume role ARN's session name
-</span><span class="kw">pub const </span>AWS_ASSUME_ROLE_SESSION_NAME: <span class="kw-2">&amp;</span>str = <span class="string">"aws_assume_role_session_name"</span>;
 
 <span class="doccomment">/// Creates an aws sdk configuration based on
 /// provided properties and an optional endpoint URL.
@@ -635,21 +606,6 @@
     <span class="kw">if let </span><span class="prelude-val">Some</span>(region_name) = properties.get(AWS_REGION_NAME) {
         <span class="kw">let </span>region = Region::new(region_name.clone());
         config = config.region(region);
-    }
-
-    <span class="comment">// assume role
-    </span><span class="kw">if let </span><span class="prelude-val">Some</span>(assume_role_arn) = properties.get(AWS_ASSUME_ROLE_ARN) {
-        <span class="kw">let </span><span class="kw-2">mut </span>builder = AssumeRoleProvider::builder(assume_role_arn);
-
-        <span class="kw">if let </span><span class="prelude-val">Some</span>(assume_role_external_id) = properties.get(AWS_ASSUME_ROLE_EXTERNAL_ID) {
-            builder = builder.external_id(assume_role_external_id);
-        }
-
-        <span class="kw">if let </span><span class="prelude-val">Some</span>(assume_role_session_name) = properties.get(AWS_ASSUME_ROLE_SESSION_NAME) {
-            builder = builder.session_name(assume_role_session_name);
-        }
-
-        config = config.credentials_provider(builder.build().<span class="kw">await</span>);
     }
 
     config.load().<span class="kw">await

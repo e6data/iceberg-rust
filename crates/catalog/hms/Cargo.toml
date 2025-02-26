@@ -41,6 +41,9 @@ tokio = { workspace = true }
 typed-builder = { workspace = true }
 uuid = { workspace = true }
 volo-thrift = { workspace = true }
+parquet = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 
 [dev-dependencies]
 ctor = { workspace = true }

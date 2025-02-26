@@ -2926,6 +2926,8 @@ name = "iceberg-catalog-hms"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
  "async-trait",
  "chrono",
  "ctor",
@@ -2933,6 +2935,7 @@ dependencies = [
  "iceberg",
  "iceberg_test_utils",
  "log",
+ "parquet",
  "pilota",
  "port_scanner",
  "serde_json",

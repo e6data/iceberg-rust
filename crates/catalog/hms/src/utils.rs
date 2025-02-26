@@ -203,6 +203,10 @@ pub(crate) fn convert_to_hive_table(
         last_access_time: Some(current_time_ms),
         sd: Some(storage_descriptor),
         parameters: Some(parameters),
+        // Default of `partition_key` is `None`, but hive converts it into Some(vec[])
+        // and we don't use this field, inferring from here:
+        // https://github.com/apache/iceberg-python/blob/2cd4e789d0fd7d6aab261037e8229ca94c218923/pyiceberg/catalog/hive.py#L320-L334
+        partition_keys: Some(vec![]),
         ..Default::default()
     })
 }

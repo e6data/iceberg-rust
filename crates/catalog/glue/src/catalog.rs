@@ -20,7 +20,10 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 use aws_sdk_glue::types::TableInput;
-use iceberg::io::FileIO;
+use iceberg::io::{
+    FileIO, S3_ACCESS_KEY_ID, S3_ASSUME_ROLE_ARN, S3_ASSUME_ROLE_EXTERNAL_ID,
+    S3_ASSUME_ROLE_SESSION_NAME, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
+};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
@@ -34,7 +37,10 @@ use crate::utils::{
     convert_to_database, convert_to_glue_table, convert_to_namespace, create_metadata_location,
     create_sdk_config, get_default_table_location, get_metadata_location, validate_namespace,
 };
-use crate::with_catalog_id;
+use crate::{
+    with_catalog_id, AWS_ACCESS_KEY_ID, AWS_ASSUME_ROLE_ARN, AWS_ASSUME_ROLE_EXTERNAL_ID,
+    AWS_ASSUME_ROLE_SESSION_NAME, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+};
 
 #[derive(Debug, TypedBuilder)]
 /// Glue Catalog configuration
@@ -69,6 +75,66 @@ impl GlueCatalog {
     /// Create a new glue catalog
     pub async fn new(config: GlueCatalogConfig) -> Result<Self> {
         let sdk_config = create_sdk_config(&config.props, config.uri.as_ref()).await;
+
+        let mut file_io_props = config.props.clone();
+
+        if !file_io_props.contains_key(S3_ACCESS_KEY_ID) {
+            if let Some(access_key_id) = file_io_props.get(AWS_ACCESS_KEY_ID) {
+                file_io_props.insert(S3_ACCESS_KEY_ID.to_string(), access_key_id.to_string());
+            }
+        }
+
+        if !file_io_props.contains_key(S3_SECRET_ACCESS_KEY) {
+            if let Some(secret_access_key) = file_io_props.get(AWS_SECRET_ACCESS_KEY) {
+                file_io_props.insert(
+                    S3_SECRET_ACCESS_KEY.to_string(),
+                    secret_access_key.to_string(),
+                );
+            }
+        }
+
+        if !file_io_props.contains_key(S3_REGION) {
+            if let Some(region) = file_io_props.get(AWS_REGION_NAME) {
+                file_io_props.insert(S3_REGION.to_string(), region.to_string());
+            }
+        }
+
+        if !file_io_props.contains_key(S3_SESSION_TOKEN) {
+            if let Some(session_token) = file_io_props.get(AWS_SESSION_TOKEN) {
+                file_io_props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
+            }
+        }
+
+        if !file_io_props.contains_key(S3_ENDPOINT) {
+            if let Some(aws_endpoint) = config.uri.as_ref() {
+                file_io_props.insert(S3_ENDPOINT.to_string(), aws_endpoint.to_string());
+            }
+        }
+
+        if !file_io_props.contains_key(S3_ASSUME_ROLE_ARN) {
+            if let Some(assume_role_arn) = file_io_props.get(AWS_ASSUME_ROLE_ARN) {
+                file_io_props.insert(S3_ASSUME_ROLE_ARN.to_string(), assume_role_arn.to_string());
+            }
+        }
+
+        if !file_io_props.contains_key(S3_ASSUME_ROLE_EXTERNAL_ID) {
+            if let Some(assume_role_external_id) = file_io_props.get(AWS_ASSUME_ROLE_EXTERNAL_ID) {
+                file_io_props.insert(
+                    S3_ASSUME_ROLE_EXTERNAL_ID.to_string(),
+                    assume_role_external_id.to_string(),
+                );
+            }
+        }
+
+        if !file_io_props.contains_key(S3_ASSUME_ROLE_SESSION_NAME) {
+            if let Some(assume_role_session_name) = file_io_props.get(AWS_ASSUME_ROLE_SESSION_NAME)
+            {
+                file_io_props.insert(
+                    S3_ASSUME_ROLE_SESSION_NAME.to_string(),
+                    assume_role_session_name.to_string(),
+                );
+            }
+        }
 
         let client = aws_sdk_glue::Client::new(&sdk_config);
 
@@ -593,10 +659,89 @@ impl Catalog for GlueCatalog {
         }
     }
 
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
+    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
+        // check if table exists
+
+        let identifier = commit.identifier().clone();
+
+        if !self.table_exists(&identifier).await? {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("No such table: {:?}", identifier),
+            ));
+        }
+
+        // load table
+
+        let iceberg_table = self.load_table(&identifier).await?;
+
+        let requirements = commit.take_requirements();
+
+        let table_updates = commit.take_updates();
+
+        let mut update_table_metadata_builder = TableMetadataBuilder::new_from_metadata(
+            iceberg_table.metadata().clone(),
+            iceberg_table.metadata_location().map(|x| x.to_string()),
+        );
+
+        // apply table updates
+
+        for table_update in table_updates {
+            update_table_metadata_builder = table_update.apply(update_table_metadata_builder)?;
+        }
+
+        // check table requirements
+
+        for table_requirement in requirements {
+            table_requirement.check(Some(iceberg_table.metadata()))?;
+        }
+
+        // write new metadata file
+
+        let tbl_location = iceberg_table.metadata().location();
+
+        let new_metadata_location = create_metadata_location(
+            &tbl_location,
+            iceberg_table.metadata().next_sequence_number() as i32,
+        )?;
+
+        let file = self.file_io.new_output(&new_metadata_location)?;
+
+        let update_table_metadata = update_table_metadata_builder.build()?;
+
+        file.write(serde_json::to_vec(&update_table_metadata.metadata)?.into())
+            .await?;
+
+        let db_name = validate_namespace(iceberg_table.identifier().namespace())?;
+
+        let tbl_name = iceberg_table.identifier().clone().name().to_string();
+
+        // convert iceberg table to glue table
+
+        let glue_table = convert_to_glue_table(
+            tbl_name,
+            new_metadata_location.to_string(),
+            &update_table_metadata.metadata,
+            &update_table_metadata.metadata.properties(),
+            iceberg_table.metadata_location().map(|x| x.to_string()),
+        )?;
+
+        // run alter table on glue
+
+        self.client
+            .0
+            .update_table()
+            .database_name(&db_name)
+            .table_input(glue_table)
+            .send()
+            .await
+            .map_err(from_aws_sdk_error)?;
+
+        Ok(Table::builder()
+            .file_io(self.file_io.clone())
+            .identifier(identifier)
+            .metadata_location(new_metadata_location)
+            .metadata(update_table_metadata.metadata)
+            .build()?)
     }
 }

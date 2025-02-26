@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use aws_config::sts::AssumeRoleProvider;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_glue::config::Credentials;
 use aws_sdk_glue::types::{Database, DatabaseInput, StorageDescriptor, TableInput};
@@ -51,6 +52,12 @@ const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
 const TABLE_TYPE: &str = "table_type";
 /// Parameter value `table_type` for `TableInput`
 const ICEBERG: &str = "ICEBERG";
+/// Parameter assume role ARN
+pub const AWS_ASSUME_ROLE_ARN: &str = "aws_assume_role_arn";
+/// Parameter assume role ARN's external ID
+pub const AWS_ASSUME_ROLE_EXTERNAL_ID: &str = "aws_assume_role_external_id";
+/// Parameter assume role ARN's session name
+pub const AWS_ASSUME_ROLE_SESSION_NAME: &str = "aws_assume_role_session_name";
 
 /// Creates an aws sdk configuration based on
 /// provided properties and an optional endpoint URL.
@@ -86,6 +93,22 @@ pub(crate) async fn create_sdk_config(
     if let Some(region_name) = properties.get(AWS_REGION_NAME) {
         let region = Region::new(region_name.clone());
         config = config.region(region);
+    }
+
+    // assume role
+
+    if let Some(assume_role_arn) = properties.get(AWS_ASSUME_ROLE_ARN) {
+        let mut builder = AssumeRoleProvider::builder(assume_role_arn);
+
+        if let Some(assume_role_external_id) = properties.get(AWS_ASSUME_ROLE_EXTERNAL_ID) {
+            builder = builder.external_id(assume_role_external_id);
+        }
+
+        if let Some(assume_role_session_name) = properties.get(AWS_ASSUME_ROLE_SESSION_NAME) {
+            builder = builder.session_name(assume_role_session_name);
+        }
+
+        config = config.credentials_provider(builder.build().await);
     }
 
     config.load().await

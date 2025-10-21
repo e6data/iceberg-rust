@@ -19,6 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::RangeFrom;
 
+use chrono::format;
+// use anyhow::Ok;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -114,6 +116,7 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    added_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -127,6 +130,7 @@ impl<'a> SnapshotProducer<'a> {
         key_metadata: Option<Vec<u8>>,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        added_delete_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -135,6 +139,7 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
+            added_delete_files,
             manifest_counter: (0..),
         }
     }
@@ -160,6 +165,26 @@ impl<'a> SnapshotProducer<'a> {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Validates that all added delete files have the correct content type.
+    /// Delete files must be either EqualityDeletes or PositionDeletes.
+    pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
+        for delete_file in &self.added_delete_files {
+            let content_type = delete_file.content_type();
+            if content_type != crate::spec::DataContentType::EqualityDeletes
+                && content_type != crate::spec::DataContentType::PositionDeletes
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Delete file must have content type EqualityDeletes or PositionDeletes, got: {:?}",
+                        content_type
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -319,6 +344,43 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    async fn write_added_delete_manifest(&mut self) -> Result<ManifestFile> {
+        //take mem ownership fro it
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        if added_delete_files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No added delete files found when writing manifest file",
+            ));
+        }
+
+        let format_version = self.table.metadata().format_version();
+        if format_version == FormatVersion::V1 {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No delete file can be added for v1 ",
+            ));
+        }
+
+        //loop over delete files
+        //build manifest
+        // check for version greater than 1 || v1 doesnt support delete files
+        //
+        let manifests = added_delete_files.into_iter().map(|delete_file| {
+            let builder = ManifestEntry::builder()
+                .status(crate::spec::ManifestStatus::Added)
+                .data_file(delete_file);
+            builder.build()
+        });
+
+        let mut writer = self.new_manifest_writer(ManifestContentType::Deletes)?;
+        for entry in manifests {
+            writer.add_entry(entry)?;
+        }
+
+        writer.write_manifest_file().await
+    }
+
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
@@ -329,15 +391,22 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.snapshot_properties.is_empty()
+            && self.added_delete_files.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
                 "No added data files or added snapshot properties found when write a manifest file",
             ));
         }
 
-        let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
-        let mut manifest_files = existing_manifests;
+        let mut manifest_files = vec![];
+
+        if !self.added_delete_files.is_empty() {
+            let data_manifest = self.write_added_manifest().await?;
+            manifest_files.push(data_manifest);
+        }
 
         // Process added entries.
         if !self.added_data_files.is_empty() {
@@ -345,8 +414,8 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        // # TODO
-        // Support process delete entries.
+        let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
+        manifest_files.extend(existing_manifests);
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
@@ -378,6 +447,15 @@ impl<'a> SnapshotProducer<'a> {
         for data_file in &self.added_data_files {
             summary_collector.add_file(
                 data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        // Track delete files
+        for delete_file in &self.added_delete_files {
+            summary_collector.add_file(
+                delete_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
             );

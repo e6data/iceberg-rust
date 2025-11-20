@@ -134,19 +134,33 @@ impl<'a> SnapshotProducer<'a> {
     ) -> Result<()> {
         for delete_file in added_delete_files {
             let content_type = delete_file.content_type();
-            //must be equality or positional delete
-            if content_type != crate::spec::DataContentType::EqualityDeletes
-                && content_type != crate::spec::DataContentType::PositionDeletes
-            {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Delete file must have content type EqualityDeletes or PositionDeletes, got: {:?}",
-                        content_type
-                    ),
-                ));
+            match content_type {
+                crate::spec::DataContentType::EqualityDeletes => {
+                    if delete_file.equality_ids().is_none() {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Equality delete file must have equality_ids",
+                        ));
+                    }
+                }
+                crate::spec::DataContentType::PositionDeletes => {
+                    if delete_file.equality_ids().is_some() {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Position delete file should not have equality_ids",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Delete file must have content type EqualityDeletes or PositionDeletes, got: {:?}",
+                            content_type
+                        ),
+                    ));
+                }
             }
-            //
         }
 
         Ok(())
@@ -367,7 +381,7 @@ impl<'a> SnapshotProducer<'a> {
         let mut manifest_files = vec![];
 
         if !self.added_delete_files.is_empty() {
-            let data_manifest = self.write_added_manifest().await?;
+            let data_manifest = self.write_added_delete_manifest().await?;
             manifest_files.push(data_manifest);
         }
 

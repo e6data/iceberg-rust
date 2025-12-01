@@ -35,3 +35,18 @@ pub use map::Map;
 pub use primitive::PrimitiveLiteral;
 pub(crate) use serde::_serde::RawLiteral;
 pub use struct_value::Struct;
+
+// =============================================================================
+// Position Delete File Metadata Column IDs
+// =============================================================================
+// These are reserved field IDs from the Iceberg spec for position delete files.
+// The spec reserves Integer.MAX_VALUE - (101-200) for delete file metadata columns.
+// Reference: https://iceberg.apache.org/spec/#position-delete-files
+
+/// Field ID for the `file_path` column in position delete files.
+/// This column contains the path of the data file where the row to be deleted exists.
+pub const DELETE_FILE_PATH_FIELD_ID: i32 = i32::MAX - 101; // 2147483546
+
+/// Field ID for the `pos` column in position delete files.
+/// This column contains the 0-indexed row position within the data file.
+pub const DELETE_FILE_POS_FIELD_ID: i32 = i32::MAX - 102; // 2147483545

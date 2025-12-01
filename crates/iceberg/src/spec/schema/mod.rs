@@ -423,6 +423,46 @@ impl Schema {
     }
 }
 
+/// Creates the Iceberg schema for position delete files.
+///
+/// Position delete files contain two required columns:
+/// - `file_path` (String): The path of the data file containing the row to delete
+/// - `pos` (Long): The 0-indexed position of the row within the data file
+///
+/// These columns use reserved field IDs defined by the Iceberg spec:
+/// - `file_path`: 2147483546 (Integer.MAX_VALUE - 101)
+/// - `pos`: 2147483545 (Integer.MAX_VALUE - 102)
+///
+/// # Example
+/// ```rust
+/// use iceberg::spec::position_delete_schema;
+///
+/// let schema = position_delete_schema();
+/// assert_eq!(schema.as_struct().fields().len(), 2);
+/// ```
+///
+/// # Reference
+/// - [Iceberg Spec: Position Delete Files](https://iceberg.apache.org/spec/#position-delete-files)
+pub fn position_delete_schema() -> Schema {
+    use super::values::{DELETE_FILE_PATH_FIELD_ID, DELETE_FILE_POS_FIELD_ID};
+
+    Schema::builder()
+        .with_fields(vec![
+            Arc::new(NestedField::required(
+                DELETE_FILE_PATH_FIELD_ID,
+                "file_path",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::required(
+                DELETE_FILE_POS_FIELD_ID,
+                "pos",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+        ])
+        .build()
+        .expect("Position delete schema is always valid")
+}
+
 impl Display for Schema {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "table {{")?;

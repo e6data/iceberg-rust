@@ -17,7 +17,9 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
 use reqwest::header::HeaderMap;
@@ -27,6 +29,15 @@ use tokio::sync::Mutex;
 
 use crate::RestCatalogConfig;
 use crate::types::{ErrorResponse, TokenResponse};
+
+/// Trait for providing authentication tokens to the REST catalog client.
+#[async_trait]
+pub trait TokenProvider: Send + Sync + Debug {
+    /// Get a valid access token. Implementations should cache tokens.
+    async fn get_token(&self) -> Result<String>;
+    /// Force refresh the token. Called on 401/403 before retry.
+    async fn refresh_token(&self) -> Result<String>;
+}
 
 pub(crate) struct HttpClient {
     client: Client,
@@ -43,6 +54,8 @@ pub(crate) struct HttpClient {
     extra_headers: HeaderMap,
     /// Extra oauth parameters to be added to each authentication request.
     extra_oauth_params: HashMap<String, String>,
+    /// Optional external token provider (e.g., GCP ADC).
+    token_provider: Option<Arc<dyn TokenProvider>>,
 }
 
 impl Debug for HttpClient {
@@ -65,6 +78,7 @@ impl HttpClient {
             credential: cfg.credential(),
             extra_headers,
             extra_oauth_params: cfg.extra_oauth_params(),
+            token_provider: cfg.token_provider(),
         })
     }
 
@@ -92,6 +106,7 @@ impl HttpClient {
             } else {
                 self.extra_oauth_params
             },
+            token_provider: cfg.token_provider().or(self.token_provider),
         })
     }
 
@@ -195,16 +210,30 @@ impl HttpClient {
 
     /// Authenticates the request by adding a bearer token to the authorization header.
     ///
-    /// This method supports three authentication modes:
+    /// This method supports four authentication modes (in priority order):
     ///
-    /// 1. **No authentication** - Skip authentication when both `credential` and `token` are missing.
-    /// 2. **Token authentication** - Use the provided `token` directly for authentication.
-    /// 3. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
+    /// 1. **External token provider** - Use the external token provider (e.g., GCP ADC) if set.
+    /// 2. **No authentication** - Skip authentication when both `credential` and `token` are missing.
+    /// 3. **Token authentication** - Use the provided `token` directly for authentication.
+    /// 4. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
     ///
     /// When both `credential` and `token` are present, `token` takes precedence.
     ///
     /// # TODO: Support automatic token refreshing.
     async fn authenticate(&self, req: &mut Request) -> Result<()> {
+        // Priority 1: External token provider
+        if let Some(provider) = &self.token_provider {
+            let token = provider.get_token().await?;
+            req.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().map_err(|e| {
+                    Error::new(ErrorKind::DataInvalid, "Invalid token from provider").with_source(e)
+                })?,
+            );
+            return Ok(());
+        }
+
+        // Priority 2: Existing OAuth flow
         // Clone the token from lock without holding the lock for entire function.
         let token = self.token.lock().await.clone();
 

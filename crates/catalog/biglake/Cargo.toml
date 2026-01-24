@@ -16,29 +16,28 @@
 # under the License.
 
 [package]
+name = "iceberg-catalog-biglake"
+version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }
-name = "iceberg-catalog-loader"
 rust-version = { workspace = true }
-version = { workspace = true }
-
-categories = ["database"]
-description = "Apache Iceberg Catalog Loader API"
-keywords = ["iceberg", "catalog"]
-license = { workspace = true }
 repository = { workspace = true }
+license = { workspace = true }
+description = "Apache Iceberg BigLake Catalog implementation"
+keywords = ["iceberg", "biglake", "gcp", "catalog"]
+categories = ["database"]
 
 [dependencies]
-iceberg = { workspace = true }
-iceberg-catalog-biglake = { workspace = true }
-iceberg-catalog-rest = { workspace = true }
-iceberg-catalog-glue = { workspace = true }
-iceberg-catalog-s3tables = { workspace = true }
-iceberg-catalog-hms = { workspace = true }
-iceberg-catalog-sql = { workspace = true }
-tokio = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
+dirs = { workspace = true }
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "migrate"] }
-tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

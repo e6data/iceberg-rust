@@ -21,6 +21,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::io::{self, FileIO};
@@ -38,12 +39,12 @@ use tokio::sync::OnceCell;
 use typed_builder::TypedBuilder;
 
 use crate::client::{
-    HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
+    HttpClient, TokenProvider, deserialize_catalog_response, deserialize_unexpected_catalog_error,
 };
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
     CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
-    NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    NamespaceResponse, RegisterTableRequest, RenameTableRequest, StorageCredential,
 };
 
 /// REST catalog URI
@@ -54,6 +55,19 @@ pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PATH_V1: &str = "v1";
+
+/// Select the most specific storage credential for the given location.
+/// Chooses the credential with the longest matching prefix.
+fn select_storage_credential<'a>(
+    credentials: &'a [StorageCredential],
+    location: &str,
+) -> Option<&'a HashMap<String, String>> {
+    credentials
+        .iter()
+        .filter(|c| location.starts_with(&c.prefix))
+        .max_by_key(|c| c.prefix.len())
+        .map(|c| &c.config)
+}
 
 /// Builder for [`RestCatalog`].
 #[derive(Debug)]
@@ -67,6 +81,7 @@ impl Default for RestCatalogBuilder {
             warehouse: None,
             props: HashMap::new(),
             client: None,
+            token_provider: None,
         })
     }
 }
@@ -124,6 +139,12 @@ impl RestCatalogBuilder {
         self.0.client = Some(client);
         self
     }
+
+    /// Configures the catalog with an external token provider for authentication.
+    pub fn with_token_provider(mut self, provider: Arc<dyn TokenProvider>) -> Self {
+        self.0.token_provider = Some(provider);
+        self
+    }
 }
 
 /// Rest catalog configuration.
@@ -142,6 +163,9 @@ pub(crate) struct RestCatalogConfig {
 
     #[builder(default)]
     client: Option<Client>,
+
+    #[builder(default, setter(strip_option))]
+    token_provider: Option<Arc<dyn TokenProvider>>,
 }
 
 impl RestCatalogConfig {
@@ -197,6 +221,11 @@ impl RestCatalogConfig {
     /// Get the client from the config.
     pub(crate) fn client(&self) -> Option<Client> {
         self.client.clone()
+    }
+
+    /// Get the token provider from the config.
+    pub(crate) fn token_provider(&self) -> Option<Arc<dyn TokenProvider>> {
+        self.token_provider.clone()
     }
 
     /// Get the token from the config.
@@ -685,11 +714,18 @@ impl Catalog for RestCatalog {
             "Metadata location missing in `create_table` response!",
         ))?;
 
-        let config = response
+        let mut config: HashMap<String, String> = response
             .config
             .into_iter()
             .chain(self.user_config.props.clone())
             .collect();
+
+        // Apply vended credentials if available (highest priority)
+        if let Some(ref creds) = response.storage_credentials {
+            if let Some(cred_config) = select_storage_credential(creds, metadata_location) {
+                config.extend(cred_config.clone());
+            }
+        }
 
         let file_io = self
             .load_file_io(Some(metadata_location), Some(config))
@@ -735,11 +771,20 @@ impl Catalog for RestCatalog {
             _ => return Err(deserialize_unexpected_catalog_error(http_response).await),
         };
 
-        let config = response
+        let mut config: HashMap<String, String> = response
             .config
             .into_iter()
             .chain(self.user_config.props.clone())
             .collect();
+
+        // Apply vended credentials if available (highest priority)
+        if let Some(ref creds) = response.storage_credentials {
+            if let Some(metadata_loc) = response.metadata_location.as_deref() {
+                if let Some(cred_config) = select_storage_credential(creds, metadata_loc) {
+                    config.extend(cred_config.clone());
+                }
+            }
+        }
 
         let file_io = self
             .load_file_io(response.metadata_location.as_deref(), Some(config))
@@ -873,7 +918,18 @@ impl Catalog for RestCatalog {
             "Metadata location missing in `register_table` response!",
         ))?;
 
-        let file_io = self.load_file_io(Some(metadata_location), None).await?;
+        // Build config with vended credentials if available (highest priority)
+        let config = if let Some(ref creds) = response.storage_credentials {
+            if let Some(cred_config) = select_storage_credential(creds, metadata_location) {
+                Some(cred_config.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let file_io = self.load_file_io(Some(metadata_location), config).await?;
 
         Table::builder()
             .identifier(table_ident.clone())

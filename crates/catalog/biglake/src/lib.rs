@@ -35,6 +35,15 @@
 //! - GCE/GKE metadata server
 //! - Workload Identity
 //!
+//! # Billing and access delegation
+//!
+//! BigLake requires an `X-Goog-User-Project` header on all requests. Configure
+//! this via [`BIGLAKE_USER_PROJECT`], which defaults to the project ID if unset.
+//!
+//! If the catalog uses vended credentials, set [`BIGLAKE_ACCESS_DELEGATION`] to
+//! `"vended-credentials"` so the client sends the required
+//! `X-Iceberg-Access-Delegation` header.
+//!
 //! # Example
 //!
 //! ```rust, no_run
@@ -77,6 +86,8 @@ pub const BIGLAKE_CATALOG_ID: &str = "biglake.catalog-id";
 pub const BIGLAKE_WAREHOUSE: &str = "warehouse";
 /// Billing/quota project for X-Goog-User-Project header (optional, defaults to project-id)
 pub const BIGLAKE_USER_PROJECT: &str = "biglake.user-project";
+/// Value for X-Iceberg-Access-Delegation header (e.g. "vended-credentials")
+pub const BIGLAKE_ACCESS_DELEGATION: &str = "biglake.access-delegation";
 
 // GCS configuration keys (for FileIO)
 /// Google Cloud Storage token for vended credentials

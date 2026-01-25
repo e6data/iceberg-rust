@@ -30,8 +30,10 @@ categories = ["database"]
 [dependencies]
 async-trait = { workspace = true }
 google-cloud-api = "1.2"
+google-cloud-auth = "1.4"
 google-cloud-biglake-v1 = "1.1"
 google-cloud-gax = "1.5"
+http = "1"
 iceberg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

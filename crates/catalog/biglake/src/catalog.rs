@@ -22,8 +22,12 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 use google_cloud_api::model::HttpBody;
+use google_cloud_auth::credentials::{
+    Builder as CredentialsBuilder, CacheableResource, Credentials,
+};
 use google_cloud_biglake_v1::client::IcebergCatalogService;
 use google_cloud_biglake_v1::model::{IcebergNamespace, IcebergNamespaceUpdate};
+use http::{Extensions, HeaderMap, HeaderValue};
 use iceberg::io::FileIO;
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
@@ -33,7 +37,7 @@ use iceberg::{
 };
 
 use crate::error::{from_biglake_error, is_not_found};
-use crate::{BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_WAREHOUSE};
+use crate::{BIGLAKE_ACCESS_DELEGATION, BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_WAREHOUSE};
 
 /// BigLake Catalog configuration.
 #[derive(Debug, Clone)]
@@ -48,6 +52,8 @@ pub struct BigLakeCatalogConfig {
     pub warehouse: String,
     /// User project for billing (optional)
     pub user_project: Option<String>,
+    /// Optional access delegation header value (e.g. "vended-credentials")
+    pub access_delegation: Option<String>,
     /// Additional properties
     pub props: HashMap<String, String>,
 }
@@ -70,7 +76,12 @@ impl BigLakeCatalogConfig {
 
     /// Returns the default table location for a table
     pub fn default_table_location(&self, namespace: &str, table: &str) -> String {
-        format!("{}/{}/{}", self.warehouse.trim_end_matches('/'), namespace, table)
+        format!(
+            "{}/{}/{}",
+            self.warehouse.trim_end_matches('/'),
+            namespace,
+            table
+        )
     }
 }
 
@@ -94,6 +105,7 @@ impl CatalogBuilder for BigLakeCatalogBuilder {
         let catalog_id = props.get(BIGLAKE_CATALOG_ID).cloned();
         let warehouse = props.get(BIGLAKE_WAREHOUSE).cloned();
         let user_project = props.get(crate::BIGLAKE_USER_PROJECT).cloned();
+        let access_delegation = props.get(BIGLAKE_ACCESS_DELEGATION).cloned();
 
         // Collect remaining properties
         let remaining_props: HashMap<String, String> = props
@@ -103,6 +115,7 @@ impl CatalogBuilder for BigLakeCatalogBuilder {
                     && k != BIGLAKE_CATALOG_ID
                     && k != BIGLAKE_WAREHOUSE
                     && k != crate::BIGLAKE_USER_PROJECT
+                    && k != BIGLAKE_ACCESS_DELEGATION
             })
             .collect();
 
@@ -112,6 +125,7 @@ impl CatalogBuilder for BigLakeCatalogBuilder {
             catalog_id: catalog_id.unwrap_or_default(),
             warehouse: warehouse.unwrap_or_default(),
             user_project,
+            access_delegation,
             props: remaining_props,
         });
 
@@ -169,11 +183,16 @@ impl Debug for BigLakeCatalog {
 impl BigLakeCatalog {
     /// Create a new BigLake catalog.
     async fn new(config: BigLakeCatalogConfig) -> Result<Self> {
-        // Create the BigLake gRPC client using ADC
+        // Create the BigLake REST client with explicit credentials so we can
+        // inject required headers (e.g., X-Goog-User-Project and access delegation).
+        let creds = build_catalog_credentials(&config)?;
         let client = IcebergCatalogService::builder()
+            .with_credentials(creds)
             .build()
             .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, "Failed to create BigLake client").with_source(e))?;
+            .map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "Failed to create BigLake client").with_source(e)
+            })?;
 
         // Create FileIO for the warehouse
         let file_io = FileIO::from_path(&config.warehouse)?
@@ -232,6 +251,84 @@ impl BigLakeCatalog {
         }
         Ok(parts[0].clone())
     }
+}
+
+#[derive(Clone, Debug)]
+struct HeaderInjectingCredentials {
+    inner: Credentials,
+    extra_headers: HeaderMap,
+}
+
+impl HeaderInjectingCredentials {
+    fn new(inner: Credentials, extra_headers: HeaderMap) -> Self {
+        Self {
+            inner,
+            extra_headers,
+        }
+    }
+}
+
+impl google_cloud_auth::credentials::CredentialsProvider for HeaderInjectingCredentials {
+    fn headers(
+        &self,
+        extensions: Extensions,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            CacheableResource<HeaderMap>,
+            google_cloud_auth::errors::CredentialsError,
+        >,
+    > + Send {
+        let inner = self.inner.clone();
+        let extra_headers = self.extra_headers.clone();
+        async move {
+            match inner.headers(extensions).await? {
+                CacheableResource::New {
+                    mut data,
+                    entity_tag,
+                } => {
+                    data.extend(extra_headers);
+                    Ok(CacheableResource::New { data, entity_tag })
+                }
+                CacheableResource::NotModified => Ok(CacheableResource::NotModified),
+            }
+        }
+    }
+
+    fn universe_domain(&self) -> impl std::future::Future<Output = Option<String>> + Send {
+        let inner = self.inner.clone();
+        async move { inner.universe_domain().await }
+    }
+}
+
+fn build_catalog_credentials(config: &BigLakeCatalogConfig) -> Result<Credentials> {
+    let quota_project = config
+        .user_project
+        .clone()
+        .unwrap_or_else(|| config.project_id.clone());
+    let creds = CredentialsBuilder::default()
+        .with_quota_project_id(quota_project)
+        .build()
+        .map_err(|e| {
+            Error::new(ErrorKind::Unexpected, "Failed to build credentials").with_source(e)
+        })?;
+
+    let Some(access_delegation) = config.access_delegation.as_deref() else {
+        return Ok(creds);
+    };
+
+    let mut headers = HeaderMap::new();
+    let header_value = HeaderValue::from_str(access_delegation).map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Invalid value for biglake.access-delegation",
+        )
+        .with_source(e)
+    })?;
+    headers.insert("x-iceberg-access-delegation", header_value);
+
+    Ok(Credentials::from(HeaderInjectingCredentials::new(
+        creds, headers,
+    )))
 }
 
 #[async_trait]
@@ -468,9 +565,7 @@ impl Catalog for BigLakeCatalog {
         let metadata_location = MetadataLocation::new_with_table_location(&location).to_string();
 
         // Write metadata to GCS
-        metadata
-            .write_to(&self.file_io, &metadata_location)
-            .await?;
+        metadata.write_to(&self.file_io, &metadata_location).await?;
 
         // Create table in BigLake
         // The request body is the Iceberg REST spec CreateTableRequest format
@@ -517,16 +612,18 @@ impl Catalog for BigLakeCatalog {
             .map_err(from_biglake_error)?;
 
         // Parse response to get metadata location
-        let body: serde_json::Value =
-            serde_json::from_slice(&response.data).map_err(|e| {
-                Error::new(ErrorKind::DataInvalid, "Failed to parse table response").with_source(e)
-            })?;
+        let body: serde_json::Value = serde_json::from_slice(&response.data).map_err(|e| {
+            Error::new(ErrorKind::DataInvalid, "Failed to parse table response").with_source(e)
+        })?;
 
         let metadata_location = body["metadata-location"]
             .as_str()
             .or_else(|| body["metadataLocation"].as_str())
             .ok_or_else(|| {
-                Error::new(ErrorKind::DataInvalid, "Missing metadata-location in response")
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Missing metadata-location in response",
+                )
             })?;
 
         // Get vended credentials for GCS access
@@ -662,5 +759,32 @@ impl Catalog for BigLakeCatalog {
             .map_err(from_biglake_error)?;
 
         Ok(staged_table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn header_injection_adds_access_delegation() {
+        let inner = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-iceberg-access-delegation",
+            HeaderValue::from_static("vended-credentials"),
+        );
+
+        let creds = HeaderInjectingCredentials::new(inner, headers);
+        let result = creds.headers(Extensions::new()).await.unwrap();
+
+        let CacheableResource::New { data, .. } = result else {
+            panic!("expected new headers");
+        };
+
+        assert_eq!(
+            data.get("x-iceberg-access-delegation").unwrap(),
+            "vended-credentials"
+        );
     }
 }

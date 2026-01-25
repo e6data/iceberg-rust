@@ -29,11 +29,11 @@ use google_cloud_biglake_v1::client::IcebergCatalogService;
 use google_cloud_biglake_v1::model::{IcebergNamespace, IcebergNamespaceUpdate};
 use http::{Extensions, HeaderMap, HeaderValue};
 use iceberg::io::FileIO;
-use iceberg::spec::{TableMetadata, TableMetadataBuilder};
+use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit,
+    TableCreation, TableIdent,
 };
 
 use crate::error::{from_biglake_error, is_not_found};
@@ -553,41 +553,27 @@ impl Catalog for BigLakeCatalog {
             .clone()
             .unwrap_or_else(|| self.config.default_table_location(&ns_name, &table_name));
 
-        // Build initial table metadata
-        let mut creation_with_location = creation;
-        creation_with_location.location = Some(location.clone());
-
-        let metadata = TableMetadataBuilder::from_table_creation(creation_with_location)?
-            .build()?
-            .metadata;
-
-        // Generate metadata location
-        let metadata_location = MetadataLocation::new_with_table_location(&location).to_string();
-
-        // Write metadata to GCS
-        metadata.write_to(&self.file_io, &metadata_location).await?;
-
-        // Create table in BigLake
-        // The request body is the Iceberg REST spec CreateTableRequest format
+        // Build the CreateTableRequest body per Iceberg REST spec
+        // BigLake will create and write the metadata
         let request_body = serde_json::json!({
             "name": table_name,
             "location": location,
-            "schema": metadata.current_schema(),
-            "properties": metadata.properties(),
+            "schema": creation.schema,
+            "properties": creation.properties,
         });
 
         let body_bytes = serde_json::to_vec(&request_body).map_err(|e| {
             Error::new(ErrorKind::DataInvalid, "Failed to serialize request").with_source(e)
         })?;
 
-        let http_body = HttpBody::new()
-            .set_content_type("application/json")
-            .set_data(body_bytes);
-
         let parent_path = self.config.namespace_path(&ns_name);
         eprintln!("DEBUG create_table:");
         eprintln!("  parent: {}", parent_path);
-        eprintln!("  body: {}", String::from_utf8_lossy(&serde_json::to_vec(&request_body).unwrap()));
+        eprintln!("  body: {}", String::from_utf8_lossy(&body_bytes));
+
+        let http_body = HttpBody::new()
+            .set_content_type("application/json")
+            .set_data(body_bytes);
 
         self.client
             .create_iceberg_table()
@@ -597,7 +583,7 @@ impl Catalog for BigLakeCatalog {
             .await
             .map_err(from_biglake_error)?;
 
-        // Load and return the created table
+        // Load and return the created table (BigLake created the metadata)
         self.load_table(&TableIdent::new(namespace.clone(), table_name))
             .await
     }

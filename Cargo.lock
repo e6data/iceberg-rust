@@ -3546,8 +3546,10 @@ version = "0.8.0"
 dependencies = [
  "async-trait",
  "google-cloud-api",
+ "google-cloud-auth",
  "google-cloud-biglake-v1",
  "google-cloud-gax",
+ "http 1.4.0",
  "iceberg",
  "serde",
  "serde_json",

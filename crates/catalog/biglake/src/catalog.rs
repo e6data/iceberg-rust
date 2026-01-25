@@ -584,9 +584,14 @@ impl Catalog for BigLakeCatalog {
             .set_content_type("application/json")
             .set_data(body_bytes);
 
+        let parent_path = self.config.namespace_path(&ns_name);
+        eprintln!("DEBUG create_table:");
+        eprintln!("  parent: {}", parent_path);
+        eprintln!("  body: {}", String::from_utf8_lossy(&serde_json::to_vec(&request_body).unwrap()));
+
         self.client
             .create_iceberg_table()
-            .set_parent(&self.config.namespace_path(&ns_name))
+            .set_parent(&parent_path)
             .set_http_body(http_body)
             .send()
             .await
@@ -603,13 +608,23 @@ impl Catalog for BigLakeCatalog {
         let table_name = table.name();
 
         // Get table from BigLake
+        let table_path = self.config.table_path(&ns_name, table_name);
+        eprintln!("DEBUG load_table:");
+        eprintln!("  name: {}", table_path);
+
         let response = self
             .client
             .get_iceberg_table()
-            .set_name(&self.config.table_path(&ns_name, table_name))
+            .set_name(&table_path)
             .send()
             .await
             .map_err(from_biglake_error)?;
+
+        // Debug: print response
+        eprintln!("DEBUG get_iceberg_table response:");
+        eprintln!("  content_type: {}", response.content_type);
+        eprintln!("  data length: {}", response.data.len());
+        eprintln!("  data: {:?}", String::from_utf8_lossy(&response.data));
 
         // Parse response to get metadata location
         let body: serde_json::Value = serde_json::from_slice(&response.data).map_err(|e| {

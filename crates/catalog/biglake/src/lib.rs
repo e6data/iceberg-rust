@@ -42,8 +42,7 @@
 //!
 //! use iceberg::CatalogBuilder;
 //! use iceberg_catalog_biglake::{
-//!     BigLakeCatalogBuilder, BIGLAKE_CATALOG_ID, BIGLAKE_LOCATION, BIGLAKE_PROJECT_ID,
-//!     BIGLAKE_WAREHOUSE,
+//!     BigLakeCatalogBuilder, BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_WAREHOUSE,
 //! };
 //!
 //! #[tokio::main]
@@ -53,7 +52,6 @@
 //!             "biglake",
 //!             HashMap::from([
 //!                 (BIGLAKE_PROJECT_ID.to_string(), "my-project".to_string()),
-//!                 (BIGLAKE_LOCATION.to_string(), "us-central1".to_string()),
 //!                 (BIGLAKE_CATALOG_ID.to_string(), "my-catalog".to_string()),
 //!                 (BIGLAKE_WAREHOUSE.to_string(), "gs://my-bucket/warehouse".to_string()),
 //!             ]),
@@ -73,8 +71,6 @@ pub use catalog::{BigLakeCatalog, BigLakeCatalogBuilder, BigLakeCatalogConfig};
 // Configuration property keys
 /// GCP project ID (required)
 pub const BIGLAKE_PROJECT_ID: &str = "biglake.project-id";
-/// GCP region/location (required, e.g., "us-central1")
-pub const BIGLAKE_LOCATION: &str = "biglake.location";
 /// BigLake catalog ID (required)
 pub const BIGLAKE_CATALOG_ID: &str = "biglake.catalog-id";
 /// GCS warehouse path (required, must start with gs://)

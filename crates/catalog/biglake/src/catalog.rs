@@ -33,7 +33,7 @@ use iceberg::{
 };
 
 use crate::error::{from_biglake_error, is_not_found};
-use crate::{BIGLAKE_CATALOG_ID, BIGLAKE_LOCATION, BIGLAKE_PROJECT_ID, BIGLAKE_WAREHOUSE};
+use crate::{BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_WAREHOUSE};
 
 /// BigLake Catalog configuration.
 #[derive(Debug, Clone)]
@@ -42,8 +42,6 @@ pub struct BigLakeCatalogConfig {
     pub name: String,
     /// GCP project ID
     pub project_id: String,
-    /// GCP region/location
-    pub location: String,
     /// BigLake catalog ID
     pub catalog_id: String,
     /// GCS warehouse path
@@ -55,12 +53,9 @@ pub struct BigLakeCatalogConfig {
 }
 
 impl BigLakeCatalogConfig {
-    /// Returns the catalog parent path: projects/{project}/locations/{location}/catalogs/{catalog}
+    /// Returns the catalog parent path: projects/{project}/catalogs/{catalog}
     pub fn catalog_parent(&self) -> String {
-        format!(
-            "projects/{}/locations/{}/catalogs/{}",
-            self.project_id, self.location, self.catalog_id
-        )
+        format!("projects/{}/catalogs/{}", self.project_id, self.catalog_id)
     }
 
     /// Returns namespace path for a given namespace
@@ -96,7 +91,6 @@ impl CatalogBuilder for BigLakeCatalogBuilder {
         let name = name.into();
 
         let project_id = props.get(BIGLAKE_PROJECT_ID).cloned();
-        let location = props.get(BIGLAKE_LOCATION).cloned();
         let catalog_id = props.get(BIGLAKE_CATALOG_ID).cloned();
         let warehouse = props.get(BIGLAKE_WAREHOUSE).cloned();
         let user_project = props.get(crate::BIGLAKE_USER_PROJECT).cloned();
@@ -106,7 +100,6 @@ impl CatalogBuilder for BigLakeCatalogBuilder {
             .into_iter()
             .filter(|(k, _)| {
                 k != BIGLAKE_PROJECT_ID
-                    && k != BIGLAKE_LOCATION
                     && k != BIGLAKE_CATALOG_ID
                     && k != BIGLAKE_WAREHOUSE
                     && k != crate::BIGLAKE_USER_PROJECT
@@ -116,7 +109,6 @@ impl CatalogBuilder for BigLakeCatalogBuilder {
         self.config = Some(BigLakeCatalogConfig {
             name,
             project_id: project_id.unwrap_or_default(),
-            location: location.unwrap_or_default(),
             catalog_id: catalog_id.unwrap_or_default(),
             warehouse: warehouse.unwrap_or_default(),
             user_project,
@@ -133,12 +125,6 @@ impl CatalogBuilder for BigLakeCatalogBuilder {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!("{} is required", BIGLAKE_PROJECT_ID),
-                ));
-            }
-            if config.location.is_empty() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("{} is required", BIGLAKE_LOCATION),
                 ));
             }
             if config.catalog_id.is_empty() {

@@ -15,29 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! BigLake Catalog implementation using native gRPC.
+//! BigLake Catalog implementation wrapping REST catalog with GCP auth.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use google_cloud_api::model::HttpBody;
-use google_cloud_auth::credentials::{
-    Builder as CredentialsBuilder, CacheableResource, Credentials,
-};
-use google_cloud_biglake_v1::client::IcebergCatalogService;
-use google_cloud_biglake_v1::model::{IcebergNamespace, IcebergNamespaceUpdate};
-use http::{Extensions, HeaderMap, HeaderValue};
-use iceberg::io::FileIO;
-use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit,
     TableCreation, TableIdent,
 };
+use iceberg_catalog_rest::RestCatalogBuilder;
+use tokio::sync::RwLock;
 
-use crate::error::{from_biglake_error, is_not_found};
-use crate::{BIGLAKE_ACCESS_DELEGATION, BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_WAREHOUSE};
+use crate::token::{fetch_gcp_token, Token};
+use crate::{
+    BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_SERVICE_ACCOUNT, BIGLAKE_URI, BIGLAKE_WAREHOUSE,
+    DEFAULT_BIGLAKE_URI,
+};
 
 /// BigLake Catalog configuration.
 #[derive(Debug, Clone)]
@@ -48,47 +45,34 @@ pub struct BigLakeCatalogConfig {
     pub project_id: String,
     /// BigLake catalog ID
     pub catalog_id: String,
-    /// GCS warehouse path
+    /// GCS warehouse path (gs://...)
     pub warehouse: String,
-    /// User project for billing (optional)
-    pub user_project: Option<String>,
-    /// Optional access delegation header value (e.g. "vended-credentials")
-    pub access_delegation: Option<String>,
-    /// Additional properties
+    /// BigLake REST endpoint (optional)
+    pub uri: String,
+    /// Service account name for metadata server (default: "default")
+    pub service_account: String,
+    /// Additional properties passed to REST catalog
     pub props: HashMap<String, String>,
 }
 
-impl BigLakeCatalogConfig {
-    /// Returns the catalog parent path: projects/{project}/catalogs/{catalog}
-    pub fn catalog_parent(&self) -> String {
-        format!("projects/{}/catalogs/{}", self.project_id, self.catalog_id)
-    }
-
-    /// Returns namespace path for a given namespace
-    pub fn namespace_path(&self, namespace: &str) -> String {
-        format!("{}/namespaces/{}", self.catalog_parent(), namespace)
-    }
-
-    /// Returns table path
-    pub fn table_path(&self, namespace: &str, table: &str) -> String {
-        format!("{}/tables/{}", self.namespace_path(namespace), table)
-    }
-
-    /// Returns the default table location for a table
-    pub fn default_table_location(&self, namespace: &str, table: &str) -> String {
-        format!(
-            "{}/{}/{}",
-            self.warehouse.trim_end_matches('/'),
-            namespace,
-            table
-        )
+impl Default for BigLakeCatalogConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            project_id: String::new(),
+            catalog_id: String::new(),
+            warehouse: String::new(),
+            uri: DEFAULT_BIGLAKE_URI.to_string(),
+            service_account: "default".to_string(),
+            props: HashMap::new(),
+        }
     }
 }
 
 /// Builder for [`BigLakeCatalog`].
 #[derive(Debug, Default)]
 pub struct BigLakeCatalogBuilder {
-    config: Option<BigLakeCatalogConfig>,
+    config: BigLakeCatalogConfig,
 }
 
 impl CatalogBuilder for BigLakeCatalogBuilder {
@@ -99,77 +83,85 @@ impl CatalogBuilder for BigLakeCatalogBuilder {
         name: impl Into<String>,
         props: HashMap<String, String>,
     ) -> impl std::future::Future<Output = Result<Self::C>> + Send {
-        let name = name.into();
+        self.config.name = name.into();
 
-        let project_id = props.get(BIGLAKE_PROJECT_ID).cloned();
-        let catalog_id = props.get(BIGLAKE_CATALOG_ID).cloned();
-        let warehouse = props.get(BIGLAKE_WAREHOUSE).cloned();
-        let user_project = props.get(crate::BIGLAKE_USER_PROJECT).cloned();
-        let access_delegation = props.get(BIGLAKE_ACCESS_DELEGATION).cloned();
+        // Extract known properties
+        if let Some(v) = props.get(BIGLAKE_PROJECT_ID) {
+            self.config.project_id = v.clone();
+        }
+        if let Some(v) = props.get(BIGLAKE_CATALOG_ID) {
+            self.config.catalog_id = v.clone();
+        }
+        if let Some(v) = props.get(BIGLAKE_WAREHOUSE) {
+            self.config.warehouse = v.clone();
+        }
+        if let Some(v) = props.get(BIGLAKE_URI) {
+            self.config.uri = v.clone();
+        }
+        if let Some(v) = props.get(BIGLAKE_SERVICE_ACCOUNT) {
+            self.config.service_account = v.clone();
+        }
 
-        // Collect remaining properties
-        let remaining_props: HashMap<String, String> = props
+        // Collect remaining properties (for REST catalog passthrough)
+        self.config.props = props
             .into_iter()
             .filter(|(k, _)| {
                 k != BIGLAKE_PROJECT_ID
                     && k != BIGLAKE_CATALOG_ID
                     && k != BIGLAKE_WAREHOUSE
-                    && k != crate::BIGLAKE_USER_PROJECT
-                    && k != BIGLAKE_ACCESS_DELEGATION
+                    && k != BIGLAKE_URI
+                    && k != BIGLAKE_SERVICE_ACCOUNT
             })
             .collect();
 
-        self.config = Some(BigLakeCatalogConfig {
-            name,
-            project_id: project_id.unwrap_or_default(),
-            catalog_id: catalog_id.unwrap_or_default(),
-            warehouse: warehouse.unwrap_or_default(),
-            user_project,
-            access_delegation,
-            props: remaining_props,
-        });
-
         async move {
-            let config = self.config.ok_or_else(|| {
-                Error::new(ErrorKind::DataInvalid, "Catalog configuration is required")
-            })?;
-
             // Validate required fields
-            if config.project_id.is_empty() {
+            if self.config.project_id.is_empty() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!("{} is required", BIGLAKE_PROJECT_ID),
                 ));
             }
-            if config.catalog_id.is_empty() {
+            if self.config.catalog_id.is_empty() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!("{} is required", BIGLAKE_CATALOG_ID),
                 ));
             }
-            if config.warehouse.is_empty() {
+            if self.config.warehouse.is_empty() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!("{} is required", BIGLAKE_WAREHOUSE),
                 ));
             }
-            if !config.warehouse.starts_with("gs://") {
+            if !self.config.warehouse.starts_with("gs://") {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!("{} must start with gs://", BIGLAKE_WAREHOUSE),
                 ));
             }
 
-            BigLakeCatalog::new(config).await
+            BigLakeCatalog::new(self.config).await
         }
     }
 }
 
-/// BigLake Catalog using native gRPC.
+/// Internal state holding the REST catalog and token.
+struct CatalogState {
+    catalog: iceberg_catalog_rest::RestCatalog,
+    token: Token,
+}
+
+/// BigLake Catalog - wraps REST catalog with GCP token management.
+///
+/// This catalog automatically:
+/// - Fetches GCP tokens from the metadata server
+/// - Refreshes tokens before they expire
+/// - Retries operations on auth errors (401/403)
+/// - Adds required BigLake headers (x-goog-user-project, X-Iceberg-Access-Delegation)
 pub struct BigLakeCatalog {
     config: BigLakeCatalogConfig,
-    client: IcebergCatalogService,
-    file_io: FileIO,
+    state: Arc<RwLock<CatalogState>>,
 }
 
 impl Debug for BigLakeCatalog {
@@ -182,584 +174,442 @@ impl Debug for BigLakeCatalog {
 
 impl BigLakeCatalog {
     /// Create a new BigLake catalog.
-    async fn new(config: BigLakeCatalogConfig) -> Result<Self> {
-        // Create the BigLake REST client with explicit credentials so we can
-        // inject required headers (e.g., X-Goog-User-Project and access delegation).
-        let creds = build_catalog_credentials(&config)?;
-        let client = IcebergCatalogService::builder()
-            .with_credentials(creds)
-            .build()
-            .await
-            .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to create BigLake client").with_source(e)
-            })?;
+    pub async fn new(config: BigLakeCatalogConfig) -> Result<Self> {
+        // Fetch initial token
+        let token = fetch_gcp_token(&config.service_account).await?;
 
-        // Create FileIO for the warehouse
-        let file_io = FileIO::from_path(&config.warehouse)?
-            .with_props(&config.props)
-            .build()?;
+        // Build initial REST catalog
+        let catalog = Self::build_rest_catalog(&config, &token.access_token).await?;
 
-        Ok(BigLakeCatalog {
+        tracing::info!(
+            project_id = %config.project_id,
+            catalog_id = %config.catalog_id,
+            uri = %config.uri,
+            "Created BigLake catalog"
+        );
+
+        Ok(Self {
             config,
-            client,
-            file_io,
+            state: Arc::new(RwLock::new(CatalogState { catalog, token })),
         })
     }
 
-    /// Get the catalog's FileIO.
-    pub fn file_io(&self) -> FileIO {
-        self.file_io.clone()
-    }
+    /// Build a REST catalog with the given token.
+    async fn build_rest_catalog(
+        config: &BigLakeCatalogConfig,
+        token: &str,
+    ) -> Result<iceberg_catalog_rest::RestCatalog> {
+        let mut props = config.props.clone();
 
-    /// Build FileIO with vended credentials from BigLake.
-    async fn build_file_io_with_credentials(
-        &self,
-        namespace: &str,
-        table_name: &str,
-    ) -> Result<FileIO> {
-        let creds_response = self
-            .client
-            .load_iceberg_table_credentials()
-            .set_name(&self.config.table_path(namespace, table_name))
-            .send()
+        // Set the URI
+        props.insert("uri".to_string(), config.uri.clone());
+
+        // Set warehouse
+        props.insert("warehouse".to_string(), config.warehouse.clone());
+
+        // Add token for authentication
+        props.insert("token".to_string(), token.to_string());
+
+        // Required headers for BigLake REST API
+        props.insert(
+            "header.x-goog-user-project".to_string(),
+            config.project_id.clone(),
+        );
+        props.insert(
+            "header.X-Iceberg-Access-Delegation".to_string(),
+            "vended-credentials".to_string(),
+        );
+
+        // REST catalog prefix for BigLake: projects/{project}/catalogs/{catalog}
+        props.insert(
+            "prefix".to_string(),
+            format!(
+                "projects/{}/catalogs/{}",
+                config.project_id, config.catalog_id
+            ),
+        );
+
+        RestCatalogBuilder::default()
+            .load(&config.name, props)
             .await
-            .map_err(from_biglake_error)?;
+    }
 
-        let mut props = self.config.props.clone();
+    /// Ensure the catalog token is valid, refreshing if needed.
+    async fn ensure_valid_token(&self) -> Result<()> {
+        let needs_refresh = {
+            let state = self.state.read().await;
+            state.token.is_expiring()
+        };
 
-        // Apply vended credentials from the response
-        for cred in &creds_response.storage_credentials {
-            // The config map contains keys like "gcs.oauth2.token"
-            for (key, value) in &cred.config {
-                props.insert(key.clone(), value.clone());
-            }
+        if needs_refresh {
+            self.refresh_token().await?;
         }
 
-        FileIO::from_path(&self.config.warehouse)?
-            .with_props(props)
-            .build()
+        Ok(())
     }
 
-    /// Validate that a namespace is single-level (BigLake limitation).
-    fn validate_namespace(namespace: &NamespaceIdent) -> Result<String> {
-        let parts: Vec<&String> = namespace.iter().collect();
-        if parts.len() != 1 {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "BigLake only supports single-level namespaces",
-            ));
-        }
-        Ok(parts[0].clone())
-    }
-}
+    /// Force refresh the token and rebuild the REST catalog.
+    async fn refresh_token(&self) -> Result<()> {
+        tracing::info!(
+            service_account = %self.config.service_account,
+            "Refreshing GCP access token"
+        );
 
-#[derive(Clone, Debug)]
-struct HeaderInjectingCredentials {
-    inner: Credentials,
-    extra_headers: HeaderMap,
-}
+        let new_token = fetch_gcp_token(&self.config.service_account).await?;
+        let new_catalog = Self::build_rest_catalog(&self.config, &new_token.access_token).await?;
 
-impl HeaderInjectingCredentials {
-    fn new(inner: Credentials, extra_headers: HeaderMap) -> Self {
-        Self {
-            inner,
-            extra_headers,
-        }
-    }
-}
+        let mut state = self.state.write().await;
+        state.token = new_token;
+        state.catalog = new_catalog;
 
-impl google_cloud_auth::credentials::CredentialsProvider for HeaderInjectingCredentials {
-    fn headers(
-        &self,
-        extensions: Extensions,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<
-            CacheableResource<HeaderMap>,
-            google_cloud_auth::errors::CredentialsError,
-        >,
-    > + Send {
-        let inner = self.inner.clone();
-        let extra_headers = self.extra_headers.clone();
-        async move {
-            match inner.headers(extensions).await? {
-                CacheableResource::New {
-                    mut data,
-                    entity_tag,
-                } => {
-                    data.extend(extra_headers);
-                    Ok(CacheableResource::New { data, entity_tag })
-                }
-                CacheableResource::NotModified => Ok(CacheableResource::NotModified),
-            }
-        }
+        tracing::info!("Successfully refreshed BigLake catalog token");
+        Ok(())
     }
 
-    fn universe_domain(&self) -> impl std::future::Future<Output = Option<String>> + Send {
-        let inner = self.inner.clone();
-        async move { inner.universe_domain().await }
+    /// Force refresh the token.
+    ///
+    /// Call this before `create_table` or `update_table` if you want to ensure
+    /// a fresh token, since those operations cannot be automatically retried
+    /// on auth errors (the input types don't implement Clone).
+    ///
+    /// For most operations this is not needed - the catalog automatically
+    /// refreshes tokens before they expire and retries on auth errors.
+    pub async fn force_refresh_token(&self) -> Result<()> {
+        self.refresh_token().await
     }
-}
 
-fn build_catalog_credentials(config: &BigLakeCatalogConfig) -> Result<Credentials> {
-    let quota_project = config
-        .user_project
-        .clone()
-        .unwrap_or_else(|| config.project_id.clone());
-    let creds = CredentialsBuilder::default()
-        .with_quota_project_id(quota_project)
-        .build()
-        .map_err(|e| {
-            Error::new(ErrorKind::Unexpected, "Failed to build credentials").with_source(e)
-        })?;
-
-    let Some(access_delegation) = config.access_delegation.as_deref() else {
-        return Ok(creds);
-    };
-
-    let mut headers = HeaderMap::new();
-    let header_value = HeaderValue::from_str(access_delegation).map_err(|e| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            "Invalid value for biglake.access-delegation",
-        )
-        .with_source(e)
-    })?;
-    headers.insert("x-iceberg-access-delegation", header_value);
-
-    Ok(Credentials::from(HeaderInjectingCredentials::new(
-        creds, headers,
-    )))
+    /// Check if an error is an authentication error.
+    fn is_auth_error(err: &Error) -> bool {
+        let msg = err.to_string().to_lowercase();
+        msg.contains("401")
+            || msg.contains("403")
+            || msg.contains("unauthorized")
+            || msg.contains("forbidden")
+            || msg.contains("permission denied")
+            || msg.contains("unauthenticated")
+    }
 }
 
 #[async_trait]
 impl Catalog for BigLakeCatalog {
-    /// List namespaces from BigLake catalog.
-    ///
-    /// BigLake only supports single-level namespaces, so if parent is Some,
-    /// we return an empty list.
+    /// List namespaces.
     async fn list_namespaces(
         &self,
         parent: Option<&NamespaceIdent>,
     ) -> Result<Vec<NamespaceIdent>> {
-        // BigLake doesn't support nested namespaces
-        if parent.is_some() {
-            return Ok(vec![]);
+        self.ensure_valid_token().await?;
+
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.list_namespaces(parent).await
+        };
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.list_namespaces(parent).await
+            }
+            Err(e) => Err(e),
         }
-
-        let mut namespaces = Vec::new();
-        let mut page_token: Option<String> = None;
-
-        loop {
-            let mut request = self
-                .client
-                .list_iceberg_namespaces()
-                .set_parent(&self.config.catalog_parent());
-
-            if let Some(token) = &page_token {
-                request = request.set_page_token(token);
-            }
-
-            let response = request.send().await.map_err(from_biglake_error)?;
-
-            // Each namespace in the response is a ListValue (Vec<Value>) containing the namespace parts
-            // For single-level namespaces, we take the first element
-            for ns in &response.namespaces {
-                // ns is a Vec<Value> representing an array like ["namespace_name"]
-                if let Some(first) = ns.first() {
-                    // Extract the string value using pattern matching
-                    if let serde_json::Value::String(name) = first {
-                        namespaces.push(NamespaceIdent::new(name.clone()));
-                    }
-                }
-            }
-
-            if response.next_page_token.is_empty() {
-                break;
-            }
-            page_token = Some(response.next_page_token.clone());
-        }
-
-        Ok(namespaces)
     }
 
-    /// Create a new namespace in the BigLake catalog.
+    /// Create a namespace.
     async fn create_namespace(
         &self,
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> Result<Namespace> {
-        let ns_name = Self::validate_namespace(namespace)?;
+        self.ensure_valid_token().await?;
 
-        let ns = IcebergNamespace::new()
-            .set_namespace([&ns_name])
-            .set_properties(properties.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-
-        self.client
-            .create_iceberg_namespace()
-            .set_parent(&self.config.catalog_parent())
-            .set_iceberg_namespace(ns)
-            .send()
-            .await
-            .map_err(from_biglake_error)?;
-
-        Ok(Namespace::with_properties(namespace.clone(), properties))
-    }
-
-    /// Get a namespace from the BigLake catalog.
-    async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
-        let ns_name = Self::validate_namespace(namespace)?;
-
-        let response = self
-            .client
-            .get_iceberg_namespace()
-            .set_name(&self.config.namespace_path(&ns_name))
-            .send()
-            .await
-            .map_err(from_biglake_error)?;
-
-        Ok(Namespace::with_properties(
-            namespace.clone(),
-            response.properties.clone(),
-        ))
-    }
-
-    /// Check if a namespace exists in the BigLake catalog.
-    async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
-        let ns_name = Self::validate_namespace(namespace)?;
-
-        let result = self
-            .client
-            .get_iceberg_namespace()
-            .set_name(&self.config.namespace_path(&ns_name))
-            .send()
-            .await;
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.create_namespace(namespace, properties.clone()).await
+        };
 
         match result {
-            Ok(_) => Ok(true),
-            Err(e) if is_not_found(&e) => Ok(false),
-            Err(e) => Err(from_biglake_error(e)),
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.create_namespace(namespace, properties).await
+            }
+            Err(e) => Err(e),
         }
     }
 
-    /// Update a namespace in the BigLake catalog.
+    /// Get a namespace.
+    async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
+        self.ensure_valid_token().await?;
+
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.get_namespace(namespace).await
+        };
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.get_namespace(namespace).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Check if a namespace exists.
+    async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
+        self.ensure_valid_token().await?;
+
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.namespace_exists(namespace).await
+        };
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.namespace_exists(namespace).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Update namespace properties.
     async fn update_namespace(
         &self,
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> Result<()> {
-        let ns_name = Self::validate_namespace(namespace)?;
+        self.ensure_valid_token().await?;
 
-        // Get current namespace to determine what to update
-        let current = self.get_namespace(namespace).await?;
-        let current_props = current.properties();
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.update_namespace(namespace, properties.clone()).await
+        };
 
-        // Compute removals (keys in current but not in new)
-        let removals: Vec<&str> = current_props
-            .keys()
-            .filter(|k| !properties.contains_key(*k))
-            .map(|k| k.as_str())
-            .collect();
-
-        // Compute updates (keys in new that are different or new)
-        let updates: Vec<(&str, &str)> = properties
-            .iter()
-            .filter(|(k, v)| current_props.get(*k) != Some(*v))
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        let ns_update = IcebergNamespaceUpdate::new()
-            .set_removals(removals)
-            .set_updates(updates);
-
-        self.client
-            .update_iceberg_namespace()
-            .set_name(&self.config.namespace_path(&ns_name))
-            .set_iceberg_namespace_update(ns_update)
-            .send()
-            .await
-            .map_err(from_biglake_error)?;
-
-        Ok(())
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.update_namespace(namespace, properties).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Drop a namespace from the BigLake catalog.
+    /// Drop a namespace.
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
-        let ns_name = Self::validate_namespace(namespace)?;
+        self.ensure_valid_token().await?;
 
-        // Check if namespace is empty
-        let tables = self.list_tables(namespace).await?;
-        if !tables.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Namespace {} is not empty", ns_name),
-            ));
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.drop_namespace(namespace).await
+        };
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.drop_namespace(namespace).await
+            }
+            Err(e) => Err(e),
         }
-
-        self.client
-            .delete_iceberg_namespace()
-            .set_name(&self.config.namespace_path(&ns_name))
-            .send()
-            .await
-            .map_err(from_biglake_error)?;
-
-        Ok(())
     }
 
     /// List tables in a namespace.
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        let ns_name = Self::validate_namespace(namespace)?;
+        self.ensure_valid_token().await?;
 
-        let mut tables = Vec::new();
-        let mut page_token: Option<String> = None;
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.list_tables(namespace).await
+        };
 
-        loop {
-            let mut request = self
-                .client
-                .list_iceberg_table_identifiers()
-                .set_parent(&self.config.namespace_path(&ns_name));
-
-            if let Some(token) = &page_token {
-                request = request.set_page_token(token);
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.list_tables(namespace).await
             }
-
-            let response = request.send().await.map_err(from_biglake_error)?;
-
-            for table_id in &response.identifiers {
-                // Extract table name from the identifier
-                tables.push(TableIdent::new(namespace.clone(), table_id.name.clone()));
-            }
-
-            if response.next_page_token.is_empty() {
-                break;
-            }
-            page_token = Some(response.next_page_token.clone());
+            Err(e) => Err(e),
         }
-
-        Ok(tables)
     }
 
-    /// Create a new table in the BigLake catalog.
+    /// Create a table.
+    ///
+    /// Note: If you get an auth error, call `force_refresh_token()` before retrying.
+    /// This operation cannot auto-retry because `TableCreation` doesn't implement Clone.
     async fn create_table(
         &self,
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
-        let ns_name = Self::validate_namespace(namespace)?;
-        let table_name = creation.name.clone();
-
-        // Determine table location
-        let location = creation
-            .location
-            .clone()
-            .unwrap_or_else(|| self.config.default_table_location(&ns_name, &table_name));
-
-        // Build the CreateTableRequest body per Iceberg REST spec
-        // BigLake will create and write the metadata
-        let request_body = serde_json::json!({
-            "name": table_name,
-            "location": location,
-            "schema": creation.schema,
-            "properties": creation.properties,
-        });
-
-        let body_bytes = serde_json::to_vec(&request_body).map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Failed to serialize request").with_source(e)
-        })?;
-
-        let parent_path = self.config.namespace_path(&ns_name);
-        eprintln!("DEBUG create_table:");
-        eprintln!("  parent: {}", parent_path);
-        eprintln!("  body: {}", String::from_utf8_lossy(&body_bytes));
-
-        let http_body = HttpBody::new()
-            .set_content_type("application/json")
-            .set_data(body_bytes);
-
-        self.client
-            .create_iceberg_table()
-            .set_parent(&parent_path)
-            .set_http_body(http_body)
-            .send()
-            .await
-            .map_err(from_biglake_error)?;
-
-        // Load and return the created table (BigLake created the metadata)
-        self.load_table(&TableIdent::new(namespace.clone(), table_name))
-            .await
-    }
-
-    /// Load a table from the BigLake catalog.
-    async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-        let ns_name = Self::validate_namespace(table.namespace())?;
-        let table_name = table.name();
-
-        // Get table from BigLake
-        let table_path = self.config.table_path(&ns_name, table_name);
-        eprintln!("DEBUG load_table:");
-        eprintln!("  name: {}", table_path);
-
-        let response = self
-            .client
-            .get_iceberg_table()
-            .set_name(&table_path)
-            .send()
-            .await
-            .map_err(from_biglake_error)?;
-
-        // Debug: print response
-        eprintln!("DEBUG get_iceberg_table response:");
-        eprintln!("  content_type: {}", response.content_type);
-        eprintln!("  data length: {}", response.data.len());
-        eprintln!("  data: {:?}", String::from_utf8_lossy(&response.data));
-
-        // Parse response to get metadata location
-        let body: serde_json::Value = serde_json::from_slice(&response.data).map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Failed to parse table response").with_source(e)
-        })?;
-
-        let metadata_location = body["metadata-location"]
-            .as_str()
-            .or_else(|| body["metadataLocation"].as_str())
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Missing metadata-location in response",
-                )
-            })?;
-
-        // Get vended credentials for GCS access
-        let file_io = self
-            .build_file_io_with_credentials(&ns_name, table_name)
-            .await?;
-
-        // Load actual metadata from GCS
-        let metadata = TableMetadata::read_from(&file_io, metadata_location).await?;
-
-        // Build and return Table
-        Table::builder()
-            .file_io(file_io)
-            .metadata_location(metadata_location)
-            .metadata(metadata)
-            .identifier(table.clone())
-            .build()
-    }
-
-    /// Drop a table from the BigLake catalog.
-    async fn drop_table(&self, table: &TableIdent) -> Result<()> {
-        let ns_name = Self::validate_namespace(table.namespace())?;
-        let table_name = table.name();
-
-        self.client
-            .delete_iceberg_table()
-            .set_name(&self.config.table_path(&ns_name, table_name))
-            .send()
-            .await
-            .map_err(from_biglake_error)?;
-
-        Ok(())
-    }
-
-    /// Check if a table exists in the BigLake catalog.
-    async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
-        let ns_name = Self::validate_namespace(table.namespace())?;
-        let table_name = table.name();
-
-        let result = self
-            .client
-            .get_iceberg_table()
-            .set_name(&self.config.table_path(&ns_name, table_name))
-            .send()
-            .await;
+        self.ensure_valid_token().await?;
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.create_table(namespace, creation).await
+        };
 
         match result {
-            Ok(_) => Ok(true),
-            Err(e) if is_not_found(&e) => Ok(false),
-            Err(e) => Err(from_biglake_error(e)),
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Got auth error on create_table, refreshing token. Caller must retry."
+                );
+                self.refresh_token().await?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Load a table.
+    async fn load_table(&self, table: &TableIdent) -> Result<Table> {
+        self.ensure_valid_token().await?;
+
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.load_table(table).await
+        };
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.load_table(table).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drop a table.
+    async fn drop_table(&self, table: &TableIdent) -> Result<()> {
+        self.ensure_valid_token().await?;
+
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.drop_table(table).await
+        };
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.drop_table(table).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Check if a table exists.
+    async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
+        self.ensure_valid_token().await?;
+
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.table_exists(table).await
+        };
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.table_exists(table).await
+            }
+            Err(e) => Err(e),
         }
     }
 
     /// Rename a table.
+    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
+        self.ensure_valid_token().await?;
+
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.rename_table(src, dest).await
+        };
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.rename_table(src, dest).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Update a table (commit).
     ///
-    /// BigLake API does not support table renaming, so this returns an error.
-    async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> Result<()> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "BigLake does not support table renaming",
-        ))
-    }
-
-    /// Register an existing table in the BigLake catalog.
-    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table> {
-        let ns_name = Self::validate_namespace(table.namespace())?;
-        let table_name = table.name();
-
-        // Read metadata to validate it exists
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
-
-        // Register table in BigLake
-        self.client
-            .register_iceberg_table()
-            .set_parent(&self.config.namespace_path(&ns_name))
-            .set_name(table_name)
-            .set_metadata_location(&metadata_location)
-            .send()
-            .await
-            .map_err(from_biglake_error)?;
-
-        // Return the registered table
-        Table::builder()
-            .file_io(self.file_io())
-            .metadata_location(metadata_location)
-            .metadata(metadata)
-            .identifier(table.clone())
-            .build()
-    }
-
-    /// Update a table in the BigLake catalog.
+    /// Note: If you get an auth error, call `force_refresh_token()` before retrying.
+    /// This operation cannot auto-retry because `TableCommit` doesn't implement Clone.
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
-        let table_ident = commit.identifier().clone();
-        let ns_name = Self::validate_namespace(table_ident.namespace())?;
+        self.ensure_valid_token().await?;
+        let result = {
+            let state = self.state.read().await;
+            state.catalog.update_table(commit).await
+        };
 
-        // Load current table
-        let current_table = self.load_table(&table_ident).await?;
-        let _current_metadata_location = current_table.metadata_location_result()?.to_string();
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Got auth error on update_table, refreshing token. Caller must retry."
+                );
+                self.refresh_token().await?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
 
-        // Apply updates to get new metadata
-        let staged_table = commit.apply(current_table)?;
-        let staged_metadata_location = staged_table.metadata_location_result()?;
+    /// Register a table.
+    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table> {
+        self.ensure_valid_token().await?;
 
-        // Write new metadata to GCS
-        staged_table
-            .metadata()
-            .write_to(staged_table.file_io(), staged_metadata_location)
-            .await?;
+        let result = {
+            let state = self.state.read().await;
+            state
+                .catalog
+                .register_table(table, metadata_location.clone())
+                .await
+        };
 
-        // Update BigLake with new metadata location (CommitTable format)
-        let request_body = serde_json::json!({
-            "requirements": [],  // BigLake validates requirements server-side
-            "updates": [{
-                "action": "set-metadata-location",
-                "metadata-location": staged_metadata_location,
-            }],
-        });
-
-        let body_bytes = serde_json::to_vec(&request_body).map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Failed to serialize request").with_source(e)
-        })?;
-
-        let http_body = HttpBody::new()
-            .set_content_type("application/json")
-            .set_data(body_bytes);
-
-        self.client
-            .update_iceberg_table()
-            .set_name(&self.config.table_path(&ns_name, table_ident.name()))
-            .set_http_body(http_body)
-            .send()
-            .await
-            .map_err(from_biglake_error)?;
-
-        Ok(staged_table)
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) if Self::is_auth_error(&e) => {
+                tracing::warn!(error = %e, "Got auth error, refreshing token and retrying");
+                self.refresh_token().await?;
+                let state = self.state.read().await;
+                state.catalog.register_table(table, metadata_location).await
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -767,25 +617,19 @@ impl Catalog for BigLakeCatalog {
 mod tests {
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn header_injection_adds_access_delegation() {
-        let inner = google_cloud_auth::credentials::anonymous::Builder::new().build();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-iceberg-access-delegation",
-            HeaderValue::from_static("vended-credentials"),
-        );
+    #[test]
+    fn test_is_auth_error() {
+        let err_401 = Error::new(ErrorKind::Unexpected, "HTTP 401 Unauthorized");
+        assert!(BigLakeCatalog::is_auth_error(&err_401));
 
-        let creds = HeaderInjectingCredentials::new(inner, headers);
-        let result = creds.headers(Extensions::new()).await.unwrap();
+        let err_403 = Error::new(ErrorKind::Unexpected, "HTTP 403 Forbidden");
+        assert!(BigLakeCatalog::is_auth_error(&err_403));
 
-        let CacheableResource::New { data, .. } = result else {
-            panic!("expected new headers");
-        };
+        let err_permission =
+            Error::new(ErrorKind::Unexpected, "Permission denied to access resource");
+        assert!(BigLakeCatalog::is_auth_error(&err_permission));
 
-        assert_eq!(
-            data.get("x-iceberg-access-delegation").unwrap(),
-            "vended-credentials"
-        );
+        let err_other = Error::new(ErrorKind::DataInvalid, "Invalid table name");
+        assert!(!BigLakeCatalog::is_auth_error(&err_other));
     }
 }

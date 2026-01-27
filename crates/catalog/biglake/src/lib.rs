@@ -15,47 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache Iceberg BigLake Catalog implementation using native gRPC.
+//! Apache Iceberg BigLake Catalog implementation.
 //!
-//! This crate provides a BigLake catalog that uses the `google-cloud-biglake-v1`
-//! gRPC client directly for all catalog operations. It follows the same pattern
-//! as the Glue catalog - a native cloud catalog implementation that:
+//! This crate provides a BigLake catalog that wraps the REST catalog with
+//! automatic GCP token management. It handles:
 //!
-//! - Uses the BigLake gRPC client (`IcebergCatalogService`) for all catalog operations
-//! - Stores table metadata on GCS via FileIO (not through the catalog API)
-//! - Uses vended credentials from `load_iceberg_table_credentials` for storage access
+//! - Fetching GCP tokens from the metadata server (GKE Workload Identity)
+//! - Automatic token refresh before expiry
+//! - Retry on auth errors (401/403)
+//! - Required BigLake headers (x-goog-user-project, X-Iceberg-Access-Delegation)
 //!
 //! # Authentication
 //!
-//! Authentication is handled automatically by the `google-cloud-biglake-v1` SDK using
-//! Google Cloud Application Default Credentials (ADC). The SDK supports:
+//! The catalog fetches tokens from the GCP metadata server, which works on:
+//! - GKE pods (with Workload Identity)
+//! - GCE VMs
+//! - Cloud Run
+//! - Cloud Functions
 //!
-//! - Environment variables (GOOGLE_APPLICATION_CREDENTIALS)
-//! - gcloud CLI credentials
-//! - GCE/GKE metadata server
-//! - Workload Identity
+//! For local development, you can set `GCE_METADATA_HOST` environment variable
+//! to point to a local metadata server emulator.
 //!
-//! # Billing and access delegation
+//! # Storage Access
 //!
-//! BigLake requires an `X-Goog-User-Project` header on all requests. Configure
-//! this via [`BIGLAKE_USER_PROJECT`], which defaults to the project ID if unset.
-//!
-//! If the catalog uses vended credentials, set [`BIGLAKE_ACCESS_DELEGATION`] to
-//! `"vended-credentials"` so the client sends the required
-//! `X-Iceberg-Access-Delegation` header.
+//! GCS access is handled automatically by OpenDAL using Application Default
+//! Credentials (ADC). Enable the `storage-gcs` feature on the `iceberg` crate.
 //!
 //! # Example
 //!
-//! ```rust, no_run
+//! ```rust,no_run
 //! use std::collections::HashMap;
 //!
-//! use iceberg::CatalogBuilder;
+//! use iceberg::{Catalog, CatalogBuilder};
 //! use iceberg_catalog_biglake::{
 //!     BigLakeCatalogBuilder, BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_WAREHOUSE,
 //! };
 //!
 //! #[tokio::main]
-//! async fn main() {
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let catalog = BigLakeCatalogBuilder::default()
 //!         .load(
 //!             "biglake",
@@ -65,30 +62,35 @@
 //!                 (BIGLAKE_WAREHOUSE.to_string(), "gs://my-bucket/warehouse".to_string()),
 //!             ]),
 //!         )
-//!         .await
-//!         .unwrap();
+//!         .await?;
+//!
+//!     // Use like any other Catalog
+//!     let namespaces = catalog.list_namespaces(None).await?;
+//!     println!("Namespaces: {:?}", namespaces);
+//!
+//!     Ok(())
 //! }
 //! ```
 
-#![deny(missing_docs)]
-
 mod catalog;
-mod error;
+mod token;
 
 pub use catalog::{BigLakeCatalog, BigLakeCatalogBuilder, BigLakeCatalogConfig};
 
-// Configuration property keys
-/// GCP project ID (required)
+/// Property key for GCP project ID (required)
 pub const BIGLAKE_PROJECT_ID: &str = "biglake.project-id";
-/// BigLake catalog ID (required)
-pub const BIGLAKE_CATALOG_ID: &str = "biglake.catalog-id";
-/// GCS warehouse path (required, must start with gs://)
-pub const BIGLAKE_WAREHOUSE: &str = "warehouse";
-/// Billing/quota project for X-Goog-User-Project header (optional, defaults to project-id)
-pub const BIGLAKE_USER_PROJECT: &str = "biglake.user-project";
-/// Value for X-Iceberg-Access-Delegation header (e.g. "vended-credentials")
-pub const BIGLAKE_ACCESS_DELEGATION: &str = "biglake.access-delegation";
 
-// GCS configuration keys (for FileIO)
-/// Google Cloud Storage token for vended credentials
-pub const GCS_TOKEN: &str = "gcs.oauth2.token";
+/// Property key for BigLake catalog ID (required)
+pub const BIGLAKE_CATALOG_ID: &str = "biglake.catalog-id";
+
+/// Property key for warehouse location (required, must start with gs://)
+pub const BIGLAKE_WAREHOUSE: &str = "warehouse";
+
+/// Property key for service account name for metadata server (default: "default")
+pub const BIGLAKE_SERVICE_ACCOUNT: &str = "biglake.service-account";
+
+/// Property key for BigLake REST endpoint (optional)
+pub const BIGLAKE_URI: &str = "biglake.uri";
+
+/// Default BigLake REST endpoint
+pub const DEFAULT_BIGLAKE_URI: &str = "https://biglake.googleapis.com/iceberg/v1/restcatalog";

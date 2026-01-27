@@ -23,21 +23,18 @@ homepage = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 license = { workspace = true }
-description = "Apache Iceberg BigLake Catalog implementation (Native gRPC)"
-keywords = ["iceberg", "biglake", "gcp", "catalog", "grpc"]
+description = "Apache Iceberg BigLake Catalog implementation"
+keywords = ["iceberg", "biglake", "gcp", "catalog"]
 categories = ["database"]
 
 [dependencies]
 async-trait = { workspace = true }
-google-cloud-api = "1.2"
-google-cloud-auth = "1.4"
-google-cloud-biglake-v1 = "1.1"
-google-cloud-gax = "1.5"
-http = "1"
 iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

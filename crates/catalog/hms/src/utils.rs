@@ -18,10 +18,11 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use hive_metastore::{Database, PrincipalType, SerDeInfo, StorageDescriptor};
+use hive_metastore::{Database, FieldSchema, PrincipalType, SerDeInfo, StorageDescriptor};
 use iceberg::spec::Schema;
 use iceberg::{Error, ErrorKind, Namespace, NamespaceIdent, Result};
 use pilota::{AHashMap, FastStr};
+use uuid::Uuid;
 
 use crate::schema::HiveSchemaBuilder;
 
@@ -155,6 +156,30 @@ pub(crate) fn convert_to_database(
     Ok(db)
 }
 
+/// Creates a new metadata location path with version and UUID.
+pub(crate) fn create_metadata_location(location: impl AsRef<str>, version: i32) -> Result<String> {
+    if version < 0 {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Table metadata version: '{}' must be a non-negative integer",
+                version
+            ),
+        ));
+    };
+
+    let version = format!("{:0>5}", version);
+    let id = Uuid::new_v4();
+    let metadata_location = format!(
+        "{}/metadata/{}-{}.metadata.json",
+        location.as_ref(),
+        version,
+        id
+    );
+
+    Ok(metadata_location)
+}
+
 pub(crate) fn convert_to_hive_table(
     db_name: String,
     schema: &Schema,
@@ -162,6 +187,7 @@ pub(crate) fn convert_to_hive_table(
     location: String,
     metadata_location: String,
     properties: &HashMap<String, String>,
+    partition_keys: Option<Vec<FieldSchema>>,
 ) -> Result<hive_metastore::Table> {
     let serde_info = SerDeInfo {
         serialization_lib: Some(SERIALIZATION_LIB.into()),
@@ -202,6 +228,7 @@ pub(crate) fn convert_to_hive_table(
         last_access_time: Some(current_time_ms),
         sd: Some(storage_descriptor),
         parameters: Some(parameters),
+        partition_keys,
         ..Default::default()
     })
 }
@@ -363,6 +390,7 @@ mod tests {
             location.clone(),
             metadata_location,
             &properties,
+            Some(vec![]),
         )?;
 
         let serde_info = SerDeInfo {

@@ -38,6 +38,7 @@ pilota = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 volo-thrift = { workspace = true }
 
 # Transitive dependencies below
@@ -54,9 +55,17 @@ motore-macros = { workspace = true }
 volo = { workspace = true }
 
 [dev-dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 ctor = { workspace = true }
+futures = { workspace = true }
 iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
+parquet = { workspace = true }
 port_scanner = { workspace = true }
+
+[[example]]
+name = "hms_commit_test"
+required-features = []
 
 [package.metadata.cargo-machete]
 # These dependencies are added to ensure minimal dependency version

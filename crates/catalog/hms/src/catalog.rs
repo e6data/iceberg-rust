@@ -454,6 +454,7 @@ impl Catalog for HmsCatalog {
             location,
             metadata_location.clone(),
             metadata.properties(),
+            Some(vec![]),
         )?;
 
         self.client
@@ -594,19 +595,124 @@ impl Catalog for HmsCatalog {
 
     async fn register_table(
         &self,
-        _table_ident: &TableIdent,
-        _metadata_location: String,
+        table_ident: &TableIdent,
+        metadata_location: String,
     ) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Registering a table is not supported yet",
-        ))
+        //validate if the namespace exists
+
+        let db_name = validate_namespace(table_ident.namespace())?;
+        let table_name = table_ident.name().clone();
+
+        // check if table exists in catalog ? error out if it does
+
+        if self.table_exists(&table_ident).await? {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("Table already exists in catalog: {}", table_ident),
+            ));
+        }
+
+        // read the existing metadata
+        let metadata = TableMetadata::read_from(&self.file_io, metadata_location.clone()).await?;
+        // create hms entry
+        let hive_table = convert_to_hive_table(
+            db_name.clone(),
+            metadata.current_schema(),
+            table_name.clone().to_string(),
+            metadata.location().to_string(),
+            metadata_location.clone(),
+            metadata.properties(),
+            Some(vec![]),
+        )?;
+        // Register in HMS
+        self.client
+            .0
+            .create_table(hive_table)
+            .await
+            .map_err(from_thrift_error)?;
+
+        Table::builder()
+            .file_io(self.file_io())
+            .metadata_location(metadata_location)
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new(db_name),
+                table_name.to_string(),
+            ))
+            .build()
     }
 
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
+    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
+        // Check if table exists
+        let identifier = commit.identifier().clone();
+        if !self.table_exists(&identifier).await? {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("No such table: {:?}", identifier),
+            ));
+        }
+
+        // Load current table
+        let iceberg_table = self.load_table(&identifier).await?;
+
+        let requirements = commit.take_requirements();
+        let table_updates = commit.take_updates();
+
+        // Build new metadata with current metadata location for metadata-log
+        let mut update_table_metadata_builder = TableMetadataBuilder::new_from_metadata(
+            iceberg_table.metadata().clone(),
+            iceberg_table.metadata_location().map(|x| x.to_string()),
+        );
+
+        // Apply table updates
+        for table_update in table_updates {
+            update_table_metadata_builder = table_update.apply(update_table_metadata_builder)?;
+        }
+
+        // Check table requirements
+        for table_requirement in requirements {
+            table_requirement.check(Some(iceberg_table.metadata()))?;
+        }
+
+        // Write new metadata file
+        let metadata_location = iceberg_table.metadata().location();
+        let new_metadata_location = create_metadata_location(
+            metadata_location,
+            iceberg_table.metadata().next_sequence_number() as i32,
+        )?;
+
+        let file = self.file_io.new_output(&new_metadata_location)?;
+        let update_table_metadata = update_table_metadata_builder.build()?;
+        file.write(serde_json::to_vec(&update_table_metadata.metadata)?.into())
+            .await?;
+
+        let db_name = validate_namespace(iceberg_table.identifier().namespace())?;
+        let tbl_name = iceberg_table.identifier().name().to_string();
+        let tbl_location = iceberg_table.metadata().location();
+
+        // Convert iceberg table to hive table
+        let hive_table_new = convert_to_hive_table(
+            db_name.clone(),
+            update_table_metadata.metadata.current_schema(),
+            tbl_name.clone(),
+            tbl_location.into(),
+            new_metadata_location.to_string(),
+            update_table_metadata.metadata.properties(),
+            Some(vec![]),
+        )?;
+
+        // Run alter table on hive
+        self.client
+            .0
+            .alter_table(db_name.into(), tbl_name.into(), hive_table_new)
+            .await
+            .map_err(from_thrift_error)?;
+
+        Ok(Table::builder()
+            .file_io(self.file_io.clone())
+            .identifier(identifier)
+            .metadata_location(new_metadata_location)
+            .metadata(update_table_metadata.metadata)
+            .build()?)
     }
 }

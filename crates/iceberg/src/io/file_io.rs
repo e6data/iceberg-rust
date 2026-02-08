@@ -49,6 +49,14 @@ pub struct FileIO {
     builder: FileIOBuilder,
 
     inner: Arc<Storage>,
+
+    /// Multipart upload chunk size in bytes (e.g. 8MB).
+    /// When set, output files use `writer_with().chunk(size)` for multipart uploads.
+    write_chunk_size: Option<usize>,
+
+    /// Number of concurrent multipart upload parts (e.g. 8).
+    /// When set, output files upload this many parts in parallel.
+    write_concurrency: Option<usize>,
 }
 
 impl FileIO {
@@ -58,6 +66,24 @@ impl FileIO {
     /// distributed systems.
     pub fn into_builder(self) -> FileIOBuilder {
         self.builder
+    }
+
+    /// Set the multipart upload chunk size in bytes.
+    ///
+    /// When set, all output files created from this FileIO will use
+    /// multipart uploads with the given chunk size.
+    pub fn with_write_chunk_size(mut self, size: usize) -> Self {
+        self.write_chunk_size = Some(size);
+        self
+    }
+
+    /// Set the number of concurrent multipart upload parts.
+    ///
+    /// When set, all output files created from this FileIO will upload
+    /// this many parts in parallel.
+    pub fn with_write_concurrency(mut self, concurrency: usize) -> Self {
+        self.write_concurrency = Some(concurrency);
+        self
     }
 
     /// Try to infer file io scheme from path. See [`FileIO`] for supported schemes.
@@ -164,6 +190,8 @@ impl FileIO {
             op,
             path,
             relative_path_pos,
+            write_chunk_size: self.write_chunk_size,
+            write_concurrency: self.write_concurrency,
         })
     }
 }
@@ -277,6 +305,8 @@ impl FileIOBuilder {
         Ok(FileIO {
             builder: self,
             inner: Arc::new(storage),
+            write_chunk_size: None,
+            write_concurrency: None,
         })
     }
 }
@@ -409,6 +439,10 @@ pub struct OutputFile {
     path: String,
     // Relative path of file to uri, starts at [`relative_path_pos`]
     relative_path_pos: usize,
+    // Multipart upload chunk size in bytes.
+    write_chunk_size: Option<usize>,
+    // Number of concurrent multipart upload parts.
+    write_concurrency: Option<usize>,
 }
 
 impl OutputFile {
@@ -456,8 +490,14 @@ impl OutputFile {
     ///
     /// For one-time writing, use [`Self::write`] instead.
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
+        let chunk_size = self.write_chunk_size.unwrap_or(8 * 1024 * 1024);
+        let concurrency = self.write_concurrency.unwrap_or(8);
         Ok(Box::new(
-            self.op.writer(&self.path[self.relative_path_pos..]).await?,
+            self.op
+                .writer_with(&self.path[self.relative_path_pos..])
+                .chunk(chunk_size)
+                .concurrent(concurrency)
+                .await?,
         ))
     }
 }

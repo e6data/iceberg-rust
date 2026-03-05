@@ -216,6 +216,8 @@ impl Storage {
         // harm in retrying temporary failures for other storage backends as well.
         let operator = operator.layer(RetryLayer::new());
 
+        let operator = operator.layer(super::metrics_layer::IcebergMetricsLayer);
+
         Ok((operator, relative_path))
     }
 

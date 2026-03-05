@@ -69,6 +69,9 @@
 mod file_io;
 mod storage;
 
+mod metrics_layer;
+pub use metrics_layer::IcebergMetricsLayer;
+
 pub use file_io::*;
 pub(crate) mod object_cache;
 

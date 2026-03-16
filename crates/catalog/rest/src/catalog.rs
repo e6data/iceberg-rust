@@ -729,6 +729,7 @@ impl Catalog for RestCatalog {
         let request = context
             .client
             .request(Method::GET, context.config.table_endpoint(table_ident))
+            .query(&[("snapshots", "refs")])
             .build()?;
 
         let http_response = context.client.query_catalog(request).await?;

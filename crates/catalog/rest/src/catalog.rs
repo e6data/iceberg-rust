@@ -51,6 +51,20 @@ pub const REST_CATALOG_PROP_URI: &str = "uri";
 /// REST catalog warehouse location
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 
+// ============ Connection pool configuration properties ============
+/// Maximum number of idle connections per host (default: 10)
+pub const REST_CATALOG_PROP_POOL_MAX_IDLE_PER_HOST: &str = "rest.pool.max-idle-per-host";
+/// Pool idle timeout in seconds (default: 30)
+pub const REST_CATALOG_PROP_POOL_IDLE_TIMEOUT_SECS: &str = "rest.pool.idle-timeout-secs";
+/// TCP keepalive interval in seconds (default: 60)
+pub const REST_CATALOG_PROP_TCP_KEEPALIVE_SECS: &str = "rest.tcp.keepalive-secs";
+/// Connect timeout in seconds (default: 30)
+pub const REST_CATALOG_PROP_CONNECT_TIMEOUT_SECS: &str = "rest.connect-timeout-secs";
+/// Request timeout in seconds (default: 60)
+pub const REST_CATALOG_PROP_REQUEST_TIMEOUT_SECS: &str = "rest.request-timeout-secs";
+/// Enable TCP nodelay (default: true)
+pub const REST_CATALOG_PROP_TCP_NODELAY: &str = "rest.tcp.nodelay";
+
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PATH_V1: &str = "v1";
@@ -197,6 +211,79 @@ impl RestCatalogConfig {
     /// Get the client from the config.
     pub(crate) fn client(&self) -> Option<Client> {
         self.client.clone()
+    }
+
+    /// Build an optimized HTTP client from configuration properties.
+    ///
+    /// If a custom client was provided via `with_client()`, returns that.
+    /// Otherwise, builds a new client with connection pool settings from props.
+    ///
+    /// Supported properties:
+    /// - `rest.pool.max-idle-per-host`: Max idle connections per host (default: 10)
+    /// - `rest.pool.idle-timeout-secs`: Idle connection timeout in seconds (default: 30)
+    /// - `rest.tcp.keepalive-secs`: TCP keepalive interval in seconds (default: 60)
+    /// - `rest.connect-timeout-secs`: Connection timeout in seconds (default: 30)
+    /// - `rest.request-timeout-secs`: Request timeout in seconds (default: 60)
+    /// - `rest.tcp.nodelay`: Enable TCP nodelay (default: true)
+    pub(crate) fn build_client(&self) -> Result<Client> {
+        use std::time::Duration;
+
+        // If custom client provided, use it
+        if let Some(client) = &self.client {
+            return Ok(client.clone());
+        }
+
+        let pool_max_idle = self
+            .props
+            .get(REST_CATALOG_PROP_POOL_MAX_IDLE_PER_HOST)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10usize);
+
+        let pool_idle_timeout = self
+            .props
+            .get(REST_CATALOG_PROP_POOL_IDLE_TIMEOUT_SECS)
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(30));
+
+        let tcp_keepalive = self
+            .props
+            .get(REST_CATALOG_PROP_TCP_KEEPALIVE_SECS)
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(60));
+
+        let connect_timeout = self
+            .props
+            .get(REST_CATALOG_PROP_CONNECT_TIMEOUT_SECS)
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(30));
+
+        let request_timeout = self
+            .props
+            .get(REST_CATALOG_PROP_REQUEST_TIMEOUT_SECS)
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(60));
+
+        let tcp_nodelay = self
+            .props
+            .get(REST_CATALOG_PROP_TCP_NODELAY)
+            .map(|s| s.to_lowercase() != "false")
+            .unwrap_or(true);
+
+        Client::builder()
+            .pool_max_idle_per_host(pool_max_idle)
+            .pool_idle_timeout(pool_idle_timeout)
+            .tcp_keepalive(tcp_keepalive)
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .tcp_nodelay(tcp_nodelay)
+            .build()
+            .map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "Failed to build HTTP client").with_source(e)
+            })
     }
 
     /// Get the token from the config.

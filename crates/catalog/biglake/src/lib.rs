@@ -48,7 +48,7 @@
 //!
 //! use iceberg::{Catalog, CatalogBuilder};
 //! use iceberg_catalog_biglake::{
-//!     BigLakeCatalogBuilder, BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_WAREHOUSE,
+//!     BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_WAREHOUSE, BigLakeCatalogBuilder,
 //! };
 //!
 //! #[tokio::main]
@@ -59,7 +59,10 @@
 //!             HashMap::from([
 //!                 (BIGLAKE_PROJECT_ID.to_string(), "my-project".to_string()),
 //!                 (BIGLAKE_CATALOG_ID.to_string(), "my-catalog".to_string()),
-//!                 (BIGLAKE_WAREHOUSE.to_string(), "gs://my-bucket/warehouse".to_string()),
+//!                 (
+//!                     BIGLAKE_WAREHOUSE.to_string(),
+//!                     "gs://my-bucket/warehouse".to_string(),
+//!                 ),
 //!             ]),
 //!         )
 //!         .await?;

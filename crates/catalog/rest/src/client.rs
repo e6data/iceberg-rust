@@ -56,10 +56,13 @@ impl Debug for HttpClient {
 
 impl HttpClient {
     /// Create a new http client.
+    ///
+    /// Uses `build_client()` to construct an optimized HTTP client with connection
+    /// pool settings from the configuration properties.
     pub fn new(cfg: &RestCatalogConfig) -> Result<Self> {
         let extra_headers = cfg.extra_headers()?;
         Ok(HttpClient {
-            client: cfg.client().unwrap_or_default(),
+            client: cfg.build_client()?,
             token: Mutex::new(cfg.token()),
             token_endpoint: cfg.get_token_endpoint(),
             credential: cfg.credential(),
@@ -72,13 +75,24 @@ impl HttpClient {
     ///
     /// If cfg carries new value, we will use cfg instead.
     /// Otherwise, we will keep the old value.
+    ///
+    /// Note: If a custom client was provided via `with_client()`, that client
+    /// will be used. Otherwise, the existing client is preserved.
     pub fn update_with(self, cfg: &RestCatalogConfig) -> Result<Self> {
         let extra_headers = (!cfg.extra_headers()?.is_empty())
             .then(|| cfg.extra_headers())
             .transpose()?
             .unwrap_or(self.extra_headers);
+
+        // Only rebuild client if a custom client was explicitly provided
+        let client = if cfg.client().is_some() {
+            cfg.build_client()?
+        } else {
+            self.client
+        };
+
         Ok(HttpClient {
-            client: cfg.client().unwrap_or(self.client),
+            client,
             token: Mutex::new(cfg.token().or_else(|| self.token.into_inner())),
             token_endpoint: if !cfg.get_token_endpoint().is_empty() {
                 cfg.get_token_endpoint()

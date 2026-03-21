@@ -106,10 +106,7 @@ pub async fn fetch_gcp_token(service_account: &str) -> Result<Token> {
     if !response.status().is_success() {
         return Err(Error::new(
             ErrorKind::Unexpected,
-            format!(
-                "GCP metadata server returned status {}",
-                response.status()
-            ),
+            format!("GCP metadata server returned status {}", response.status()),
         ));
     }
 

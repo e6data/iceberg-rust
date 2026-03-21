@@ -30,10 +30,10 @@ use iceberg::{
 use iceberg_catalog_rest::RestCatalogBuilder;
 use tokio::sync::RwLock;
 
-use crate::token::{fetch_gcp_token, Token};
+use crate::token::{Token, fetch_gcp_token};
 use crate::{
-    BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_SERVICE_ACCOUNT, BIGLAKE_URI, BIGLAKE_WAREHOUSE,
-    DEFAULT_BIGLAKE_URI,
+    BIGLAKE_CATALOG_ID, BIGLAKE_PROJECT_ID, BIGLAKE_SERVICE_ACCOUNT, BIGLAKE_URI,
+    BIGLAKE_WAREHOUSE, DEFAULT_BIGLAKE_URI,
 };
 
 /// BigLake Catalog configuration.
@@ -326,7 +326,10 @@ impl Catalog for BigLakeCatalog {
 
         let result = {
             let state = self.state.read().await;
-            state.catalog.create_namespace(namespace, properties.clone()).await
+            state
+                .catalog
+                .create_namespace(namespace, properties.clone())
+                .await
         };
 
         match result {
@@ -393,7 +396,10 @@ impl Catalog for BigLakeCatalog {
 
         let result = {
             let state = self.state.read().await;
-            state.catalog.update_namespace(namespace, properties.clone()).await
+            state
+                .catalog
+                .update_namespace(namespace, properties.clone())
+                .await
         };
 
         match result {
@@ -625,8 +631,10 @@ mod tests {
         let err_403 = Error::new(ErrorKind::Unexpected, "HTTP 403 Forbidden");
         assert!(BigLakeCatalog::is_auth_error(&err_403));
 
-        let err_permission =
-            Error::new(ErrorKind::Unexpected, "Permission denied to access resource");
+        let err_permission = Error::new(
+            ErrorKind::Unexpected,
+            "Permission denied to access resource",
+        );
         assert!(BigLakeCatalog::is_auth_error(&err_permission));
 
         let err_other = Error::new(ErrorKind::DataInvalid, "Invalid table name");

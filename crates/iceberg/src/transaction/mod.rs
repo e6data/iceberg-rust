@@ -84,6 +84,8 @@ use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdat
 pub struct Transaction {
     table: Table,
     actions: Vec<BoxedTransactionAction>,
+    /// Optional statistics sidecar to include in the commit request.
+    statistics: Option<serde_json::Value>,
 }
 
 impl Transaction {
@@ -92,7 +94,15 @@ impl Transaction {
         Self {
             table: table.clone(),
             actions: vec![],
+            statistics: None,
         }
+    }
+
+    /// Attach a statistics sidecar to this transaction.
+    /// The JSON value is passed through to the catalog commit request as-is.
+    pub fn with_statistics(mut self, statistics: serde_json::Value) -> Self {
+        self.statistics = Some(statistics);
+        self
     }
 
     fn update_table_metadata(table: Table, updates: &[TableUpdate]) -> Result<Table> {
@@ -238,6 +248,7 @@ impl Transaction {
             .ident(self.table.identifier().to_owned())
             .updates(existing_updates)
             .requirements(existing_requirements)
+            .statistics(self.statistics.clone())
             .build();
 
         catalog.update_table(table_commit).await

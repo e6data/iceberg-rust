@@ -183,6 +183,8 @@ pub(super) struct CommitTableRequest {
     pub(super) identifier: TableIdent,
     pub(super) requirements: Vec<TableRequirement>,
     pub(super) updates: Vec<TableUpdate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) statistics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

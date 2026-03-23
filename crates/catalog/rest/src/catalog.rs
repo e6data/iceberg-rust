@@ -909,6 +909,7 @@ impl Catalog for RestCatalog {
                 identifier: commit.identifier().clone(),
                 requirements: commit.take_requirements(),
                 updates: commit.take_updates(),
+                statistics: commit.take_statistics(),
             })
             .build()?;
 

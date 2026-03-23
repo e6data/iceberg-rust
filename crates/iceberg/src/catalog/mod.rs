@@ -309,6 +309,10 @@ pub struct TableCommit {
     requirements: Vec<TableRequirement>,
     /// The updates of the table.
     updates: Vec<TableUpdate>,
+    /// Optional statistics sidecar (opaque JSON, passed through to catalog).
+    /// The catalog interprets this as aggregate stats deltas to merge at commit time.
+    #[builder(default)]
+    statistics: Option<serde_json::Value>,
 }
 
 impl TableCommit {
@@ -325,6 +329,11 @@ impl TableCommit {
     /// Take all updates.
     pub fn take_updates(&mut self) -> Vec<TableUpdate> {
         take(&mut self.updates)
+    }
+
+    /// Take the statistics sidecar, if present.
+    pub fn take_statistics(&mut self) -> Option<serde_json::Value> {
+        self.statistics.take()
     }
 
     /// Applies this [`TableCommit`] to the given [`Table`] as part of a catalog update.

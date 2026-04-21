@@ -77,6 +77,8 @@ pub(crate) struct SnapshotProducer<'a> {
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
+    removed_data_files: Vec<DataFile>,
+    data_sequence_number: Option<i64>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -100,8 +102,20 @@ impl<'a> SnapshotProducer<'a> {
             snapshot_properties,
             added_data_files,
             added_delete_files,
+            removed_data_files: vec![],
+            data_sequence_number: None,
             manifest_counter: (0..),
         }
+    }
+
+    pub(crate) fn with_removed_data_files(mut self, files: Vec<DataFile>) -> Self {
+        self.removed_data_files = files;
+        self
+    }
+
+    pub(crate) fn with_data_sequence_number(mut self, seq_num: i64) -> Self {
+        self.data_sequence_number = Some(seq_num);
+        self
     }
 
     pub(crate) fn validate_added_data_files(&self, added_data_files: &[DataFile]) -> Result<()> {
@@ -371,6 +385,7 @@ impl<'a> SnapshotProducer<'a> {
         if self.added_data_files.is_empty()
             && self.snapshot_properties.is_empty()
             && self.added_delete_files.is_empty()
+            && self.removed_data_files.is_empty()
         {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
@@ -438,6 +453,15 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
+        // Track removed data files
+        for removed_file in &self.removed_data_files {
+            summary_collector.remove_file(
+                removed_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
         let previous_snapshot = table_metadata
             .snapshot_by_id(self.snapshot_id)
             .and_then(|snapshot| snapshot.parent_snapshot_id())
@@ -476,14 +500,14 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<ActionCommit> {
+        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
+            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
+        })?;
+
         let new_manifests = self
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
         let next_seq_num = self.table.metadata().next_sequence_number();
-
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
-            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
-        })?;
 
         let manifest_list_path = self.generate_manifest_list_file_path(0);
 

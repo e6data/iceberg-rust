@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod replace_data_files;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -72,6 +73,7 @@ use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
+use crate::transaction::replace_data_files::ReplaceDataFilesAction;
 use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -145,6 +147,11 @@ impl Transaction {
     /// Creates a row delta action for atomically committing data and delete files.
     pub fn row_delta(&self) -> RowDeltaAction {
         RowDeltaAction::new()
+    }
+
+    /// Creates a replace data files action for atomic file compaction.
+    pub fn replace_data_files(&self) -> ReplaceDataFilesAction {
+        ReplaceDataFilesAction::new()
     }
 
     /// Creates replace sort order action.

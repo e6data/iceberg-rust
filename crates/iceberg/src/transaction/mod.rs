@@ -86,6 +86,11 @@ use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdat
 pub struct Transaction {
     table: Table,
     actions: Vec<BoxedTransactionAction>,
+    /// Tracks whether this is the first commit attempt.
+    /// On the first attempt, we skip the expensive `load_table` call
+    /// and use the table reference we already have (optimistic commit).
+    /// On retries, we reload to pick up concurrent changes.
+    first_attempt: bool,
 }
 
 impl Transaction {
@@ -94,6 +99,7 @@ impl Transaction {
         Self {
             table: table.clone(),
             actions: vec![],
+            first_attempt: true,
         }
     }
 
@@ -217,13 +223,21 @@ impl Transaction {
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
-        let refreshed = catalog.load_table(self.table.identifier()).await?;
+        // On the first attempt, skip the expensive load_table and use the
+        // table reference we already have (optimistic commit). The catalog's
+        // assert-table-uuid and assert-ref-snapshot-id requirements will
+        // reject the commit if the table has changed. On retries, reload
+        // to pick up concurrent changes.
+        if self.first_attempt {
+            self.first_attempt = false;
+        } else {
+            let refreshed = catalog.load_table(self.table.identifier()).await?;
 
-        if self.table.metadata() != refreshed.metadata()
-            || self.table.metadata_location() != refreshed.metadata_location()
-        {
-            // current base is stale, use refreshed as base and re-apply transaction actions
-            self.table = refreshed.clone();
+            if self.table.metadata() != refreshed.metadata()
+                || self.table.metadata_location() != refreshed.metadata_location()
+            {
+                self.table = refreshed.clone();
+            }
         }
 
         let mut current_table = self.table.clone();

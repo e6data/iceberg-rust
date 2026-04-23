@@ -43,17 +43,115 @@ use crate::client::{
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateTableRequest,
     ListNamespaceResponse, ListTableResponse, LoadTableResponse, NamespaceSerde,
-    RegisterTableRequest, RenameTableRequest,
+    RegisterTableRequest, RenameTableRequest, StorageCredential,
 };
 
 /// REST catalog URI
 pub const REST_CATALOG_PROP_URI: &str = "uri";
 /// REST catalog warehouse location
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
+/// Value for the `X-Iceberg-Access-Delegation` header sent on table operations.
+///
+/// The spec allows a comma-separated list of `vended-credentials` and
+/// `remote-signing`. The client defaults to `vended-credentials` because that
+/// is the dominant Polaris / Unity / Nessie deployment pattern; set the prop
+/// to an empty string to disable the header entirely, or provide a custom
+/// value to opt in to `remote-signing` or both. An explicit
+/// `header.X-Iceberg-Access-Delegation` in props takes precedence.
+pub const REST_CATALOG_PROP_ACCESS_DELEGATION: &str = "rest.access-delegation";
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PATH_V1: &str = "v1";
+const DEFAULT_ACCESS_DELEGATION: &str = "vended-credentials";
+const ACCESS_DELEGATION_HEADER: &str = "x-iceberg-access-delegation";
+
+/// Keys that Java's `OAuth2Manager` forwards to a child auth session instead
+/// of to FileIO. We strip them out of `LoadTableResponse.config` before
+/// merging into FileIO props; honoring them for per-table auth is deferred
+/// to the `AuthManager` trait work (PR-4).
+const AUTH_TOKEN_KEYS: &[&str] = &[
+    "token",
+    "urn:ietf:params:oauth:token-type:id_token",
+    "urn:ietf:params:oauth:token-type:access_token",
+    "urn:ietf:params:oauth:token-type:jwt",
+    "urn:ietf:params:oauth:token-type:saml2",
+    "urn:ietf:params:oauth:token-type:saml1",
+];
+
+/// Pick the credential whose `prefix` is the longest prefix of `location`.
+/// Matches the Iceberg REST OpenAPI rule: clients should choose the most
+/// specific prefix (by selecting the longest) when several credentials of the
+/// same type are available.
+fn select_storage_credential<'a>(
+    credentials: &'a [StorageCredential],
+    location: &str,
+) -> Option<&'a HashMap<String, String>> {
+    credentials
+        .iter()
+        .filter(|c| location.starts_with(&c.prefix))
+        .max_by_key(|c| c.prefix.len())
+        .map(|c| &c.config)
+}
+
+/// Filter the `config` map returned by a `loadTable`-style response so that
+/// auth-token keys don't leak into FileIO. Returns the filtered map. Logs a
+/// warning when a per-table `token` is dropped so operators know a Polaris
+/// feature is currently unused.
+fn filter_loadtable_config(
+    config: HashMap<String, String>,
+    table_ident: &TableIdent,
+) -> HashMap<String, String> {
+    if config.contains_key("token") {
+        tracing::warn!(
+            table = %table_ident,
+            "loadTable response contains per-table `token`; it is ignored until AuthManager trait support lands (PR-4)"
+        );
+    }
+    config
+        .into_iter()
+        .filter(|(k, _)| !AUTH_TOKEN_KEYS.contains(&k.as_str()))
+        .collect()
+}
+
+/// Build the FileIO property map for a table, combining (in priority order,
+/// lowest first):
+///   1. Filtered `LoadTableResponse.config` (token keys stripped).
+///   2. Longest-prefix `storage-credentials[]` entry for the table's location.
+///   3. User-supplied catalog props (always win, matching existing semantics).
+fn build_table_file_io_props(
+    response_config: Option<HashMap<String, String>>,
+    storage_credentials: Option<&[StorageCredential]>,
+    table_ident: &TableIdent,
+    metadata_location: Option<&str>,
+    user_props: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut props = filter_loadtable_config(response_config.unwrap_or_default(), table_ident);
+
+    if let (Some(creds), Some(loc)) = (storage_credentials, metadata_location) {
+        match select_storage_credential(creds, loc) {
+            Some(selected) => {
+                tracing::debug!(
+                    table = %table_ident,
+                    metadata_location = loc,
+                    "applying vended storage credential"
+                );
+                props.extend(selected.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            None if !creds.is_empty() => {
+                tracing::warn!(
+                    table = %table_ident,
+                    metadata_location = loc,
+                    "loadTable response has storage-credentials but none matched the table location"
+                );
+            }
+            None => {}
+        }
+    }
+
+    props.extend(user_props.iter().map(|(k, v)| (k.clone(), v.clone())));
+    props
+}
 
 /// Builder for [`RestCatalog`].
 #[derive(Debug)]
@@ -247,6 +345,36 @@ impl RestCatalogConfig {
             ),
         ]);
 
+        // Default `X-Iceberg-Access-Delegation: vended-credentials` unless the
+        // user supplied a first-class override via `rest.access-delegation`
+        // or a raw `header.X-Iceberg-Access-Delegation` entry. This matches
+        // PyIceberg's default (send) rather than Java's (opt-in), because the
+        // typical Polaris deployment relies on vended credentials and we want
+        // table loads to surface storage creds without extra configuration.
+        let has_explicit_delegation_header = self
+            .props
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("header.X-Iceberg-Access-Delegation"));
+        if !has_explicit_delegation_header {
+            let delegation = self
+                .props
+                .get(REST_CATALOG_PROP_ACCESS_DELEGATION)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_ACCESS_DELEGATION);
+            if !delegation.is_empty() {
+                headers.insert(
+                    HeaderName::from_static(ACCESS_DELEGATION_HEADER),
+                    HeaderValue::from_str(delegation).map_err(|e| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Invalid access-delegation value: {delegation}"),
+                        )
+                        .with_source(e)
+                    })?,
+                );
+            }
+        }
+
         for (key, value) in self
             .props
             .iter()
@@ -352,7 +480,7 @@ impl RestCatalog {
                 let client = HttpClient::new(&self.user_config)?;
                 let catalog_config = RestCatalog::load_config(&client, &self.user_config).await?;
                 let config = self.user_config.clone().merge_with_config(catalog_config);
-                let client = client.update_with(&config)?;
+                let client = client.update_with(&config).await?;
 
                 Ok(RestContext { config, client })
             })
@@ -695,15 +823,16 @@ impl Catalog for RestCatalog {
             "Metadata location missing in `create_table` response!",
         ))?;
 
-        let config = response
-            .config
-            .unwrap_or_default()
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
+        let file_io_props = build_table_file_io_props(
+            response.config,
+            response.storage_credentials.as_deref(),
+            &table_ident,
+            Some(metadata_location.as_str()),
+            &self.user_config.props,
+        );
 
         let file_io = self
-            .load_file_io(Some(metadata_location), Some(config))
+            .load_file_io(Some(metadata_location), Some(file_io_props))
             .await?;
 
         let table_builder = Table::builder()
@@ -747,15 +876,16 @@ impl Catalog for RestCatalog {
             _ => return Err(deserialize_unexpected_catalog_error(http_response).await),
         };
 
-        let config = response
-            .config
-            .unwrap_or_default()
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
+        let file_io_props = build_table_file_io_props(
+            response.config,
+            response.storage_credentials.as_deref(),
+            table_ident,
+            response.metadata_location.as_deref(),
+            &self.user_config.props,
+        );
 
         let file_io = self
-            .load_file_io(response.metadata_location.as_deref(), Some(config))
+            .load_file_io(response.metadata_location.as_deref(), Some(file_io_props))
             .await?;
 
         let table_builder = Table::builder()
@@ -886,7 +1016,17 @@ impl Catalog for RestCatalog {
             "Metadata location missing in `register_table` response!",
         ))?;
 
-        let file_io = self.load_file_io(Some(metadata_location), None).await?;
+        let file_io_props = build_table_file_io_props(
+            response.config,
+            response.storage_credentials.as_deref(),
+            table_ident,
+            Some(metadata_location.as_str()),
+            &self.user_config.props,
+        );
+
+        let file_io = self
+            .load_file_io(Some(metadata_location), Some(file_io_props))
+            .await?;
 
         Table::builder()
             .identifier(table_ident.clone())
@@ -968,6 +1108,7 @@ mod tests {
     use std::fs::File;
     use std::io::BufReader;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use chrono::{TimeZone, Utc};
     use iceberg::spec::{
@@ -1218,6 +1359,512 @@ mod tests {
         assert_eq!(token, Some("ey000000000001".to_string()));
     }
 
+    async fn create_oauth_mock_with_expiry(
+        server: &mut ServerGuard,
+        token: &str,
+        expires_in_secs: u64,
+        expected_calls: usize,
+    ) -> Mock {
+        let body = format!(
+            r#"{{
+                "access_token": "{token}",
+                "token_type": "Bearer",
+                "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "expires_in": {expires_in_secs}
+            }}"#
+        );
+        server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(200)
+            .with_body(body)
+            .expect(expected_calls)
+            .create_async()
+            .await
+    }
+
+    /// When the server omits `expires_in`, auto-refresh is disabled: the
+    /// first token remains cached and no second mint occurs.
+    #[tokio::test]
+    async fn test_no_refresh_when_expires_in_absent() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        // Body deliberately omits `expires_in`.
+        let body = r#"{
+            "access_token": "permanent000000",
+            "token_type": "Bearer",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token"
+        }"#;
+        let mint_mock = server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(200)
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        let token = catalog.context().await.unwrap().client.token().await;
+        assert_eq!(token, Some("permanent000000".to_string()));
+        mint_mock.assert_async().await;
+        config_mock.assert_async().await;
+
+        // Wait past any plausible refresh window; mint_mock.expect(1) would
+        // fail at Drop if a refresh fired.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let token = catalog.context().await.unwrap().client.token().await;
+        assert_eq!(token, Some("permanent000000".to_string()));
+    }
+
+    #[test]
+    fn select_storage_credential_picks_longest_prefix() {
+        let creds = vec![
+            StorageCredential {
+                prefix: "s3://bucket".to_string(),
+                config: HashMap::from([("s3.region".into(), "us-east-1".into())]),
+            },
+            StorageCredential {
+                prefix: "s3://bucket/warehouse/ns/table".to_string(),
+                config: HashMap::from([("s3.access-key-id".into(), "vended".into())]),
+            },
+            StorageCredential {
+                prefix: "s3://other-bucket".to_string(),
+                config: HashMap::from([("s3.region".into(), "us-west-2".into())]),
+            },
+        ];
+        let selected = select_storage_credential(
+            &creds,
+            "s3://bucket/warehouse/ns/table/metadata/00000.json",
+        )
+        .expect("should match longest prefix");
+        assert_eq!(selected.get("s3.access-key-id"), Some(&"vended".to_string()));
+        assert!(!selected.contains_key("s3.region"));
+    }
+
+    #[test]
+    fn select_storage_credential_no_match() {
+        let creds = vec![StorageCredential {
+            prefix: "s3://other-bucket".to_string(),
+            config: HashMap::from([("s3.region".into(), "us-west-2".into())]),
+        }];
+        assert!(select_storage_credential(&creds, "s3://bucket/t/m.json").is_none());
+    }
+
+    #[test]
+    fn filter_loadtable_config_strips_token_keys() {
+        let cfg = HashMap::from([
+            ("token".to_string(), "secret".to_string()),
+            (
+                "urn:ietf:params:oauth:token-type:jwt".to_string(),
+                "jwt-value".to_string(),
+            ),
+            ("s3.region".to_string(), "us-east-1".to_string()),
+            ("client.region".to_string(), "us-east-1".to_string()),
+        ]);
+        let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
+        let out = filter_loadtable_config(cfg, &ident);
+        assert!(!out.contains_key("token"));
+        assert!(!out.contains_key("urn:ietf:params:oauth:token-type:jwt"));
+        assert_eq!(out.get("s3.region"), Some(&"us-east-1".to_string()));
+        assert_eq!(out.get("client.region"), Some(&"us-east-1".to_string()));
+    }
+
+    #[test]
+    fn build_table_file_io_props_priority_order() {
+        // Response config sets region us-east-1. Vended creds override with
+        // us-west-2. User props override with us-central-1. Expected: user wins.
+        let response_config = Some(HashMap::from([
+            ("s3.region".to_string(), "us-east-1".to_string()),
+            ("token".to_string(), "should-be-stripped".to_string()),
+        ]));
+        let creds = vec![StorageCredential {
+            prefix: "s3://bucket/".to_string(),
+            config: HashMap::from([
+                ("s3.region".into(), "us-west-2".into()),
+                ("s3.access-key-id".into(), "VENDED".into()),
+            ]),
+        }];
+        let user_props = HashMap::from([("s3.region".to_string(), "us-central-1".to_string())]);
+
+        let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
+        let props = build_table_file_io_props(
+            response_config,
+            Some(&creds),
+            &ident,
+            Some("s3://bucket/table/metadata/1.json"),
+            &user_props,
+        );
+        assert_eq!(props.get("s3.region"), Some(&"us-central-1".to_string())); // user wins
+        assert_eq!(props.get("s3.access-key-id"), Some(&"VENDED".to_string())); // vended reaches through where not overridden
+        assert!(!props.contains_key("token")); // stripped
+    }
+
+    /// `load_table` surfaces a server-vended credential in the FileIO props
+    /// when the table location matches the credential prefix. The test
+    /// inspects the header sent to the catalog to confirm the client opts in
+    /// to vended credentials by default.
+    #[tokio::test]
+    async fn test_load_table_applies_vended_credentials() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let oauth_mock = create_oauth_mock(&mut server).await;
+
+        // Build a minimal LoadTableResponse carrying storage-credentials.
+        // We reuse the on-disk fixture for metadata and splice config /
+        // storage-credentials into it.
+        let fixture_path = format!(
+            "{}/testdata/load_table_response.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let fixture =
+            std::fs::read_to_string(&fixture_path).expect("load_table_response.json fixture missing");
+        let mut body: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+        body["storage-credentials"] = json!([
+            {
+                "prefix": "s3://iceberg-catalog",
+                "config": {
+                    "s3.access-key-id": "AKIA_VENDED",
+                    "s3.secret-access-key": "SECRET_VENDED",
+                    "s3.session-token": "SESSION_VENDED",
+                    "s3.region": "us-east-2"
+                }
+            }
+        ]);
+        body["config"] = json!({
+            "token": "per-table-should-be-stripped",
+            "client.region": "us-east-2"
+        });
+
+        let load_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/t1")
+            .match_query(mockito::Matcher::Any)
+            .match_header("x-iceberg-access-delegation", "vended-credentials")
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        let _table = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("ns1".into()),
+                "t1".into(),
+            ))
+            .await
+            .expect("load_table should succeed");
+
+        // mockito's `match_header` + strict mock semantics mean the mock only
+        // matches if the delegation header is present — so `load_mock.assert`
+        // succeeding implicitly verifies the header was sent and the response
+        // parsed cleanly through the storage-credentials path. FileIO prop
+        // merging is covered by `build_table_file_io_props_priority_order`.
+        config_mock.assert_async().await;
+        oauth_mock.assert_async().await;
+        load_mock.assert_async().await;
+    }
+
+    /// Setting `rest.access-delegation` to empty string suppresses the
+    /// header. Used by clients deployed against catalogs that don't vend
+    /// credentials to avoid unnecessary server-side work.
+    #[tokio::test]
+    async fn test_access_delegation_can_be_disabled() {
+        let config = RestCatalogConfig {
+            name: None,
+            uri: "http://localhost".to_string(),
+            warehouse: None,
+            client: None,
+            props: HashMap::from([(
+                REST_CATALOG_PROP_ACCESS_DELEGATION.to_string(),
+                "".to_string(),
+            )]),
+        };
+        let headers = config.extra_headers().unwrap();
+        assert!(!headers.contains_key(ACCESS_DELEGATION_HEADER));
+    }
+
+    /// Explicit `header.X-Iceberg-Access-Delegation=…` takes precedence over
+    /// the default, letting users opt in to `remote-signing` or both.
+    #[tokio::test]
+    async fn test_access_delegation_explicit_override() {
+        let config = RestCatalogConfig {
+            name: None,
+            uri: "http://localhost".to_string(),
+            warehouse: None,
+            client: None,
+            props: HashMap::from([(
+                "header.X-Iceberg-Access-Delegation".to_string(),
+                "remote-signing".to_string(),
+            )]),
+        };
+        let headers = config.extra_headers().unwrap();
+        let v = headers
+            .get(ACCESS_DELEGATION_HEADER)
+            .expect("delegation header must be present");
+        assert_eq!(v.to_str().unwrap(), "remote-signing");
+    }
+
+    /// 401 from the catalog triggers token invalidation and a single retry
+    /// with a freshly minted token. Proves the resilience path used when
+    /// the refresh task silently died, clock skewed, or the process paused
+    /// long enough to miss the refresh window.
+    #[tokio::test]
+    async fn test_401_triggers_reauth_and_retry_once() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        // Two successive OAuth mints: first token "A" (used for /v1/config),
+        // second "B" (used for the retry after 401).
+        let oauth_mock_a =
+            create_oauth_mock_with_expiry(&mut server, "tokenA_expired", 3600, 1).await;
+        let list_401 = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let oauth_mock_b =
+            create_oauth_mock_with_expiry(&mut server, "tokenB_fresh", 3600, 1).await;
+        let list_ok = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(200)
+            .with_body(r#"{"namespaces":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces should succeed after 401 retry");
+
+        config_mock.assert_async().await;
+        oauth_mock_a.assert_async().await;
+        list_401.assert_async().await;
+        oauth_mock_b.assert_async().await;
+        list_ok.assert_async().await;
+    }
+
+    /// Back-to-back 401s bubble up rather than looping forever.
+    #[tokio::test]
+    async fn test_401_only_retries_once() {
+        let mut server = Server::new_async().await;
+        let _config_mock = create_config_mock(&mut server).await;
+        let _oauth_a =
+            create_oauth_mock_with_expiry(&mut server, "tokenA", 3600, 1).await;
+        let first_401 = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let _oauth_b =
+            create_oauth_mock_with_expiry(&mut server, "tokenB", 3600, 1).await;
+        let second_401 = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        let result = catalog.list_namespaces(None).await;
+        assert!(result.is_err(), "second 401 must bubble up");
+        first_401.assert_async().await;
+        second_401.assert_async().await;
+    }
+
+    /// 429 with `Retry-After: 1` causes the client to sleep for at least a
+    /// second and retry. Proves honor of the spec-defined Retry-After form.
+    #[tokio::test]
+    async fn test_429_honors_retry_after_and_succeeds() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let oauth_mock = create_oauth_mock(&mut server).await;
+
+        let rate_limited = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(429)
+            .with_header("retry-after", "1")
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(200)
+            .with_body(r#"{"namespaces":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        let start = std::time::Instant::now();
+        catalog
+            .list_namespaces(None)
+            .await
+            .expect("should succeed after 429 backoff");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(950),
+            "expected at least ~1s of backoff, got {:?}",
+            elapsed
+        );
+
+        config_mock.assert_async().await;
+        oauth_mock.assert_async().await;
+        rate_limited.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    /// 503 Service Unavailable is treated the same as 429. Falls back to
+    /// exponential backoff when Retry-After is absent.
+    #[tokio::test]
+    async fn test_503_retries_with_exponential_backoff() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let oauth_mock = create_oauth_mock(&mut server).await;
+
+        let unavailable = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(200)
+            .with_body(r#"{"namespaces":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        let start = std::time::Instant::now();
+        catalog
+            .list_namespaces(None)
+            .await
+            .expect("should succeed after 503 retry");
+        let elapsed = start.elapsed();
+        // Default first backoff is 500ms.
+        assert!(
+            elapsed >= Duration::from_millis(450),
+            "expected at least ~500ms of backoff, got {:?}",
+            elapsed
+        );
+
+        config_mock.assert_async().await;
+        oauth_mock.assert_async().await;
+        unavailable.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    /// Persistent rate-limiting exhausts retries and bubbles up. Confirms
+    /// the cap prevents infinite loops under a broken server.
+    #[tokio::test]
+    async fn test_429_gives_up_after_max_retries() {
+        let mut server = Server::new_async().await;
+        let _config_mock = create_config_mock(&mut server).await;
+        let _oauth_mock = create_oauth_mock(&mut server).await;
+
+        // Initial + 3 retries = 4 attempts total. Use Retry-After: 0 so the
+        // test stays fast.
+        let throttled = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(429)
+            .with_header("retry-after", "0")
+            .expect(4)
+            .create_async()
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        let result = catalog.list_namespaces(None).await;
+        assert!(result.is_err(), "persistent 429 must surface as error");
+        throttled.assert_async().await;
+    }
+
+    /// `update_with` should reuse the existing `TokenState` (preserving the
+    /// cached token) when the token endpoint, credential, and oauth params
+    /// are unchanged — the common case for the `/v1/config` → merged-config
+    /// transition. Verified by checking exactly one mint occurred across
+    /// both `HttpClient::new` and `update_with`.
+    #[tokio::test]
+    async fn test_update_with_reuses_token_state() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        // `.expect(1)` — if update_with rebuilt state and re-minted, this fails.
+        let mint_mock =
+            create_oauth_mock_with_expiry(&mut server, "reused000000000", 3600, 1).await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        let token = catalog.context().await.unwrap().client.token().await;
+        assert_eq!(token, Some("reused000000000".to_string()));
+        mint_mock.assert_async().await;
+        config_mock.assert_async().await;
+    }
+
     #[tokio::test]
     async fn test_regenerate_token_failing_request() {
         let mut server = Server::new_async().await;
@@ -1276,6 +1923,10 @@ mod tests {
                 header::USER_AGENT,
                 HeaderValue::from_str(&format!("iceberg-rs/{}", CARGO_PKG_VERSION)).unwrap(),
             ),
+            (
+                HeaderName::from_static(ACCESS_DELEGATION_HEADER),
+                HeaderValue::from_static(DEFAULT_ACCESS_DELEGATION),
+            ),
         ]);
         assert_eq!(headers, expected_headers);
     }
@@ -1312,6 +1963,10 @@ mod tests {
             (
                 header::USER_AGENT,
                 HeaderValue::from_str(&format!("iceberg-rs/{}", CARGO_PKG_VERSION)).unwrap(),
+            ),
+            (
+                HeaderName::from_static(ACCESS_DELEGATION_HEADER),
+                HeaderValue::from_static(DEFAULT_ACCESS_DELEGATION),
             ),
             (
                 HeaderName::from_static("customized-header"),

@@ -507,6 +507,13 @@ impl<'a> SnapshotProducer<'a> {
         let new_manifests = self
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
+
+        // Capture manifest paths for callers that need manifest-aware compaction
+        let created_manifest_paths: Vec<String> = new_manifests
+            .iter()
+            .map(|m| m.manifest_path.clone())
+            .collect();
+
         let next_seq_num = self.table.metadata().next_sequence_number();
 
         let manifest_list_path = self.generate_manifest_list_file_path(0);
@@ -565,6 +572,6 @@ impl<'a> SnapshotProducer<'a> {
             },
         ];
 
-        Ok(ActionCommit::new(updates, requirements))
+        Ok(ActionCommit::new(updates, requirements).with_manifest_paths(created_manifest_paths))
     }
 }

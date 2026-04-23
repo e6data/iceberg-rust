@@ -87,10 +87,10 @@ pub struct Transaction {
     table: Table,
     actions: Vec<BoxedTransactionAction>,
     /// Tracks whether this is the first commit attempt.
-    /// On the first attempt, we skip the expensive `load_table` call
-    /// and use the table reference we already have (optimistic commit).
-    /// On retries, we reload to pick up concurrent changes.
     first_attempt: bool,
+    /// Manifest file paths created during the last successful commit.
+    /// Used by callers (e.g. Laminar's IcebergSink) for manifest-aware compaction.
+    pub created_manifest_paths: Vec<String>,
 }
 
 impl Transaction {
@@ -100,6 +100,7 @@ impl Transaction {
             table: table.clone(),
             actions: vec![],
             first_attempt: true,
+            created_manifest_paths: Vec::new(),
         }
     }
 
@@ -244,8 +245,11 @@ impl Transaction {
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
 
+        let mut all_manifest_paths: Vec<String> = Vec::new();
+
         for action in &self.actions {
             let action_commit = Arc::clone(action).commit(&current_table).await?;
+            all_manifest_paths.extend(action_commit.created_manifest_paths.iter().cloned());
             // apply action commit to current_table
             current_table = Self::apply(
                 current_table,
@@ -261,7 +265,11 @@ impl Transaction {
             .requirements(existing_requirements)
             .build();
 
-        catalog.update_table(table_commit).await
+        let result = catalog.update_table(table_commit).await;
+        if result.is_ok() {
+            self.created_manifest_paths = all_manifest_paths;
+        }
+        result
     }
 }
 

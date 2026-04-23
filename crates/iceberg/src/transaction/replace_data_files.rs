@@ -17,12 +17,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestContentType, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{
+    DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
+    ManifestWriterBuilder, Operation,
+};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
@@ -34,8 +38,8 @@ use crate::{Error, ErrorKind};
 /// in a table. This is the core primitive for compaction: old data files are removed and
 /// new (compacted) data files are added in a single atomic snapshot.
 ///
-/// Phase 1 constraint: Manifests that contain a mix of deleted and surviving entries
-/// are rejected. Each manifest must contain ONLY entries that are all deleted or all surviving.
+/// For manifests containing a mix of deleted and surviving entries, a new manifest is
+/// written with only the surviving entries. Manifests with all entries deleted are dropped.
 pub struct ReplaceDataFilesAction {
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
@@ -154,6 +158,9 @@ impl TransactionAction for ReplaceDataFilesAction {
         let replace_op = ReplaceOperation {
             files_to_delete: self.files_to_delete.clone(),
             delete_manifest_paths: self.delete_manifest_paths.clone(),
+            commit_uuid: self.commit_uuid.unwrap_or_else(Uuid::now_v7),
+            key_metadata: self.key_metadata.clone(),
+            rewrite_counter: AtomicU64::new(1000),
         };
 
         snapshot_producer
@@ -165,10 +172,18 @@ impl TransactionAction for ReplaceDataFilesAction {
 /// The operation implementation for replace-data-files.
 /// Loads existing manifests, marks entries matching `files_to_delete` as DELETED,
 /// and filters out manifests that contain only deleted entries.
+/// Mixed manifests (containing both deleted and surviving entries) are rewritten
+/// with only the surviving entries.
 struct ReplaceOperation {
     files_to_delete: Vec<DataFile>,
     /// Fast path: known manifest paths to drop without loading from S3.
     delete_manifest_paths: HashSet<String>,
+    /// UUID for generating unique rewritten manifest paths.
+    commit_uuid: Uuid,
+    /// Key metadata for rewritten manifests.
+    key_metadata: Option<Vec<u8>>,
+    /// Counter for generating unique manifest file names for rewrites.
+    rewrite_counter: AtomicU64,
 }
 
 impl SnapshotProduceOperation for ReplaceOperation {
@@ -278,18 +293,47 @@ impl SnapshotProduceOperation for ReplaceOperation {
                     found_files.insert(entry.file_path().to_string());
                 }
             } else {
-                // Phase 1 constraint: mixed manifests (some deleted, some surviving) are rejected
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    format!(
-                        "Manifest {} contains both deleted and surviving entries. \
-                         Phase 1 requires manifests to be fully replaced or fully kept. \
-                         Found {} entries to delete out of {} alive entries.",
-                        manifest_entry.manifest_path,
-                        deleted_count,
-                        alive_entries.len()
-                    ),
-                ));
+                // Mixed manifest: rewrite with only surviving entries.
+                let counter = self.rewrite_counter.fetch_add(1, Ordering::Relaxed);
+                let new_manifest_path = format!(
+                    "{}/metadata/{}-m{}.{}",
+                    snapshot_produce.table.metadata().location(),
+                    self.commit_uuid,
+                    counter,
+                    DataFileFormat::Avro
+                );
+                let output_file =
+                    snapshot_produce.table.file_io().new_output(&new_manifest_path)?;
+                let builder = ManifestWriterBuilder::new(
+                    output_file,
+                    None, // snapshot_id inherited from entries
+                    self.key_metadata.clone(),
+                    snapshot_produce.table.metadata().current_schema().clone(),
+                    snapshot_produce
+                        .table
+                        .metadata()
+                        .default_partition_spec()
+                        .as_ref()
+                        .clone(),
+                );
+                let mut writer =
+                    if snapshot_produce.table.metadata().format_version() == FormatVersion::V1 {
+                        builder.build_v1()
+                    } else {
+                        builder.build_v2_data()
+                    };
+
+                // Write surviving entries as EXISTING
+                for entry in &alive_entries {
+                    if !delete_set.contains(entry.file_path()) {
+                        writer.add_existing_entry(entry.as_ref().clone())?;
+                    } else {
+                        found_files.insert(entry.file_path().to_string());
+                    }
+                }
+
+                let rewritten_manifest = writer.write_manifest_file().await?;
+                result_manifests.push(rewritten_manifest);
             }
         }
 

@@ -186,9 +186,22 @@ impl Transaction {
 
     /// Commit transaction.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        self.commit_with_manifest_paths(catalog)
+            .await
+            .map(|(table, _)| table)
+    }
+
+    /// Commit transaction and return the manifest paths created during the commit.
+    ///
+    /// Returns the updated `Table` and the list of manifest file paths
+    /// created during the commit (useful for manifest-aware compaction).
+    pub async fn commit_with_manifest_paths(
+        self,
+        catalog: &dyn Catalog,
+    ) -> Result<(Table, Vec<String>)> {
         if self.actions.is_empty() {
             // nothing to commit
-            return Ok(self.table);
+            return Ok((self.table, Vec::new()));
         }
 
         let table_props =
@@ -199,7 +212,7 @@ impl Transaction {
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
 
-        (|mut tx: Transaction| async {
+        let (tx, result) = (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
             (tx, result)
         })
@@ -207,8 +220,9 @@ impl Transaction {
         .sleep(tokio::time::sleep)
         .context(tx)
         .when(|e| e.retryable())
-        .await
-        .1
+        .await;
+
+        result.map(|table| (table, tx.created_manifest_paths))
     }
 
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {

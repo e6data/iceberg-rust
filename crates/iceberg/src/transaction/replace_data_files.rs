@@ -44,6 +44,11 @@ pub struct ReplaceDataFilesAction {
     files_to_add: Vec<DataFile>,
     validate_from_snapshot_id: Option<i64>,
     data_sequence_number: Option<i64>,
+    /// Known manifest paths that contain ONLY files being deleted.
+    /// When provided, `existing_manifest()` drops these manifests by path
+    /// without loading them from S3 — eliminating the manifest-read bottleneck.
+    /// Falls back to the slow path (loading all manifests) if empty.
+    delete_manifest_paths: HashSet<String>,
 }
 
 impl ReplaceDataFilesAction {
@@ -56,7 +61,21 @@ impl ReplaceDataFilesAction {
             files_to_add: vec![],
             validate_from_snapshot_id: None,
             data_sequence_number: None,
+            delete_manifest_paths: HashSet::new(),
         }
+    }
+
+    /// Provide known manifest paths that contain ONLY files being deleted.
+    ///
+    /// When the writer (e.g. Laminar's IcebergSink) tracks which manifests
+    /// its files landed in, it can pass those paths here to skip the
+    /// expensive manifest-loading step in `existing_manifest()`.
+    ///
+    /// Each manifest in this set will be dropped from the manifest list
+    /// without reading its contents from S3.
+    pub fn delete_manifests(mut self, paths: impl IntoIterator<Item = String>) -> Self {
+        self.delete_manifest_paths.extend(paths);
+        self
     }
 
     /// Set the data files to delete (the old files being replaced).
@@ -134,6 +153,7 @@ impl TransactionAction for ReplaceDataFilesAction {
 
         let replace_op = ReplaceOperation {
             files_to_delete: self.files_to_delete.clone(),
+            delete_manifest_paths: self.delete_manifest_paths.clone(),
         };
 
         snapshot_producer
@@ -147,6 +167,8 @@ impl TransactionAction for ReplaceDataFilesAction {
 /// and filters out manifests that contain only deleted entries.
 struct ReplaceOperation {
     files_to_delete: Vec<DataFile>,
+    /// Fast path: known manifest paths to drop without loading from S3.
+    delete_manifest_paths: HashSet<String>,
 }
 
 impl SnapshotProduceOperation for ReplaceOperation {
@@ -199,6 +221,26 @@ impl SnapshotProduceOperation for ReplaceOperation {
         let mut result_manifests: Vec<ManifestFile> = Vec::new();
         let mut found_files: HashSet<String> = HashSet::new();
 
+        // Fast path: if the caller provided known manifest paths to drop,
+        // skip loading manifests from S3 entirely. Just filter by path.
+        if !self.delete_manifest_paths.is_empty() {
+            for manifest_entry in manifest_list.entries() {
+                if self
+                    .delete_manifest_paths
+                    .contains(&manifest_entry.manifest_path)
+                {
+                    // Drop this manifest — caller guarantees it contains only deleted files
+                    continue;
+                }
+                // Keep all other manifests (data + delete manifests)
+                if manifest_entry.has_added_files() || manifest_entry.has_existing_files() {
+                    result_manifests.push(manifest_entry.clone());
+                }
+            }
+            return Ok(result_manifests);
+        }
+
+        // Slow path: load each manifest to determine which ones to drop
         for manifest_entry in manifest_list.entries() {
             // Only process data manifests for deletion
             if manifest_entry.content != ManifestContentType::Data {

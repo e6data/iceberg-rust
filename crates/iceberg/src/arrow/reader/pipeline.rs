@@ -494,6 +494,9 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+        lower_bounds: HashMap::new(),
+        upper_bounds: HashMap::new(),
+        null_value_counts: HashMap::new(),
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -704,6 +707,9 @@ mod tests {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_1.parquet"))
@@ -722,6 +728,9 @@ mod tests {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_2.parquet"))
@@ -740,6 +749,9 @@ mod tests {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             }),
         ];
 

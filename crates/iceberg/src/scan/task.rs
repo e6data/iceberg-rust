@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::Result;
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
+    DataContentType, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
     SchemaRef, Struct,
 };
 
@@ -110,6 +111,16 @@ pub struct FileScanTask {
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     pub case_sensitive: bool,
+
+    /// Per-column lower bounds from the manifest entry (field_id -> Datum).
+    #[serde(skip)]
+    pub lower_bounds: HashMap<i32, Datum>,
+    /// Per-column upper bounds from the manifest entry (field_id -> Datum).
+    #[serde(skip)]
+    pub upper_bounds: HashMap<i32, Datum>,
+    /// Per-column null value counts from the manifest entry (field_id -> count).
+    #[serde(skip)]
+    pub null_value_counts: HashMap<i32, u64>,
 }
 
 impl FileScanTask {

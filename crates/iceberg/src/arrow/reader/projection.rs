@@ -595,6 +595,9 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -697,6 +700,9 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -798,6 +804,9 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -888,6 +897,9 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -992,6 +1004,9 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -1125,6 +1140,9 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -1225,6 +1243,9 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -1338,6 +1359,9 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -1481,6 +1505,9 @@ message schema {
                 partition_spec: Some(partition_spec),
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -1692,6 +1719,9 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;

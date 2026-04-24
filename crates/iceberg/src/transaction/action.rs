@@ -81,6 +81,8 @@ impl<T: TransactionAction + 'static> ApplyTransactionAction for T {
 pub struct ActionCommit {
     updates: Vec<TableUpdate>,
     requirements: Vec<TableRequirement>,
+    /// Manifest file paths created during this action (for manifest-aware compaction).
+    pub(crate) created_manifest_paths: Vec<String>,
 }
 
 impl ActionCommit {
@@ -89,7 +91,14 @@ impl ActionCommit {
         Self {
             updates,
             requirements,
+            created_manifest_paths: Vec::new(),
         }
+    }
+
+    /// Set the manifest paths created during this action.
+    pub fn with_manifest_paths(mut self, paths: Vec<String>) -> Self {
+        self.created_manifest_paths = paths;
+        self
     }
 
     /// Consumes and returns the list of table updates.

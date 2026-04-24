@@ -1745,6 +1745,9 @@ message schema {
                 project_field_ids: vec![1],
                 predicate: Some(predicate.bind(schema, true).unwrap()),
                 deletes: vec![],
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                null_value_counts: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;

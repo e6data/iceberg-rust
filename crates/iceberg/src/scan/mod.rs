@@ -1780,6 +1780,9 @@ pub mod tests {
             record_count: Some(100),
             data_file_format: DataFileFormat::Parquet,
             deletes: vec![],
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                null_value_counts: HashMap::new(),
         };
         test_fn(task);
 
@@ -1794,6 +1797,9 @@ pub mod tests {
             record_count: None,
             data_file_format: DataFileFormat::Avro,
             deletes: vec![],
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                null_value_counts: HashMap::new(),
         };
         test_fn(task);
     }

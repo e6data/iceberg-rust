@@ -339,6 +339,9 @@ pub(crate) mod tests {
                 project_field_ids: vec![],
                 predicate: None,
                 deletes: vec![pos_del_1, pos_del_2.clone()],
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                null_value_counts: HashMap::new(),
             },
             FileScanTask {
                 start: 0,
@@ -350,6 +353,9 @@ pub(crate) mod tests {
                 project_field_ids: vec![],
                 predicate: None,
                 deletes: vec![pos_del_3],
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                null_value_counts: HashMap::new(),
             },
         ];
 

@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::expr::BoundPredicate;
-use crate::spec::{DataContentType, DataFileFormat, ManifestEntryRef, Schema, SchemaRef};
+use crate::spec::{
+    DataContentType, DataFileFormat, Datum, ManifestEntryRef, Schema, SchemaRef,
+};
 
 /// A stream of [`FileScanTask`].
 pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
@@ -54,6 +58,16 @@ pub struct FileScanTask {
 
     /// The list of delete files that may need to be applied to this data file
     pub deletes: Vec<FileScanTaskDeleteFile>,
+
+    /// Per-column lower bounds from the manifest entry (field_id → Datum).
+    #[serde(skip)]
+    pub lower_bounds: HashMap<i32, Datum>,
+    /// Per-column upper bounds from the manifest entry (field_id → Datum).
+    #[serde(skip)]
+    pub upper_bounds: HashMap<i32, Datum>,
+    /// Per-column null value counts from the manifest entry (field_id → count).
+    #[serde(skip)]
+    pub null_value_counts: HashMap<i32, u64>,
 }
 
 impl FileScanTask {

@@ -128,6 +128,10 @@ impl ManifestEntryContext {
                 .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
 
             deletes,
+
+            lower_bounds: self.manifest_entry.data_file.lower_bounds.clone(),
+            upper_bounds: self.manifest_entry.data_file.upper_bounds.clone(),
+            null_value_counts: self.manifest_entry.data_file.null_value_counts.clone(),
         })
     }
 }

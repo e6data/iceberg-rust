@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod replace_data_files;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -71,6 +72,7 @@ use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
+use crate::transaction::replace_data_files::ReplaceDataFilesAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -83,6 +85,8 @@ use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdat
 pub struct Transaction {
     table: Table,
     actions: Vec<BoxedTransactionAction>,
+    first_attempt: bool,
+    created_manifest_paths: Vec<String>,
 }
 
 impl Transaction {
@@ -91,6 +95,8 @@ impl Transaction {
         Self {
             table: table.clone(),
             actions: vec![],
+            first_attempt: true,
+            created_manifest_paths: Vec::new(),
         }
     }
 
@@ -156,11 +162,26 @@ impl Transaction {
         UpdateStatisticsAction::new()
     }
 
+    /// Creates a replace data files action.
+    pub fn replace_data_files(&self) -> ReplaceDataFilesAction {
+        ReplaceDataFilesAction::new()
+    }
+
     /// Commit transaction.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        self.commit_with_manifest_paths(catalog)
+            .await
+            .map(|(table, _)| table)
+    }
+
+    /// Commit transaction and return both the updated table and the manifest paths created.
+    pub async fn commit_with_manifest_paths(
+        self,
+        catalog: &dyn Catalog,
+    ) -> Result<(Table, Vec<String>)> {
         if self.actions.is_empty() {
             // nothing to commit
-            return Ok(self.table);
+            return Ok((self.table, Vec::new()));
         }
 
         let table_props =
@@ -171,7 +192,7 @@ impl Transaction {
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
 
-        (|mut tx: Transaction| async {
+        let (tx, result) = (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
             (tx, result)
         })
@@ -179,8 +200,10 @@ impl Transaction {
         .sleep(tokio::time::sleep)
         .context(tx)
         .when(|e| e.retryable())
-        .await
-        .1
+        .await;
+
+        let table = result?;
+        Ok((table, tx.created_manifest_paths))
     }
 
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
@@ -196,21 +219,27 @@ impl Transaction {
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
-        let refreshed = catalog.load_table(self.table.identifier()).await?;
+        if self.first_attempt {
+            self.first_attempt = false;
+        } else {
+            let refreshed = catalog.load_table(self.table.identifier()).await?;
 
-        if self.table.metadata() != refreshed.metadata()
-            || self.table.metadata_location() != refreshed.metadata_location()
-        {
-            // current base is stale, use refreshed as base and re-apply transaction actions
-            self.table = refreshed.clone();
+            if self.table.metadata() != refreshed.metadata()
+                || self.table.metadata_location() != refreshed.metadata_location()
+            {
+                // current base is stale, use refreshed as base and re-apply transaction actions
+                self.table = refreshed.clone();
+            }
         }
 
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
+        let mut all_manifest_paths: Vec<String> = Vec::new();
 
         for action in &self.actions {
-            let action_commit = Arc::clone(action).commit(&current_table).await?;
+            let mut action_commit = Arc::clone(action).commit(&current_table).await?;
+            all_manifest_paths.extend(action_commit.take_manifest_paths());
             // apply action commit to current_table
             current_table = Self::apply(
                 current_table,
@@ -219,6 +248,8 @@ impl Transaction {
                 &mut existing_requirements,
             )?;
         }
+
+        self.created_manifest_paths = all_manifest_paths;
 
         let table_commit = TableCommit::builder()
             .ident(self.table.identifier().to_owned())

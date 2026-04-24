@@ -114,6 +114,9 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    removed_data_files: Vec<DataFile>,
+    data_sequence_number: Option<i64>,
+    added_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -127,6 +130,7 @@ impl<'a> SnapshotProducer<'a> {
         key_metadata: Option<Vec<u8>>,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        added_delete_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -135,8 +139,21 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
+            removed_data_files: Vec::new(),
+            data_sequence_number: None,
+            added_delete_files,
             manifest_counter: (0..),
         }
+    }
+
+    pub(crate) fn with_removed_data_files(mut self, files: Vec<DataFile>) -> Self {
+        self.removed_data_files = files;
+        self
+    }
+
+    pub(crate) fn with_data_sequence_number(mut self, seq_num: Option<i64>) -> Self {
+        self.data_sequence_number = seq_num;
+        self
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
@@ -319,6 +336,58 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    // Write manifest file for added delete files and return the ManifestFile for ManifestList.
+    async fn write_added_delete_manifest(&mut self) -> Result<ManifestFile> {
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        if added_delete_files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No added delete files found when writing a delete manifest file",
+            ));
+        }
+
+        let snapshot_id = self.snapshot_id;
+        let format_version = self.table.metadata().format_version();
+        let data_sequence_number = self.data_sequence_number;
+        let manifest_entries: Vec<ManifestEntry> = added_delete_files
+            .into_iter()
+            .map(|data_file| {
+                if format_version == FormatVersion::V1 {
+                    if let Some(seq) = data_sequence_number {
+                        ManifestEntry::builder()
+                            .status(crate::spec::ManifestStatus::Added)
+                            .snapshot_id(snapshot_id)
+                            .sequence_number(seq)
+                            .data_file(data_file)
+                            .build()
+                    } else {
+                        ManifestEntry::builder()
+                            .status(crate::spec::ManifestStatus::Added)
+                            .snapshot_id(snapshot_id)
+                            .data_file(data_file)
+                            .build()
+                    }
+                } else if let Some(seq) = data_sequence_number {
+                    ManifestEntry::builder()
+                        .status(crate::spec::ManifestStatus::Added)
+                        .sequence_number(seq)
+                        .data_file(data_file)
+                        .build()
+                } else {
+                    ManifestEntry::builder()
+                        .status(crate::spec::ManifestStatus::Added)
+                        .data_file(data_file)
+                        .build()
+                }
+            })
+            .collect();
+        let mut writer = self.new_manifest_writer(ManifestContentType::Deletes)?;
+        for entry in manifest_entries {
+            writer.add_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
@@ -329,10 +398,13 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.snapshot_properties.is_empty()
+            && self.removed_data_files.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files or added snapshot properties found when write a manifest file",
+                "No added data files, removed data files, or added snapshot properties found when write a manifest file",
             ));
         }
 
@@ -345,8 +417,11 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        // # TODO
-        // Support process delete entries.
+        // Process added delete files.
+        if !self.added_delete_files.is_empty() {
+            let delete_manifest = self.write_added_delete_manifest().await?;
+            manifest_files.push(delete_manifest);
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
@@ -376,6 +451,22 @@ impl<'a> SnapshotProducer<'a> {
         summary_collector.set_partition_summary_limit(partition_summary_limit);
 
         for data_file in &self.added_data_files {
+            summary_collector.add_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        for data_file in &self.removed_data_files {
+            summary_collector.remove_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        for data_file in &self.added_delete_files {
             summary_collector.add_file(
                 data_file,
                 table_metadata.current_schema().clone(),
@@ -462,6 +553,11 @@ impl<'a> SnapshotProducer<'a> {
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
 
+        let created_manifest_paths: Vec<String> = new_manifests
+            .iter()
+            .map(|m| m.manifest_path.clone())
+            .collect();
+
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
         let writer_next_row_id = manifest_list_writer.next_row_id();
         manifest_list_writer.close().await?;
@@ -508,6 +604,6 @@ impl<'a> SnapshotProducer<'a> {
             },
         ];
 
-        Ok(ActionCommit::new(updates, requirements))
+        Ok(ActionCommit::new(updates, requirements).with_manifest_paths(created_manifest_paths))
     }
 }

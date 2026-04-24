@@ -81,6 +81,7 @@ impl<T: TransactionAction + 'static> ApplyTransactionAction for T {
 pub struct ActionCommit {
     updates: Vec<TableUpdate>,
     requirements: Vec<TableRequirement>,
+    created_manifest_paths: Vec<String>,
 }
 
 impl ActionCommit {
@@ -89,6 +90,7 @@ impl ActionCommit {
         Self {
             updates,
             requirements,
+            created_manifest_paths: Vec::new(),
         }
     }
 
@@ -100,6 +102,17 @@ impl ActionCommit {
     /// Consumes and returns the list of table requirements.
     pub fn take_requirements(&mut self) -> Vec<TableRequirement> {
         take(&mut self.requirements)
+    }
+
+    /// Sets the manifest paths created during this action.
+    pub fn with_manifest_paths(mut self, paths: Vec<String>) -> Self {
+        self.created_manifest_paths = paths;
+        self
+    }
+
+    /// Consumes and returns the list of created manifest paths.
+    pub fn take_manifest_paths(&mut self) -> Vec<String> {
+        take(&mut self.created_manifest_paths)
     }
 }
 

@@ -240,6 +240,14 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_id
     }
 
+    /// Returns the snapshot ID this producer is committing to.
+    /// Used by callers (e.g. `ReplaceDataFilesAction`) when they rewrite
+    /// existing manifests inline and need to attribute the rewritten
+    /// manifest to the new commit.
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",

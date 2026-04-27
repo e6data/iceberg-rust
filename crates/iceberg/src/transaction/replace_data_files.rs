@@ -251,9 +251,15 @@ impl SnapshotProduceOperation for ReplaceOperation {
                 .file_io()
                 .new_output(&new_manifest_path)?;
 
+            // The rewritten manifest is part of the NEW commit's manifest list,
+            // so its `added_snapshot_id` must be the new snapshot's ID — not
+            // None (which would default to UNASSIGNED_SNAPSHOT_ID = -1 and fail
+            // the sequence-number assignment check in ManifestListWriter).
+            // Per-entry snapshot IDs are preserved separately (Existing entries
+            // keep their original snapshot_id, see `entry.snapshot_id()` below).
             let builder = ManifestWriterBuilder::new(
                 output_file,
-                None, // snapshot_id will be inherited
+                Some(snapshot_produce.snapshot_id()),
                 self.key_metadata.clone(),
                 snapshot_produce.table.metadata().current_schema().clone(),
                 snapshot_produce

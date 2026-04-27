@@ -1382,6 +1382,38 @@ mod tests {
             .await
     }
 
+    /// A token cached within `EXPIRY_BUFFER` of expiry is refreshed inline on
+    /// the next `get_or_refresh` call. Two mocks are registered for the OAuth
+    /// path so mockito FIFO-serves: the `/v1/config` mint hits A (1s TTL —
+    /// already inside the buffer), then `client.token()`'s lazy-refresh hits
+    /// B (3600s TTL).
+    #[tokio::test]
+    async fn test_lazy_refresh_on_next_call_when_cached_token_expiring() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let mint_a = create_oauth_mock_with_expiry(&mut server, "first000000000", 1, 1).await;
+        let mint_b =
+            create_oauth_mock_with_expiry(&mut server, "second00000000", 3600, 1).await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        // Single expression: `catalog.context()` mints A (used for /v1/config),
+        // then `client.token()` finds A in the buffer and mints B inline.
+        let token = catalog.context().await.unwrap().client.token().await;
+        assert_eq!(token, Some("second00000000".to_string()));
+
+        config_mock.assert_async().await;
+        mint_a.assert_async().await;
+        mint_b.assert_async().await;
+    }
+
     /// When the server omits `expires_in`, auto-refresh is disabled: the
     /// first token remains cached and no second mint occurs.
     #[tokio::test]

@@ -504,6 +504,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn is_expiring_with_no_expiry_returns_false() {
+        let t = CachedToken {
+            value: "x".into(),
+            expires_at: None,
+        };
+        assert!(!t.is_expiring());
+    }
+
+    #[test]
+    fn is_expiring_with_far_future_expiry_returns_false() {
+        let t = CachedToken {
+            value: "x".into(),
+            expires_at: Some(Instant::now() + Duration::from_secs(3600)),
+        };
+        assert!(!t.is_expiring());
+    }
+
+    #[test]
+    fn is_expiring_within_buffer_returns_true() {
+        let t = CachedToken {
+            value: "x".into(),
+            expires_at: Some(Instant::now() + Duration::from_secs(30)),
+        };
+        assert!(t.is_expiring());
+    }
+
+    #[test]
+    fn is_expiring_already_past_returns_true() {
+        let t = CachedToken {
+            value: "x".into(),
+            expires_at: Some(Instant::now() - Duration::from_secs(10)),
+        };
+        assert!(t.is_expiring());
+    }
+
+    #[test]
     fn exponential_backoff_doubles() {
         assert_eq!(exponential_backoff(0), Duration::from_millis(500));
         assert_eq!(exponential_backoff(1), Duration::from_millis(1000));

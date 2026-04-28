@@ -59,6 +59,7 @@ mod snapshot;
 mod sort_order;
 mod update_location;
 mod update_properties;
+mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
 
@@ -76,6 +77,7 @@ use crate::transaction::replace_data_files::ReplaceDataFilesAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
+use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
@@ -165,6 +167,14 @@ impl Transaction {
     /// Creates a replace data files action.
     pub fn replace_data_files(&self) -> ReplaceDataFilesAction {
         ReplaceDataFilesAction::new()
+    }
+
+    /// Creates a schema-evolution action limited to additive changes
+    /// (`add_column`). For renames/drops/promotions use a future fuller
+    /// UpdateSchema implementation; this exists so a streaming sink can
+    /// auto-extend the table when an inbound batch carries a new field.
+    pub fn update_schema(&self) -> UpdateSchemaAction {
+        UpdateSchemaAction::new()
     }
 
     /// Commit transaction.

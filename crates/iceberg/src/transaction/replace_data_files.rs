@@ -76,7 +76,15 @@ impl ReplaceDataFilesAction {
         self
     }
 
-    /// Set manifest paths that should be completely dropped.
+    /// Hint manifest paths that the caller believes are fully covered by
+    /// `files_to_delete`. **Currently ignored.**
+    ///
+    /// Originally an optimization to skip loading manifests we knew would be
+    /// fully dropped. Removed because it was unsafe whenever a manifest
+    /// contained any file outside `files_to_delete` (which is the common case
+    /// when upstream batches many partitions per commit). The slow path
+    /// detects fully-deletable manifests on its own without risking the
+    /// silent loss of co-resident files.
     pub fn delete_manifests(mut self, manifests: Vec<String>) -> Self {
         self.delete_manifests = manifests;
         self
@@ -144,7 +152,6 @@ impl TransactionAction for ReplaceDataFilesAction {
                 .iter()
                 .map(|f| f.file_path.clone())
                 .collect(),
-            delete_manifests: self.delete_manifests.iter().cloned().collect(),
             commit_uuid: self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             key_metadata: self.key_metadata.clone(),
         };
@@ -157,7 +164,6 @@ impl TransactionAction for ReplaceDataFilesAction {
 
 struct ReplaceOperation {
     files_to_delete: HashSet<String>,
-    delete_manifests: HashSet<String>,
     commit_uuid: Uuid,
     key_metadata: Option<Vec<u8>>,
 }
@@ -193,13 +199,22 @@ impl SnapshotProduceOperation for ReplaceOperation {
         let mut remaining_to_delete: HashSet<String> = self.files_to_delete.clone();
 
         for manifest_entry in manifest_list.entries() {
-            // Fast-path: drop manifests that are in the delete_manifests set
-            if self
-                .delete_manifests
-                .contains(&manifest_entry.manifest_path)
-            {
-                continue;
-            }
+            // NOTE: The previous fast-path here used `delete_manifests` to drop
+            // an entire manifest_entry without inspecting its contents. This is
+            // unsafe whenever a single manifest file holds entries for files
+            // that are NOT in `files_to_delete` — which is the common case for
+            // upstream Laminar's FastAppend, where every commit cycle batches
+            // ~14 data files across many partitions into a single manifest.
+            // Compaction targets one partition's slice but the manifest path
+            // is shared with files for other partitions/tenants; dropping the
+            // whole manifest then loses all of them from the snapshot.
+            //
+            // Always go through the slow path below — it loads the manifest
+            // and correctly drops only the files in `files_to_delete`, while
+            // preserving the rest as Existing entries. Cost: one extra S3
+            // GET per manifest in the snapshot (which is what the slow path
+            // already does anyway). The `delete_manifests` field is retained
+            // on the action for backwards-compat but is no longer consulted.
 
             // Skip manifests with no active files
             if !manifest_entry.has_added_files() && !manifest_entry.has_existing_files() {

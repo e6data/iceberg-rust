@@ -1357,3 +1357,54 @@ fn test_date_from_json_as_number() {
 
     // Both formats should produce the same Literal value
 }
+
+#[test]
+fn json_struct_propagates_type_mismatch_on_present_field() {
+    // Regression: writers that round-trip a Struct through JSON keyed by field
+    // id used to silently drop slots whose JSON value didn't parse to the
+    // destination field's type (e.g. when a writer fed a String value into
+    // a slot whose destination spec said Long, because two specs with the
+    // same column had different field-id assignments). The bug produced
+    // manifest entries with null partition tuples and broke reader
+    // partition pruning. The decoder now propagates the parse error so the
+    // mismatch is loud at write time.
+    let record = serde_json::json!({"1": 1, "2": "not-a-long"});
+    let dest = Type::Struct(StructType::new(vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+        // Field id 2 is a Long in the destination, but the JSON has a String for it.
+        NestedField::optional(2, "count", Type::Primitive(PrimitiveType::Long)).into(),
+    ]));
+
+    let err = Literal::try_from_json(record, &dest)
+        .expect_err("expected type-mismatch error, got Ok");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Failed to decode struct field id=2"),
+        "error should identify the offending field id; got: {msg}"
+    );
+}
+
+#[test]
+fn json_struct_missing_field_and_explicit_null_both_become_none() {
+    // Sanity: only the type-mismatch case errors. Missing keys and
+    // explicit JSON nulls remain None as before.
+    let record = serde_json::json!({"1": 7, "3": null});
+    let dest = Type::Struct(StructType::new(vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+        NestedField::optional(2, "missing", Type::Primitive(PrimitiveType::String)).into(),
+        NestedField::optional(3, "explicit_null", Type::Primitive(PrimitiveType::String)).into(),
+    ]));
+
+    let lit = Literal::try_from_json(record, &dest).unwrap().unwrap();
+    let Literal::Struct(s) = lit else {
+        panic!("expected Struct literal");
+    };
+    let fields: Vec<_> = s.into_iter().collect();
+    assert_eq!(fields.len(), 3);
+    assert!(matches!(
+        fields[0],
+        Some(Literal::Primitive(PrimitiveLiteral::Int(7)))
+    ));
+    assert!(fields[1].is_none(), "missing key should be None");
+    assert!(fields[2].is_none(), "JSON null should be None");
+}

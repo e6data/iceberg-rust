@@ -523,20 +523,45 @@ impl Literal {
             },
             Type::Struct(schema) => {
                 if let JsonValue::Object(mut object) = value {
-                    Ok(Some(Literal::Struct(Struct::from_iter(
-                        schema.fields().iter().map(|field| {
-                            object.remove(&field.id.to_string()).and_then(|value| {
-                                Literal::try_from_json(value, &field.field_type)
-                                    .and_then(|value| {
-                                        value.ok_or(Error::new(
-                                            ErrorKind::DataInvalid,
-                                            "Key of map cannot be null",
-                                        ))
-                                    })
-                                    .ok()
-                            })
-                        }),
-                    ))))
+                    // Iceberg JSON Single-Value Format keys struct fields by
+                    // field id. For each field in the destination schema:
+                    //   - missing key in the object → None (legitimate; field
+                    //     wasn't written)
+                    //   - JSON null            → None (explicit absence)
+                    //   - present and parses   → Some(Literal)
+                    //   - present and parse fails → propagate the error
+                    //
+                    // The last case used to be silently swallowed via `.ok()`,
+                    // which masked structural mismatches like a writer feeding
+                    // a Struct serialized under one PartitionSpec into a
+                    // partition_type derived from a different spec (different
+                    // field ids for the same partition column). Such mismatches
+                    // produced manifest entries with null partition tuples and
+                    // broke reader-side partition pruning. Surfacing the error
+                    // forces the caller to fix the round-trip rather than
+                    // emitting subtly-broken data.
+                    let fields: Result<Vec<Option<Literal>>> = schema
+                        .fields()
+                        .iter()
+                        .map(|field| match object.remove(&field.id.to_string()) {
+                            None | Some(JsonValue::Null) => Ok(None),
+                            Some(json_value) => Literal::try_from_json(
+                                json_value,
+                                &field.field_type,
+                            )
+                            .map_err(|e| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!(
+                                        "Failed to decode struct field id={} name={:?} \
+                                         (expected {:?}): {e}",
+                                        field.id, field.name, field.field_type
+                                    ),
+                                )
+                            }),
+                        })
+                        .collect();
+                    Ok(Some(Literal::Struct(Struct::from_iter(fields?))))
                 } else {
                     Err(Error::new(
                         crate::ErrorKind::DataInvalid,

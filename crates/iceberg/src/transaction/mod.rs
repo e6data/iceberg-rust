@@ -60,6 +60,7 @@ mod sort_order;
 mod update_location;
 mod update_properties;
 mod update_schema;
+mod update_spec;
 mod update_statistics;
 mod upgrade_format_version;
 
@@ -78,6 +79,7 @@ use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
 use crate::transaction::update_schema::UpdateSchemaAction;
+use crate::transaction::update_spec::UpdateSpecAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
@@ -175,6 +177,16 @@ impl Transaction {
     /// auto-extend the table when an inbound batch carries a new field.
     pub fn update_schema(&self) -> UpdateSchemaAction {
         UpdateSchemaAction::new()
+    }
+
+    /// Creates a partition-spec evolution action limited to additive
+    /// changes (`add_field`). For removals/renames/field-id changes use a
+    /// future fuller UpdatePartitionSpec implementation; this exists so a
+    /// streaming sink can start partitioning by an additional column
+    /// without rewriting existing data (Iceberg supports two specs
+    /// coexisting and existing files keep their original spec id).
+    pub fn update_spec(&self) -> UpdateSpecAction {
+        UpdateSpecAction::new()
     }
 
     /// Commit transaction.

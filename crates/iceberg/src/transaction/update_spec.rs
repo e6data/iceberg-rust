@@ -17,13 +17,28 @@
 
 //! Partition-spec evolution via `add_field`.
 //!
-//! This action covers the additive case (new partition fields appended to
-//! the table's default partition spec). Removals, renames, and field-id
-//! reassignment are not supported — those require Iceberg's full
-//! UpdatePartitionSpec API. The intended caller is a streaming sink that
-//! wants to start partitioning by an additional column without rewriting
-//! existing data; Iceberg supports two specs coexisting and existing
-//! files keep their original spec id.
+//! Each `add_field` call declares one partition field of the *target*
+//! default partition spec, in the order paths should be generated. The
+//! action does NOT merge with the table's current default spec —
+//! callers pass the complete intended field list and the action emits
+//! exactly that spec. Removals and renames vs. the prior spec are
+//! handled implicitly: any field in the prior spec that isn't declared
+//! here is dropped from the *new* default; existing data files keep
+//! their old `spec_id` and remain readable.
+//!
+//! Why a full-spec replacement instead of additive append: a streaming
+//! sink's partition writer builds its own spec from config in config
+//! order, and stamps DataFiles with the table's current `spec_id`. If
+//! the two specs disagree on field order, the partition Struct on each
+//! DataFile is in the partitioner's order but interpreted under the
+//! table spec's order, leaving partition-pruning metadata mis-aligned.
+//! Replacing the spec keeps the two ordered identically.
+//!
+//! Field IDs are reused across specs when the same `(source_id,
+//! transform)` partition field already exists in *any* prior spec
+//! (Iceberg requires globally-unique partition field IDs in V2;
+//! reusing them is the canonical "this is the same partition" signal).
+//! Genuinely new fields get fresh IDs from the metadata builder.
 
 use std::sync::Arc;
 
@@ -34,31 +49,29 @@ use crate::table::Table;
 use crate::transaction::action::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, Result, TableUpdate};
 
-/// A transaction action that adds new partition fields to a table's
-/// default partition spec.
-///
-/// The new spec is built as `current default spec ∪ requested fields`
-/// and committed via `TableUpdate::AddSpec` followed by
-/// `TableUpdate::SetDefaultSpec { spec_id: -1 }` (last-added). Field IDs
-/// are assigned by the metadata builder; spec-id deduplication is also
-/// handled there, so re-applying the same evolution twice is a no-op.
+/// A transaction action that sets the table's default partition spec
+/// to the field list declared via `add_field` calls.
 pub struct UpdateSpecAction {
-    new_fields: Vec<(String, String, Transform)>,
+    declared_fields: Vec<(String, String, Transform)>,
 }
 
 impl UpdateSpecAction {
     pub(crate) fn new() -> Self {
         Self {
-            new_fields: Vec::new(),
+            declared_fields: Vec::new(),
         }
     }
 
-    /// Append a partition field to the default spec.
+    /// Declare one partition field of the target spec.
     ///
     /// `source_name` is the schema column the partition value is derived
     /// from. `target_name` is the partition field's display name (used in
     /// path segments like `{target_name}=value/`). `transform` describes
     /// how to derive the partition value from the source column.
+    ///
+    /// Order matters: fields are placed in the resulting spec in the
+    /// order of `add_field` calls, which determines the partition path
+    /// segment order on disk.
     ///
     /// Errors are deferred to commit time so the call site can chain
     /// `add_field` for many fields without per-call error handling.
@@ -68,7 +81,7 @@ impl UpdateSpecAction {
         target_name: impl Into<String>,
         transform: Transform,
     ) -> Self {
-        self.new_fields
+        self.declared_fields
             .push((source_name.into(), target_name.into(), transform));
         self
     }
@@ -83,7 +96,7 @@ impl Default for UpdateSpecAction {
 #[async_trait]
 impl TransactionAction for UpdateSpecAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        if self.new_fields.is_empty() {
+        if self.declared_fields.is_empty() {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 
@@ -91,23 +104,15 @@ impl TransactionAction for UpdateSpecAction {
         let schema = metadata.current_schema();
         let current_spec = metadata.default_partition_spec();
 
-        // Skip fields whose target_name already exists in the current
-        // spec. This makes the action idempotent so concurrent or
-        // restarting writers all calling `add_field("workspace", ...)`
-        // race safely — the second commit becomes a no-op rather than
-        // failing with "already exists". Mirrors UpdateSchemaAction's
-        // skip-on-duplicate-name behavior; conflict detection on
-        // (source_id, transform) mismatch is left to the metadata
-        // builder's `add_partition_spec` validator.
-        let mut additions: Vec<UnboundPartitionField> = Vec::new();
-        for (source_name, target_name, transform) in &self.new_fields {
-            if current_spec
-                .fields()
-                .iter()
-                .any(|f| &f.name == target_name)
-            {
-                continue;
-            }
+        // Resolve each declared field to (source_id, target_name, transform,
+        // optional reused field_id). Field IDs are reused from any prior
+        // spec where the same (source_id, transform) already exists; this
+        // both (a) honors Iceberg's "field IDs are stable for a given
+        // partition concept" convention and (b) makes the action idempotent
+        // so reruns produce a spec compatible with the existing default.
+        let mut target_fields: Vec<UnboundPartitionField> =
+            Vec::with_capacity(self.declared_fields.len());
+        for (source_name, target_name, transform) in &self.declared_fields {
             let source_id = schema.field_id_by_name(source_name).ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
@@ -117,34 +122,40 @@ impl TransactionAction for UpdateSpecAction {
                     ),
                 )
             })?;
-            additions.push(UnboundPartitionField {
+
+            let reused_field_id = metadata
+                .partition_specs_iter()
+                .flat_map(|spec| spec.fields().iter())
+                .find(|f| f.source_id == source_id && &f.transform == transform)
+                .map(|f| f.field_id);
+
+            target_fields.push(UnboundPartitionField {
                 source_id,
-                field_id: None,
+                field_id: reused_field_id,
                 name: target_name.clone(),
                 transform: transform.clone(),
             });
         }
 
-        if additions.is_empty() {
-            // All requested fields already exist in the default spec.
+        // Idempotence: if the declared spec is structurally identical to
+        // the current default (same length, same source_id / name /
+        // transform tuples in order), don't emit any updates.
+        if target_fields.len() == current_spec.fields().len()
+            && target_fields
+                .iter()
+                .zip(current_spec.fields().iter())
+                .all(|(declared, current)| {
+                    declared.source_id == current.source_id
+                        && declared.name == current.name
+                        && declared.transform == current.transform
+                })
+        {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 
-        // Build the target spec: existing fields, then new ones.
-        // `From<PartitionSpec>` preserves source_id / field_id / name /
-        // transform for existing fields, so the result is a strict
-        // superset that the metadata builder will accept.
-        let mut combined: Vec<UnboundPartitionField> = current_spec
-            .fields()
-            .iter()
-            .cloned()
-            .map(UnboundPartitionField::from)
-            .collect();
-        combined.extend(additions);
-
         let new_spec = UnboundPartitionSpec {
             spec_id: None,
-            fields: combined,
+            fields: target_fields,
         };
 
         let updates = vec![
@@ -185,21 +196,23 @@ mod tests {
         let action = (*tx.actions[0])
             .downcast_ref::<UpdateSpecAction>()
             .unwrap();
-        assert_eq!(action.new_fields.len(), 2);
-        assert_eq!(action.new_fields[0].0, "x");
-        assert_eq!(action.new_fields[0].1, "x");
-        assert_eq!(action.new_fields[1].1, "y_bucket");
+        assert_eq!(action.declared_fields.len(), 2);
+        assert_eq!(action.declared_fields[0].0, "x");
+        assert_eq!(action.declared_fields[0].1, "x");
+        assert_eq!(action.declared_fields[1].1, "y_bucket");
     }
 
     #[tokio::test]
-    async fn test_commit_emits_add_spec_and_set_default() {
-        // V2 fixture: default spec-id=0 = [{x identity}], schema has x/y/z (long).
-        // Adding "y" (identity) should produce AddSpec[x identity, y identity]
-        // and SetDefaultSpec{-1}.
+    async fn test_commit_emits_spec_in_declared_order() {
+        // V2 fixture: default spec_0 = [{x identity, source_id=1}], schema has
+        // x/y/z (long). Declaring [y identity, x identity] should produce a
+        // spec in THAT order — y first, then x — and reuse x's existing
+        // field_id from spec_0 since (source_id=1, identity) already exists.
         let table = make_v2_table();
         let action = Arc::new(
             UpdateSpecAction::new()
-                .add_field("y", "y", Transform::Identity),
+                .add_field("y", "y", Transform::Identity)
+                .add_field("x", "x", Transform::Identity),
         );
 
         let mut commit = action.commit(&table).await.unwrap();
@@ -209,12 +222,15 @@ mod tests {
         match &updates[0] {
             TableUpdate::AddSpec { spec } => {
                 assert_eq!(spec.fields().len(), 2);
-                assert_eq!(spec.fields()[0].name, "x");
-                assert_eq!(spec.fields()[0].source_id, 1);
+                assert_eq!(spec.fields()[0].name, "y", "y declared first");
+                assert_eq!(spec.fields()[0].source_id, 2);
                 assert_eq!(spec.fields()[0].transform, Transform::Identity);
-                assert_eq!(spec.fields()[1].name, "y");
-                assert_eq!(spec.fields()[1].source_id, 2);
-                assert_eq!(spec.fields()[1].transform, Transform::Identity);
+                assert_eq!(spec.fields()[1].name, "x", "x declared second");
+                assert_eq!(spec.fields()[1].source_id, 1);
+                assert!(
+                    spec.fields()[1].field_id.is_some(),
+                    "x should have its existing field_id reused from spec_0"
+                );
             }
             other => panic!("expected AddSpec, got {other:?}"),
         }
@@ -225,8 +241,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_idempotent_when_field_present() {
-        // "x" is already in spec 0; adding it again is a no-op.
+    async fn test_commit_idempotent_on_identical_spec() {
+        // V2 fixture default spec_0 = [{x identity}]. Declaring exactly [x
+        // identity] should be a no-op — same length, same fields in same
+        // order.
         let table = make_v2_table();
         let action = Arc::new(
             UpdateSpecAction::new()
@@ -236,8 +254,23 @@ mod tests {
         let mut commit = action.commit(&table).await.unwrap();
         assert!(
             commit.take_updates().is_empty(),
-            "re-adding existing partition field should produce zero updates"
+            "declaring the existing default spec verbatim should be a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn test_commit_emits_when_only_order_differs() {
+        // Declaring [y identity, x identity] vs current [x identity] is a
+        // real change (different fields). Emit updates.
+        let table = make_v2_table();
+        let action = Arc::new(
+            UpdateSpecAction::new()
+                .add_field("y", "y", Transform::Identity)
+                .add_field("x", "x", Transform::Identity),
+        );
+
+        let mut commit = action.commit(&table).await.unwrap();
+        assert_eq!(commit.take_updates().len(), 2);
     }
 
     #[tokio::test]

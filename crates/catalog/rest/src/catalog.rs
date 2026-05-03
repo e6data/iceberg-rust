@@ -50,21 +50,10 @@ use crate::types::{
 pub const REST_CATALOG_PROP_URI: &str = "uri";
 /// REST catalog warehouse location
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
-/// Value for the `X-Iceberg-Access-Delegation` header sent on table operations.
-///
-/// The spec allows a comma-separated list of `vended-credentials` and
-/// `remote-signing`. The client defaults to `vended-credentials` because that
-/// is the dominant Polaris / Unity / Nessie deployment pattern; set the prop
-/// to an empty string to disable the header entirely, or provide a custom
-/// value to opt in to `remote-signing` or both. An explicit
-/// `header.X-Iceberg-Access-Delegation` in props takes precedence.
-pub const REST_CATALOG_PROP_ACCESS_DELEGATION: &str = "rest.access-delegation";
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PATH_V1: &str = "v1";
-const DEFAULT_ACCESS_DELEGATION: &str = "vended-credentials";
-const ACCESS_DELEGATION_HEADER: &str = "x-iceberg-access-delegation";
 
 /// Keys that Java's `OAuth2Manager` forwards to a child auth session instead
 /// of to FileIO. We strip them out of `LoadTableResponse.config` before
@@ -349,33 +338,6 @@ impl RestCatalogConfig {
             ),
         ]);
 
-        // Default to `vended-credentials` (matching PyIceberg) so table loads
-        // surface storage creds without extra configuration. A raw
-        // `header.X-Iceberg-Access-Delegation` entry takes precedence.
-        let has_explicit_delegation_header = self
-            .props
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("header.X-Iceberg-Access-Delegation"));
-        if !has_explicit_delegation_header {
-            let delegation = self
-                .props
-                .get(REST_CATALOG_PROP_ACCESS_DELEGATION)
-                .map(String::as_str)
-                .unwrap_or(DEFAULT_ACCESS_DELEGATION);
-            if !delegation.is_empty() {
-                headers.insert(
-                    HeaderName::from_static(ACCESS_DELEGATION_HEADER),
-                    HeaderValue::from_str(delegation).map_err(|e| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Invalid access-delegation value: {delegation}"),
-                        )
-                        .with_source(e)
-                    })?,
-                );
-            }
-        }
-
         for (key, value) in self
             .props
             .iter()
@@ -397,6 +359,20 @@ impl RestCatalogConfig {
                     .with_source(e)
                 })?,
             );
+        }
+
+        // Default-on `vended-credentials` matching PyIceberg. The user can
+        // override the value via `header.X-Iceberg-Access-Delegation` or
+        // suppress the header entirely by setting that prop to "".
+        let delegation = HeaderName::from_static("x-iceberg-access-delegation");
+        match headers.get(&delegation) {
+            None => {
+                headers.insert(delegation, HeaderValue::from_static("vended-credentials"));
+            }
+            Some(v) if v.is_empty() => {
+                headers.remove(&delegation);
+            }
+            Some(_) => {}
         }
 
         Ok(headers)
@@ -1622,9 +1598,9 @@ mod tests {
         load_mock.assert_async().await;
     }
 
-    /// Setting `rest.access-delegation` to empty string suppresses the
-    /// header. Used by clients deployed against catalogs that don't vend
-    /// credentials to avoid unnecessary server-side work.
+    /// Setting `header.X-Iceberg-Access-Delegation` to empty string suppresses
+    /// the header. Matches PyIceberg's documented opt-out for clients deployed
+    /// against catalogs that don't vend credentials.
     #[tokio::test]
     async fn test_access_delegation_can_be_disabled() {
         let config = RestCatalogConfig {
@@ -1633,12 +1609,12 @@ mod tests {
             warehouse: None,
             client: None,
             props: HashMap::from([(
-                REST_CATALOG_PROP_ACCESS_DELEGATION.to_string(),
+                "header.X-Iceberg-Access-Delegation".to_string(),
                 "".to_string(),
             )]),
         };
         let headers = config.extra_headers().unwrap();
-        assert!(!headers.contains_key(ACCESS_DELEGATION_HEADER));
+        assert!(!headers.contains_key("x-iceberg-access-delegation"));
     }
 
     /// Explicit `header.X-Iceberg-Access-Delegation=…` takes precedence over
@@ -1657,7 +1633,7 @@ mod tests {
         };
         let headers = config.extra_headers().unwrap();
         let v = headers
-            .get(ACCESS_DELEGATION_HEADER)
+            .get("x-iceberg-access-delegation")
             .expect("delegation header must be present");
         assert_eq!(v.to_str().unwrap(), "remote-signing");
     }
@@ -1968,8 +1944,8 @@ mod tests {
                 HeaderValue::from_str(&format!("iceberg-rs/{}", CARGO_PKG_VERSION)).unwrap(),
             ),
             (
-                HeaderName::from_static(ACCESS_DELEGATION_HEADER),
-                HeaderValue::from_static(DEFAULT_ACCESS_DELEGATION),
+                HeaderName::from_static("x-iceberg-access-delegation"),
+                HeaderValue::from_static("vended-credentials"),
             ),
         ]);
         assert_eq!(headers, expected_headers);
@@ -2009,8 +1985,8 @@ mod tests {
                 HeaderValue::from_str(&format!("iceberg-rs/{}", CARGO_PKG_VERSION)).unwrap(),
             ),
             (
-                HeaderName::from_static(ACCESS_DELEGATION_HEADER),
-                HeaderValue::from_static(DEFAULT_ACCESS_DELEGATION),
+                HeaderName::from_static("x-iceberg-access-delegation"),
+                HeaderValue::from_static("vended-credentials"),
             ),
             (
                 HeaderName::from_static("customized-header"),

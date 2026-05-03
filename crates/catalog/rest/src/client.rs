@@ -63,9 +63,10 @@ impl CachedToken {
     }
 }
 
-/// All state needed to mint and cache an OAuth token.
+/// All state needed to mint and cache an OAuth token. Borrows the HTTP
+/// transport from `HttpClient` rather than owning it, so there's one
+/// authoritative owner of the `reqwest::Client`.
 pub(crate) struct TokenState {
-    client: Client,
     token_endpoint: String,
     credential: Option<(Option<String>, String)>,
     extra_oauth_params: HashMap<String, String>,
@@ -82,14 +83,12 @@ impl Debug for TokenState {
 
 impl TokenState {
     fn new(
-        client: Client,
         token_endpoint: String,
         credential: Option<(Option<String>, String)>,
         extra_oauth_params: HashMap<String, String>,
         initial_cache: Option<CachedToken>,
     ) -> Self {
         Self {
-            client,
             token_endpoint,
             credential,
             extra_oauth_params,
@@ -99,7 +98,7 @@ impl TokenState {
 
     /// Perform a single `client_credentials` token exchange. Does not mutate
     /// the cache — caller decides whether to store the result.
-    async fn mint_once(&self) -> Result<CachedToken> {
+    async fn mint_once(&self, client: &Client) -> Result<CachedToken> {
         let (client_id, client_secret) = self.credential.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -119,8 +118,7 @@ impl TokenState {
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         );
 
-        let mut auth_req = self
-            .client
+        let mut auth_req = client
             .request(Method::POST, &self.token_endpoint)
             .form(&params)
             .build()?;
@@ -129,7 +127,7 @@ impl TokenState {
             http::HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
         let auth_url = auth_req.url().clone();
-        let auth_resp = self.client.execute(auth_req).await?;
+        let auth_resp = client.execute(auth_req).await?;
 
         let auth_res: TokenResponse = if auth_resp.status() == StatusCode::OK {
             let text = auth_resp
@@ -189,7 +187,7 @@ impl TokenState {
     /// concurrent callers serialize and exactly one OAuth round-trip fires
     /// per refresh cycle. Returns `Ok(None)` only when no auth is configured
     /// at all (no credential and no pre-issued token).
-    async fn get_or_refresh(&self) -> Result<Option<String>> {
+    async fn get_or_refresh(&self, client: &Client) -> Result<Option<String>> {
         let mut cache = self.cache.lock().await;
 
         if let Some(c) = cache.as_ref() {
@@ -202,7 +200,7 @@ impl TokenState {
             return Ok(cache.as_ref().map(|c| c.value.clone()));
         }
 
-        let fresh = self.mint_once().await?;
+        let fresh = self.mint_once(client).await?;
         let value = fresh.value.clone();
         *cache = Some(fresh);
         Ok(Some(value))
@@ -214,6 +212,7 @@ impl TokenState {
 }
 
 pub(crate) struct HttpClient {
+    client: Client,
     state: TokenState,
     /// Extra headers to be added to each request.
     extra_headers: HeaderMap,
@@ -222,6 +221,7 @@ pub(crate) struct HttpClient {
 impl Debug for HttpClient {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpClient")
+            .field("client", &self.client)
             .field("state", &self.state)
             .field("extra_headers", &self.extra_headers)
             .finish_non_exhaustive()
@@ -236,13 +236,13 @@ impl HttpClient {
             expires_at: None,
         });
         let state = TokenState::new(
-            cfg.client().unwrap_or_default(),
             cfg.get_token_endpoint(),
             cfg.credential(),
             cfg.extra_oauth_params(),
             initial_cache,
         );
         Ok(HttpClient {
+            client: cfg.client().unwrap_or_default(),
             state,
             extra_headers,
         })
@@ -280,7 +280,7 @@ impl HttpClient {
                 oauth
             }
         };
-        let new_client = cfg.client().unwrap_or_else(|| self.state.client.clone());
+        let client = cfg.client().unwrap_or(self.client);
         let new_user_token = cfg.token();
 
         let unchanged = new_endpoint == self.state.token_endpoint
@@ -289,6 +289,7 @@ impl HttpClient {
 
         if unchanged && new_user_token.is_none() {
             return Ok(HttpClient {
+                client,
                 state: self.state,
                 extra_headers,
             });
@@ -305,14 +306,9 @@ impl HttpClient {
             None
         };
 
-        let state = TokenState::new(
-            new_client,
-            new_endpoint,
-            new_credential,
-            new_oauth,
-            initial_cache,
-        );
+        let state = TokenState::new(new_endpoint, new_credential, new_oauth, initial_cache);
         Ok(HttpClient {
+            client,
             state,
             extra_headers,
         })
@@ -321,7 +317,7 @@ impl HttpClient {
     /// This API is testing only to assert the token.
     #[cfg(test)]
     pub(crate) async fn token(&self) -> Option<String> {
-        self.state.get_or_refresh().await.ok().flatten()
+        self.state.get_or_refresh(&self.client).await.ok().flatten()
     }
 
     /// Invalidate the current token without generating a new one. On the next
@@ -334,7 +330,7 @@ impl HttpClient {
     /// Invalidate the current token and mint a new one. Mints first so that
     /// if the credential is invalid the current token is left intact.
     pub(crate) async fn regenerate_token(&self) -> Result<()> {
-        let fresh = self.state.mint_once().await?;
+        let fresh = self.state.mint_once(&self.client).await?;
         *self.state.cache.lock().await = Some(fresh);
         Ok(())
     }
@@ -343,7 +339,7 @@ impl HttpClient {
     /// No-op when neither a credential nor a pre-issued token is configured.
     /// A pre-issued `token` is used as-is and never refreshed.
     async fn authenticate(&self, req: &mut Request) -> Result<()> {
-        let Some(token) = self.state.get_or_refresh().await? else {
+        let Some(token) = self.state.get_or_refresh(&self.client).await? else {
             return Ok(());
         };
 
@@ -363,8 +359,7 @@ impl HttpClient {
 
     #[inline]
     pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
-        self.state
-            .client
+        self.client
             .request(method, url)
             .headers(self.extra_headers.clone())
     }
@@ -372,7 +367,7 @@ impl HttpClient {
     /// Executes the given `Request` and returns a `Response`.
     pub async fn execute(&self, mut request: Request) -> Result<Response> {
         request.headers_mut().extend(self.extra_headers.clone());
-        Ok(self.state.client.execute(request).await?)
+        Ok(self.client.execute(request).await?)
     }
 
     /// Queries the Iceberg REST catalog with two retry classes:

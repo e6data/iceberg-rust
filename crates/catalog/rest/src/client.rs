@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use http::StatusCode;
@@ -215,7 +214,7 @@ impl TokenState {
 }
 
 pub(crate) struct HttpClient {
-    state: Arc<TokenState>,
+    state: TokenState,
     /// Extra headers to be added to each request.
     extra_headers: HeaderMap,
 }
@@ -236,13 +235,13 @@ impl HttpClient {
             value,
             expires_at: None,
         });
-        let state = Arc::new(TokenState::new(
+        let state = TokenState::new(
             cfg.client().unwrap_or_default(),
             cfg.get_token_endpoint(),
             cfg.credential(),
             cfg.extra_oauth_params(),
             initial_cache,
-        ));
+        );
         Ok(HttpClient {
             state,
             extra_headers,
@@ -306,13 +305,13 @@ impl HttpClient {
             None
         };
 
-        let state = Arc::new(TokenState::new(
+        let state = TokenState::new(
             new_client,
             new_endpoint,
             new_credential,
             new_oauth,
             initial_cache,
-        ));
+        );
         Ok(HttpClient {
             state,
             extra_headers,
@@ -340,17 +339,9 @@ impl HttpClient {
         Ok(())
     }
 
-    /// Authenticates the request by adding a bearer token to the authorization header.
-    ///
-    /// Three modes:
-    ///
-    /// 1. **No authentication** — both `credential` and pre-issued `token` are missing.
-    /// 2. **Pre-issued token** — `token` from config is used as-is and never refreshed.
-    /// 3. **OAuth** — `credential` is exchanged for a token; the cached token
-    ///    is refreshed inline whenever the next request finds it within
-    ///    `EXPIRY_BUFFER` of expiry.
-    ///
-    /// When both are present, the pre-issued `token` takes precedence.
+    /// Add the bearer token to the request, minting one via OAuth if needed.
+    /// No-op when neither a credential nor a pre-issued token is configured.
+    /// A pre-issued `token` is used as-is and never refreshed.
     async fn authenticate(&self, req: &mut Request) -> Result<()> {
         let Some(token) = self.state.get_or_refresh().await? else {
             return Ok(());
@@ -384,19 +375,10 @@ impl HttpClient {
         Ok(self.state.client.execute(request).await?)
     }
 
-    /// Queries the Iceberg REST catalog after authentication. Transparently
-    /// handles two retry classes:
-    ///
-    /// - **401 Unauthorized / 419 Authentication Timeout** — the cached
-    ///   token is invalidated and the request retried exactly once with a
-    ///   freshly minted token. Safety net for clock skew, server-side
-    ///   rotation, and the gap between the cache's view of expiry and the
-    ///   server's.
-    /// - **429 Too Many Requests / 503 Service Unavailable** — exponential
-    ///   backoff up to `RATE_LIMIT_MAX_RETRIES`, honoring the server's
-    ///   `Retry-After` header when present (seconds form).
-    ///
-    /// All other non-2xx responses are returned to the caller unchanged.
+    /// Queries the Iceberg REST catalog with two retry classes:
+    /// 401/419 → invalidate token and retry once (safety net for clock
+    /// skew and server-side rotation); 429/503 → backoff and retry up to
+    /// `RATE_LIMIT_MAX_RETRIES`, honoring `Retry-After` when present.
     pub async fn query_catalog(&self, request: Request) -> Result<Response> {
         let mut auth_retried = false;
         let mut rate_attempt: u32 = 0;
@@ -404,7 +386,7 @@ impl HttpClient {
         loop {
             let mut attempt = request.try_clone().ok_or_else(|| {
                 Error::new(
-                    ErrorKind::DataInvalid,
+                    ErrorKind::Unexpected,
                     "request body cannot be cloned; catalog retry requires clonable bodies",
                 )
             })?;
@@ -457,10 +439,10 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// Exponential backoff: 500ms, 1s, 2s. Capped by caller at
-/// `RATE_LIMIT_BACKOFF_CAP`.
+/// Exponential backoff: 500ms, 1s, 2s, ... Caller bounds `attempt` to
+/// `RATE_LIMIT_MAX_RETRIES` and caps the result at `RATE_LIMIT_BACKOFF_CAP`.
 fn exponential_backoff(attempt: u32) -> Duration {
-    Duration::from_millis(500u64.saturating_mul(1u64 << attempt.min(10)))
+    Duration::from_millis(500) * (1u32 << attempt)
 }
 
 /// Deserializes a catalog response into the given [`DeserializedOwned`] type.

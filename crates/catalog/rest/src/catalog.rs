@@ -68,8 +68,8 @@ const ACCESS_DELEGATION_HEADER: &str = "x-iceberg-access-delegation";
 
 /// Keys that Java's `OAuth2Manager` forwards to a child auth session instead
 /// of to FileIO. We strip them out of `LoadTableResponse.config` before
-/// merging into FileIO props; honoring them for per-table auth is deferred
-/// to the `AuthManager` trait work (PR-4).
+/// merging into FileIO props; honoring them for per-table auth requires an
+/// `AuthManager` trait that doesn't exist yet.
 const AUTH_TOKEN_KEYS: &[&str] = &[
     "token",
     "urn:ietf:params:oauth:token-type:id_token",
@@ -95,22 +95,26 @@ fn select_storage_credential<'a>(
 }
 
 /// Filter the `config` map returned by a `loadTable`-style response so that
-/// auth-token keys don't leak into FileIO. Returns the filtered map. Logs a
-/// warning when a per-table `token` is dropped so operators know a Polaris
-/// feature is currently unused.
+/// auth-token keys don't leak into FileIO. Logs a warning when a per-table
+/// `token` is dropped so operators know a Polaris feature is currently unused.
 fn filter_loadtable_config(
     config: HashMap<String, String>,
     table_ident: &TableIdent,
 ) -> HashMap<String, String> {
-    if config.contains_key("token") {
-        tracing::warn!(
-            table = %table_ident,
-            "loadTable response contains per-table `token`; it is ignored until AuthManager trait support lands (PR-4)"
-        );
-    }
     config
         .into_iter()
-        .filter(|(k, _)| !AUTH_TOKEN_KEYS.contains(&k.as_str()))
+        .filter(|(k, _)| {
+            if !AUTH_TOKEN_KEYS.contains(&k.as_str()) {
+                return true;
+            }
+            if k == "token" {
+                tracing::warn!(
+                    table = %table_ident,
+                    "loadTable response contains per-table `token`; ignored until AuthManager trait lands"
+                );
+            }
+            false
+        })
         .collect()
 }
 
@@ -345,12 +349,9 @@ impl RestCatalogConfig {
             ),
         ]);
 
-        // Default `X-Iceberg-Access-Delegation: vended-credentials` unless the
-        // user supplied a first-class override via `rest.access-delegation`
-        // or a raw `header.X-Iceberg-Access-Delegation` entry. This matches
-        // PyIceberg's default (send) rather than Java's (opt-in), because the
-        // typical Polaris deployment relies on vended credentials and we want
-        // table loads to surface storage creds without extra configuration.
+        // Default to `vended-credentials` (matching PyIceberg) so table loads
+        // surface storage creds without extra configuration. A raw
+        // `header.X-Iceberg-Access-Delegation` entry takes precedence.
         let has_explicit_delegation_header = self
             .props
             .keys()
@@ -508,6 +509,26 @@ impl RestCatalog {
             StatusCode::OK => deserialize_catalog_response(http_response).await,
             _ => Err(deserialize_unexpected_catalog_error(http_response).await),
         }
+    }
+
+    /// Build a FileIO for a table response, merging vended storage credentials,
+    /// catalog config, and user props. Wraps `build_table_file_io_props` +
+    /// `load_file_io` so the three table-loading paths share one call.
+    async fn load_table_file_io(
+        &self,
+        table_ident: &TableIdent,
+        response_config: Option<HashMap<String, String>>,
+        storage_credentials: Option<Vec<StorageCredential>>,
+        metadata_location: Option<&str>,
+    ) -> Result<FileIO> {
+        let props = build_table_file_io_props(
+            response_config,
+            storage_credentials.as_deref(),
+            table_ident,
+            metadata_location,
+            &self.user_config.props,
+        );
+        self.load_file_io(metadata_location, Some(props)).await
     }
 
     async fn load_file_io(
@@ -823,16 +844,13 @@ impl Catalog for RestCatalog {
             "Metadata location missing in `create_table` response!",
         ))?;
 
-        let file_io_props = build_table_file_io_props(
-            response.config,
-            response.storage_credentials.as_deref(),
-            &table_ident,
-            Some(metadata_location.as_str()),
-            &self.user_config.props,
-        );
-
         let file_io = self
-            .load_file_io(Some(metadata_location), Some(file_io_props))
+            .load_table_file_io(
+                &table_ident,
+                response.config,
+                response.storage_credentials,
+                Some(metadata_location.as_str()),
+            )
             .await?;
 
         let table_builder = Table::builder()
@@ -876,16 +894,13 @@ impl Catalog for RestCatalog {
             _ => return Err(deserialize_unexpected_catalog_error(http_response).await),
         };
 
-        let file_io_props = build_table_file_io_props(
-            response.config,
-            response.storage_credentials.as_deref(),
-            table_ident,
-            response.metadata_location.as_deref(),
-            &self.user_config.props,
-        );
-
         let file_io = self
-            .load_file_io(response.metadata_location.as_deref(), Some(file_io_props))
+            .load_table_file_io(
+                table_ident,
+                response.config,
+                response.storage_credentials,
+                response.metadata_location.as_deref(),
+            )
             .await?;
 
         let table_builder = Table::builder()
@@ -1016,16 +1031,13 @@ impl Catalog for RestCatalog {
             "Metadata location missing in `register_table` response!",
         ))?;
 
-        let file_io_props = build_table_file_io_props(
-            response.config,
-            response.storage_credentials.as_deref(),
-            table_ident,
-            Some(metadata_location.as_str()),
-            &self.user_config.props,
-        );
-
         let file_io = self
-            .load_file_io(Some(metadata_location), Some(file_io_props))
+            .load_table_file_io(
+                table_ident,
+                response.config,
+                response.storage_credentials,
+                Some(metadata_location.as_str()),
+            )
             .await?;
 
         Table::builder()

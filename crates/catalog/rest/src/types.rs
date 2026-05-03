@@ -158,12 +158,20 @@ pub(super) struct RenameTableRequest {
     pub(super) destination: TableIdent,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub(super) struct StorageCredential {
+    pub(super) prefix: String,
+    pub(super) config: HashMap<String, String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) struct LoadTableResponse {
     pub(super) metadata_location: Option<String>,
     pub(super) metadata: TableMetadata,
     pub(super) config: Option<HashMap<String, String>>,
+    pub(super) storage_credentials: Option<Vec<StorageCredential>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -203,22 +203,15 @@ impl RewriteManifestsAction {
                 current_table = catalog.load_table(table.identifier()).await?;
             }
 
-            let fresh_snapshot =
-                current_table
-                    .metadata()
-                    .current_snapshot()
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            "Table has no current snapshot during merge phase",
-                        )
-                    })?;
+            let fresh_snapshot = current_table.metadata().current_snapshot().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Table has no current snapshot during merge phase",
+                )
+            })?;
 
             let fresh_manifest_list = fresh_snapshot
-                .load_manifest_list(
-                    current_table.file_io(),
-                    &current_table.metadata_ref(),
-                )
+                .load_manifest_list(current_table.file_io(), &current_table.metadata_ref())
                 .await?;
 
             // Find new manifests added since Phase 1 started

@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus,
-    ManifestWriterBuilder, Operation,
+    DataFile, DataFileFormat, Datum, FieldSummary, FormatVersion, ManifestEntry, ManifestFile,
+    ManifestStatus, ManifestWriterBuilder, Operation, StructType,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{
@@ -152,6 +152,7 @@ impl TransactionAction for ReplaceDataFilesAction {
                 .iter()
                 .map(|f| f.file_path.clone())
                 .collect(),
+            data_files_to_delete: self.files_to_delete.clone(),
             commit_uuid: self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             key_metadata: self.key_metadata.clone(),
         };
@@ -162,8 +163,92 @@ impl TransactionAction for ReplaceDataFilesAction {
     }
 }
 
+/// Build a `Vec<HashSet<Vec<u8>>>` where index `i` holds the set of
+/// byte-encoded partition values at position `i` across all files to delete.
+///
+/// The byte encoding matches the one used by the manifest writer when it
+/// creates `FieldSummary` bounds (`Datum::to_bytes`), so a direct byte
+/// comparison against `FieldSummary::lower_bound` / `upper_bound` is valid.
+fn build_target_partition_bytes(
+    files_to_delete: &[DataFile],
+    partition_type: &StructType,
+) -> Vec<HashSet<Vec<u8>>> {
+    let num_fields = partition_type.fields().len();
+    let mut result: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); num_fields];
+
+    let field_types: Vec<_> = partition_type
+        .fields()
+        .iter()
+        .filter_map(|f| f.field_type.as_primitive_type().cloned())
+        .collect();
+
+    // If the partition spec has non-primitive fields we can't encode them,
+    // return empty sets (which will disable filtering for those positions).
+    if field_types.len() != num_fields {
+        return result;
+    }
+
+    for file in files_to_delete {
+        // Skip files whose partition field count doesn't match this spec.
+        if file.partition().fields().len() != num_fields {
+            continue;
+        }
+        for (i, field_val) in file.partition().iter().enumerate() {
+            if let Some(literal) = field_val {
+                if let Some(prim) = literal.as_primitive_literal() {
+                    let datum = Datum::new(field_types[i].clone(), prim);
+                    if let Ok(bytes) = datum.to_bytes() {
+                        result[i].insert(bytes.to_vec());
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Returns `false` when the manifest's partition summaries prove that it
+/// cannot contain any of the target files (i.e., can be safely skipped).
+///
+/// Only filters on partition fields where both `lower_bound` and
+/// `upper_bound` are present and equal (single-value summary). When a
+/// range or missing bounds are encountered the field is conservatively
+/// treated as a possible match.
+fn manifest_could_contain_target_files(
+    partitions: &[FieldSummary],
+    target_partition_bytes: &[HashSet<Vec<u8>>],
+) -> bool {
+    for (i, summary) in partitions.iter().enumerate() {
+        let targets = match target_partition_bytes.get(i) {
+            Some(t) if !t.is_empty() => t,
+            _ => continue, // no targets for this field position — skip
+        };
+
+        match (&summary.lower_bound, &summary.upper_bound) {
+            (Some(lower), Some(upper)) if lower == upper => {
+                // Single value in this partition field across the whole manifest.
+                // If that value is not among the target partition bytes we can
+                // rule out this manifest entirely.
+                let bound_bytes: &[u8] = lower.as_ref();
+                if !targets.iter().any(|t| t.as_slice() == bound_bytes) {
+                    return false;
+                }
+            }
+            _ => {
+                // Range or missing bounds — can't safely filter, keep manifest.
+                continue;
+            }
+        }
+    }
+
+    true // all fields passed or couldn't be filtered
+}
+
 struct ReplaceOperation {
     files_to_delete: HashSet<String>,
+    /// Full DataFile objects for computing partition-level filters.
+    data_files_to_delete: Vec<DataFile>,
     commit_uuid: Uuid,
     key_metadata: Option<Vec<u8>>,
 }
@@ -198,6 +283,13 @@ impl SnapshotProduceOperation for ReplaceOperation {
         let mut result_manifests: Vec<ManifestFile> = Vec::new();
         let mut remaining_to_delete: HashSet<String> = self.files_to_delete.clone();
 
+        // Pre-compute byte-encoded partition values from the files being
+        // deleted, keyed by partition spec id. Used below to skip manifests
+        // whose FieldSummary bounds prove they cannot contain any target file.
+        let metadata = snapshot_produce.table.metadata();
+        let schema = metadata.current_schema();
+        let mut partition_bytes_by_spec: HashMap<i32, Vec<HashSet<Vec<u8>>>> = HashMap::new();
+
         for manifest_entry in manifest_list.entries() {
             // NOTE: The previous fast-path here used `delete_manifests` to drop
             // an entire manifest_entry without inspecting its contents. This is
@@ -219,6 +311,35 @@ impl SnapshotProduceOperation for ReplaceOperation {
             // Skip manifests with no active files
             if !manifest_entry.has_added_files() && !manifest_entry.has_existing_files() {
                 continue;
+            }
+
+            // Short-circuit: if all files to delete have been found,
+            // keep remaining manifests as-is without loading them from S3.
+            if remaining_to_delete.is_empty() {
+                result_manifests.push(manifest_entry.clone());
+                continue;
+            }
+
+            // Skip manifests whose partition summaries prove they cannot
+            // contain any of the target files. This avoids an S3 GET for
+            // manifests that are clearly for a different partition value
+            // (common after compaction when lower_bound == upper_bound).
+            if let Some(ref summaries) = manifest_entry.partitions {
+                let spec_id = manifest_entry.partition_spec_id;
+                let target_bytes = partition_bytes_by_spec.entry(spec_id).or_insert_with(|| {
+                    metadata
+                        .partition_spec_by_id(spec_id)
+                        .and_then(|spec| spec.partition_type(schema).ok())
+                        .map(|pt| build_target_partition_bytes(&self.data_files_to_delete, &pt))
+                        .unwrap_or_default()
+                });
+
+                if !target_bytes.is_empty()
+                    && !manifest_could_contain_target_files(summaries, target_bytes)
+                {
+                    result_manifests.push(manifest_entry.clone());
+                    continue;
+                }
             }
 
             // Load the manifest to check if any of its entries need to be deleted

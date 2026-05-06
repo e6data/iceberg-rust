@@ -1375,8 +1375,8 @@ fn json_struct_propagates_type_mismatch_on_present_field() {
         NestedField::optional(2, "count", Type::Primitive(PrimitiveType::Long)).into(),
     ]));
 
-    let err = Literal::try_from_json(record, &dest)
-        .expect_err("expected type-mismatch error, got Ok");
+    let err =
+        Literal::try_from_json(record, &dest).expect_err("expected type-mismatch error, got Ok");
     let msg = err.to_string();
     assert!(
         msg.contains("Failed to decode struct field id=2"),

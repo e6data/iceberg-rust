@@ -218,6 +218,10 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
+    pub(crate) fn generate_unique_snapshot_id_static(table: &Table) -> i64 {
+        Self::generate_unique_snapshot_id(table)
+    }
+
     fn generate_unique_snapshot_id(table: &Table) -> i64 {
         let generate_random_id = || -> i64 {
             let (lhs, rhs) = Uuid::new_v4().as_u64_pair();

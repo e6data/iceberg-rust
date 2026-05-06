@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 mod replace_data_files;
+mod rewrite_manifests;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -75,6 +76,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::replace_data_files::ReplaceDataFilesAction;
+use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -169,6 +171,12 @@ impl Transaction {
     /// Creates a replace data files action.
     pub fn replace_data_files(&self) -> ReplaceDataFilesAction {
         ReplaceDataFilesAction::new()
+    }
+
+    /// Creates a rewrite-manifests action that compacts many small manifests
+    /// into fewer large ones. This is a metadata-only operation.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Creates a schema-evolution action limited to additive changes

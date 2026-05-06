@@ -174,12 +174,12 @@ mod tests {
 
     use as_any::Downcast;
 
+    use crate::TableUpdate;
     use crate::spec::Transform;
     use crate::transaction::Transaction;
     use crate::transaction::action::{ApplyTransactionAction, TransactionAction};
     use crate::transaction::tests::make_v2_table;
     use crate::transaction::update_spec::UpdateSpecAction;
-    use crate::TableUpdate;
 
     #[test]
     fn test_add_field_queues_action() {
@@ -193,9 +193,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tx.actions.len(), 1);
-        let action = (*tx.actions[0])
-            .downcast_ref::<UpdateSpecAction>()
-            .unwrap();
+        let action = (*tx.actions[0]).downcast_ref::<UpdateSpecAction>().unwrap();
         assert_eq!(action.declared_fields.len(), 2);
         assert_eq!(action.declared_fields[0].0, "x");
         assert_eq!(action.declared_fields[0].1, "x");
@@ -246,10 +244,7 @@ mod tests {
         // identity] should be a no-op — same length, same fields in same
         // order.
         let table = make_v2_table();
-        let action = Arc::new(
-            UpdateSpecAction::new()
-                .add_field("x", "x", Transform::Identity),
-        );
+        let action = Arc::new(UpdateSpecAction::new().add_field("x", "x", Transform::Identity));
 
         let mut commit = action.commit(&table).await.unwrap();
         assert!(
@@ -276,10 +271,11 @@ mod tests {
     #[tokio::test]
     async fn test_commit_errors_on_unknown_source_column() {
         let table = make_v2_table();
-        let action = Arc::new(
-            UpdateSpecAction::new()
-                .add_field("does_not_exist", "dne", Transform::Identity),
-        );
+        let action = Arc::new(UpdateSpecAction::new().add_field(
+            "does_not_exist",
+            "dne",
+            Transform::Identity,
+        ));
 
         let err = match action.commit(&table).await {
             Ok(_) => panic!("expected error for unknown source column, got Ok"),

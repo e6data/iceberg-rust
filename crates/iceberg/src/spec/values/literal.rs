@@ -545,20 +545,18 @@ impl Literal {
                         .iter()
                         .map(|field| match object.remove(&field.id.to_string()) {
                             None | Some(JsonValue::Null) => Ok(None),
-                            Some(json_value) => Literal::try_from_json(
-                                json_value,
-                                &field.field_type,
-                            )
-                            .map_err(|e| {
-                                Error::new(
-                                    ErrorKind::DataInvalid,
-                                    format!(
-                                        "Failed to decode struct field id={} name={:?} \
+                            Some(json_value) => {
+                                Literal::try_from_json(json_value, &field.field_type).map_err(|e| {
+                                    Error::new(
+                                        ErrorKind::DataInvalid,
+                                        format!(
+                                            "Failed to decode struct field id={} name={:?} \
                                          (expected {:?}): {e}",
-                                        field.id, field.name, field.field_type
-                                    ),
-                                )
-                            }),
+                                            field.id, field.name, field.field_type
+                                        ),
+                                    )
+                                })
+                            }
                         })
                         .collect();
                     Ok(Some(Literal::Struct(Struct::from_iter(fields?))))

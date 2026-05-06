@@ -127,8 +127,11 @@ impl RewriteManifestsAction {
             }
         }
 
-        // Write compacted manifest files to S3, one set per spec_id
+        // Write compacted manifest files to S3, one set per spec_id.
+        // Generate snapshot_id upfront so manifests carry a valid ID
+        // (ManifestListWriter rejects manifests with unassigned snapshot_id in V2).
         let commit_uuid = Uuid::now_v7();
+        let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
         let format_version = table.metadata().format_version();
         let schema = table.metadata().current_schema().clone();
 
@@ -159,7 +162,7 @@ impl RewriteManifestsAction {
                 let output_file = table.file_io().new_output(&manifest_path)?;
                 let builder = ManifestWriterBuilder::new(
                     output_file,
-                    None,
+                    Some(snapshot_id),
                     None,
                     schema.clone(),
                     spec.as_ref().clone(),
@@ -226,8 +229,8 @@ impl RewriteManifestsAction {
                 }
             }
 
-            // Build final manifest list: compacted + new + delete
-            let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(&current_table);
+            // Reuse the snapshot_id generated in Phase 1 (manifests already carry it)
+            let _ = snapshot_id;
             let next_seq_num = current_table.metadata().next_sequence_number();
             let manifest_list_path = format!(
                 "{}/metadata/snap-{}-0-{}.{}",

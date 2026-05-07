@@ -3402,6 +3402,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-catalog-biglake"
+version = "0.9.0"
+dependencies = [
+ "async-trait",
+ "iceberg",
+ "iceberg-catalog-rest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iceberg-catalog-glue"
 version = "0.9.0"
 dependencies = [

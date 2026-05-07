@@ -34,9 +34,9 @@ use opendal::Scheme;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::OpenDalStorage;
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
+use crate::{OpenDalStorage, OpenDalStorageBackend, OpenDalWriterOptions};
 
 /// Schemes supported by OpenDalResolvingStorage
 pub const SCHEME_MEMORY: &str = "memory";
@@ -87,45 +87,50 @@ fn build_storage_for_scheme(
     props: &HashMap<String, String>,
     #[cfg(feature = "opendal-s3")] customized_credential_load: &Option<CustomAwsCredentialLoader>,
 ) -> Result<OpenDalStorage> {
-    match scheme {
+    let writer_options =
+        OpenDalWriterOptions::from_config(&StorageConfig::from_props(props.clone()))?;
+
+    let backend = match scheme {
         #[cfg(feature = "opendal-s3")]
         Scheme::S3 => {
             let config = crate::s3::s3_config_parse(props.clone())?;
-            Ok(OpenDalStorage::S3 {
+            OpenDalStorageBackend::S3 {
                 config: Arc::new(config),
                 customized_credential_load: customized_credential_load.clone(),
-            })
+            }
         }
         #[cfg(feature = "opendal-gcs")]
         Scheme::Gcs => {
             let config = crate::gcs::gcs_config_parse(props.clone())?;
-            Ok(OpenDalStorage::Gcs {
+            OpenDalStorageBackend::Gcs {
                 config: Arc::new(config),
-            })
+            }
         }
         #[cfg(feature = "opendal-oss")]
         Scheme::Oss => {
             let config = crate::oss::oss_config_parse(props.clone())?;
-            Ok(OpenDalStorage::Oss {
+            OpenDalStorageBackend::Oss {
                 config: Arc::new(config),
-            })
+            }
         }
         #[cfg(feature = "opendal-azdls")]
         Scheme::Azdls => {
             let config = crate::azdls::azdls_config_parse(props.clone())?;
-            Ok(OpenDalStorage::Azdls {
+            OpenDalStorageBackend::Azdls {
                 config: Arc::new(config),
-            })
+            }
         }
         #[cfg(feature = "opendal-fs")]
-        Scheme::Fs => Ok(OpenDalStorage::LocalFs),
+        Scheme::Fs => OpenDalStorageBackend::LocalFs,
         #[cfg(feature = "opendal-memory")]
-        Scheme::Memory => Ok(OpenDalStorage::Memory(crate::memory::memory_config_build()?)),
+        Scheme::Memory => OpenDalStorageBackend::Memory(crate::memory::memory_config_build()?),
         unsupported => Err(Error::new(
             ErrorKind::FeatureUnsupported,
             format!("Unsupported storage scheme: {unsupported}"),
-        )),
-    }
+        ))?,
+    };
+
+    Ok(OpenDalStorage::new(backend, writer_options))
 }
 
 /// A resolving storage factory that creates [`OpenDalResolvingStorage`] instances.

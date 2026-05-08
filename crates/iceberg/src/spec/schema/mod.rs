@@ -421,6 +421,21 @@ impl Schema {
     }
 }
 
+/// Creates the Iceberg schema for position delete files.
+///
+/// Position delete files contain two required columns:
+/// - `file_path` (String): path of the data file containing the row to delete
+/// - `pos` (Long): zero-based position of the row within the data file
+pub fn position_delete_schema() -> Schema {
+    Schema::builder()
+        .with_fields(vec![
+            crate::metadata_columns::delete_file_path_field().clone(),
+            crate::metadata_columns::delete_file_pos_field().clone(),
+        ])
+        .build()
+        .expect("Position delete schema is always valid")
+}
+
 impl Display for Schema {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "table {{")?;

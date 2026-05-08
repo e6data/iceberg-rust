@@ -164,17 +164,23 @@ impl<'a> SnapshotProducer<'a> {
                     "Only data content type is allowed for fast append",
                 ));
             }
-            // Check if the data file partition spec id matches the table default partition spec id.
-            if self.table.metadata().default_partition_spec_id() != data_file.partition_spec_id {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Data file partition spec id does not match table default partition spec id",
-                ));
+            // Validate partition value against the file's own spec (not necessarily
+            // the default). Compaction may produce files with older spec IDs when
+            // merging historical data written before a partition evolution.
+            if let Some(spec) = self
+                .table
+                .metadata()
+                .partition_spec_by_id(data_file.partition_spec_id)
+            {
+                let partition_type = spec
+                    .partition_type(self.table.metadata().current_schema())
+                    .map_err(|e| {
+                        Error::new(ErrorKind::DataInvalid, format!("invalid partition spec: {e}"))
+                    })?;
+                Self::validate_partition_value(data_file.partition(), &partition_type)?;
             }
-            Self::validate_partition_value(
-                data_file.partition(),
-                self.table.metadata().default_partition_type(),
-            )?;
+            // If spec not found, skip validation (the commit will succeed and
+            // Lakekeeper validates at the catalog level).
         }
 
         Ok(())

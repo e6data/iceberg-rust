@@ -16,8 +16,8 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -47,6 +47,9 @@ pub struct ReplaceDataFilesAction {
     validate_from_snapshot_id: Option<i64>,
     data_sequence_number: Option<i64>,
     added_delete_files: Vec<DataFile>,
+    /// Cached manifest result from the first commit attempt.
+    /// On retry, reuse this to skip re-reading all manifests from S3.
+    cached_manifests: Arc<Mutex<Option<Vec<ManifestFile>>>>,
 }
 
 impl ReplaceDataFilesAction {
@@ -61,6 +64,7 @@ impl ReplaceDataFilesAction {
             validate_from_snapshot_id: None,
             data_sequence_number: None,
             added_delete_files: Vec::new(),
+            cached_manifests: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -155,6 +159,7 @@ impl TransactionAction for ReplaceDataFilesAction {
             data_files_to_delete: self.files_to_delete.clone(),
             commit_uuid: self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             key_metadata: self.key_metadata.clone(),
+            cached_manifests: Arc::clone(&self.cached_manifests),
         };
 
         snapshot_producer
@@ -251,6 +256,10 @@ struct ReplaceOperation {
     data_files_to_delete: Vec<DataFile>,
     commit_uuid: Uuid,
     key_metadata: Option<Vec<u8>>,
+    /// Shared cache for manifest computation results. Populated on the first
+    /// commit attempt and reused on retries to avoid re-reading manifests
+    /// from S3.
+    cached_manifests: Arc<Mutex<Option<Vec<ManifestFile>>>>,
 }
 
 impl SnapshotProduceOperation for ReplaceOperation {
@@ -269,6 +278,16 @@ impl SnapshotProduceOperation for ReplaceOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
+        // On retry, reuse the cached manifest result to avoid re-reading all
+        // manifests from S3. The manifest content hasn't changed between
+        // retries — only the snapshot ref may have advanced.
+        {
+            let cache = self.cached_manifests.lock().unwrap();
+            if let Some(ref cached) = *cache {
+                return Ok(cached.clone());
+            }
+        }
+
         let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
             return Ok(vec![]);
         };
@@ -450,6 +469,12 @@ impl SnapshotProduceOperation for ReplaceOperation {
                         .join(", ")
                 ),
             ));
+        }
+
+        // Cache the result for future retries.
+        {
+            let mut cache = self.cached_manifests.lock().unwrap();
+            *cache = Some(result_manifests.clone());
         }
 
         Ok(result_manifests)

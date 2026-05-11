@@ -175,7 +175,10 @@ impl<'a> SnapshotProducer<'a> {
                 let partition_type = spec
                     .partition_type(self.table.metadata().current_schema())
                     .map_err(|e| {
-                        Error::new(ErrorKind::DataInvalid, format!("invalid partition spec: {e}"))
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("invalid partition spec: {e}"),
+                        )
                     })?;
                 Self::validate_partition_value(data_file.partition(), &partition_type)?;
             }

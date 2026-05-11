@@ -281,10 +281,26 @@ impl SnapshotProduceOperation for ReplaceOperation {
         // On retry, reuse the cached manifest result to avoid re-reading all
         // manifests from S3. The manifest content hasn't changed between
         // retries — only the snapshot ref may have advanced.
+        //
+        // Rewritten manifests in the cache carry the OLD snapshot's ID in
+        // `added_snapshot_id`. The ManifestListWriter requires unassigned-
+        // sequence manifests to match the CURRENT snapshot ID. Fix up the
+        // IDs so the retry's ManifestListWriter accepts them.
         {
             let cache = self.cached_manifests.lock().unwrap();
             if let Some(ref cached) = *cache {
-                return Ok(cached.clone());
+                let current_snap_id = snapshot_produce.snapshot_id();
+                let fixed: Vec<ManifestFile> = cached
+                    .iter()
+                    .map(|mf| {
+                        let mut m = mf.clone();
+                        if m.sequence_number == crate::spec::UNASSIGNED_SEQUENCE_NUMBER {
+                            m.added_snapshot_id = current_snap_id;
+                        }
+                        m
+                    })
+                    .collect();
+                return Ok(fixed);
             }
         }
 

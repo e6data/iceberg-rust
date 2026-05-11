@@ -111,25 +111,11 @@ impl RewriteManifestsAction {
             }
         }
 
-        // Load all alive data entries, grouped by partition_spec_id.
-        // Entries from different specs have different partition tuple shapes
-        // and must be written to separate manifests with matching specs.
-        let mut entries_by_spec: HashMap<i32, Vec<ManifestEntry>> = HashMap::new();
-        for mf in &data_manifests {
-            let manifest = mf.load_manifest(table.file_io()).await?;
-            for entry in manifest.entries() {
-                if entry.is_alive() {
-                    entries_by_spec
-                        .entry(entry.data_file().partition_spec_id)
-                        .or_default()
-                        .push(entry.as_ref().clone());
-                }
-            }
-        }
+        // Stream manifests in bounded chunks to avoid loading all entries
+        // into memory at once. Process CHUNK_SIZE manifests at a time:
+        // load their entries, write consolidated output, then drop.
+        const CHUNK_SIZE: usize = 50;
 
-        // Write compacted manifest files to S3, one set per spec_id.
-        // Generate snapshot_id upfront so manifests carry a valid ID
-        // (ManifestListWriter rejects manifests with unassigned snapshot_id in V2).
         let commit_uuid = Uuid::now_v7();
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
         let format_version = table.metadata().format_version();
@@ -138,56 +124,75 @@ impl RewriteManifestsAction {
         let mut compacted_data_manifests: Vec<ManifestFile> = Vec::new();
         let mut manifest_counter: u64 = 0;
 
-        for (spec_id, entries) in &entries_by_spec {
-            let spec = table
-                .metadata()
-                .partition_spec_by_id(*spec_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("partition spec {spec_id} not found in table metadata"),
-                    )
-                })?;
-
-            for chunk in entries.chunks(self.target_entries_per_manifest) {
-                let manifest_path = format!(
-                    "{}/metadata/{}-m{}.{}",
-                    table.metadata().location(),
-                    commit_uuid,
-                    manifest_counter,
-                    DataFileFormat::Avro,
-                );
-                manifest_counter += 1;
-
-                let output_file = table.file_io().new_output(&manifest_path)?;
-                let builder = ManifestWriterBuilder::new(
-                    output_file,
-                    Some(snapshot_id),
-                    None,
-                    schema.clone(),
-                    spec.as_ref().clone(),
-                );
-
-                let mut writer = match format_version {
-                    FormatVersion::V1 => builder.build_v1(),
-                    FormatVersion::V2 => builder.build_v2_data(),
-                    FormatVersion::V3 => builder.build_v3_data(),
-                };
-
-                for entry in chunk {
-                    let existing = ManifestEntry::builder()
-                        .status(ManifestStatus::Existing)
-                        .snapshot_id(entry.snapshot_id().unwrap_or(0))
-                        .sequence_number(entry.sequence_number().unwrap_or(0))
-                        .file_sequence_number_opt(entry.file_sequence_number)
-                        .data_file(entry.data_file().clone())
-                        .build();
-                    writer.add_entry(existing)?;
+        // Process data manifests in chunks of CHUNK_SIZE
+        for manifest_chunk in data_manifests.chunks(CHUNK_SIZE) {
+            // Load entries from this chunk only, grouped by spec_id
+            let mut entries_by_spec: HashMap<i32, Vec<ManifestEntry>> = HashMap::new();
+            for mf in manifest_chunk {
+                let manifest = mf.load_manifest(table.file_io()).await?;
+                for entry in manifest.entries() {
+                    if entry.is_alive() {
+                        entries_by_spec
+                            .entry(entry.data_file().partition_spec_id)
+                            .or_default()
+                            .push(entry.as_ref().clone());
+                    }
                 }
-
-                let manifest_file = writer.write_manifest_file().await?;
-                compacted_data_manifests.push(manifest_file);
             }
+
+            // Write consolidated manifests for this chunk
+            for (spec_id, entries) in &entries_by_spec {
+                let spec = table
+                    .metadata()
+                    .partition_spec_by_id(*spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("partition spec {spec_id} not found in table metadata"),
+                        )
+                    })?;
+
+                for chunk in entries.chunks(self.target_entries_per_manifest) {
+                    let manifest_path = format!(
+                        "{}/metadata/{}-m{}.{}",
+                        table.metadata().location(),
+                        commit_uuid,
+                        manifest_counter,
+                        DataFileFormat::Avro,
+                    );
+                    manifest_counter += 1;
+
+                    let output_file = table.file_io().new_output(&manifest_path)?;
+                    let builder = ManifestWriterBuilder::new(
+                        output_file,
+                        Some(snapshot_id),
+                        None,
+                        schema.clone(),
+                        spec.as_ref().clone(),
+                    );
+
+                    let mut writer = match format_version {
+                        FormatVersion::V1 => builder.build_v1(),
+                        FormatVersion::V2 => builder.build_v2_data(),
+                        FormatVersion::V3 => builder.build_v3_data(),
+                    };
+
+                    for entry in chunk {
+                        let existing = ManifestEntry::builder()
+                            .status(ManifestStatus::Existing)
+                            .snapshot_id(entry.snapshot_id().unwrap_or(0))
+                            .sequence_number(entry.sequence_number().unwrap_or(0))
+                            .file_sequence_number_opt(entry.file_sequence_number)
+                            .data_file(entry.data_file().clone())
+                            .build();
+                        writer.add_entry(existing)?;
+                    }
+
+                    let manifest_file = writer.write_manifest_file().await?;
+                    compacted_data_manifests.push(manifest_file);
+                }
+            }
+            // entries_by_spec dropped here — memory freed before loading next chunk
         }
 
         // Phase 1 complete — compacted manifests are on S3 and immutable.

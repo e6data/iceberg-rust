@@ -50,9 +50,13 @@ use crate::types::{
 pub const REST_CATALOG_PROP_URI: &str = "uri";
 /// REST catalog warehouse location
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
+/// Controls which snapshots are loaded in REST load_table responses.
+pub const REST_CATALOG_PROP_SNAPSHOT_LOADING_MODE: &str = "snapshot-loading-mode";
 /// Disable header redaction in error logs (defaults to false for security)
 pub const REST_CATALOG_PROP_DISABLE_HEADER_REDACTION: &str = "disable-header-redaction";
 
+const SNAPSHOT_LOADING_MODE_ALL: &str = "all";
+const SNAPSHOT_LOADING_MODE_REFS: &str = "refs";
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PATH_V1: &str = "v1";
@@ -315,6 +319,29 @@ impl RestCatalogConfig {
             .get(REST_CATALOG_PROP_DISABLE_HEADER_REDACTION)
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    /// Get the snapshot loading mode for REST load_table requests.
+    pub(crate) fn snapshot_loading_mode(&self) -> Result<&'static str> {
+        match self
+            .props
+            .get(REST_CATALOG_PROP_SNAPSHOT_LOADING_MODE)
+            .map(|v| v.as_str())
+        {
+            None => Ok(SNAPSHOT_LOADING_MODE_ALL),
+            Some(value) if value.eq_ignore_ascii_case(SNAPSHOT_LOADING_MODE_ALL) => {
+                Ok(SNAPSHOT_LOADING_MODE_ALL)
+            }
+            Some(value) if value.eq_ignore_ascii_case(SNAPSHOT_LOADING_MODE_REFS) => {
+                Ok(SNAPSHOT_LOADING_MODE_REFS)
+            }
+            Some(value) => Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid value for {REST_CATALOG_PROP_SNAPSHOT_LOADING_MODE}: {value}. Expected 'all' or 'refs'."
+                ),
+            )),
+        }
     }
 
     /// Merge the `RestCatalogConfig` with the a [`CatalogConfig`] (fetched from the REST server).
@@ -810,6 +837,7 @@ impl Catalog for RestCatalog {
         let request = context
             .client
             .request(Method::GET, context.config.table_endpoint(table_ident))
+            .query(&[("snapshots", context.config.snapshot_loading_mode()?)])
             .build()?;
 
         let http_response = context.client.query_catalog(request).await?;
@@ -1072,7 +1100,7 @@ mod tests {
         UnboundPartitionField, UnboundPartitionSpec,
     };
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use mockito::{Mock, Server, ServerGuard};
+    use mockito::{Matcher, Mock, Server, ServerGuard};
     use serde_json::json;
     use uuid::uuid;
 
@@ -2197,8 +2225,12 @@ mod tests {
 
         let config_mock = create_config_mock(&mut server).await;
 
-        let rename_table_mock = server
+        let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .match_query(Matcher::UrlEncoded(
+                "snapshots".to_string(),
+                "all".to_string(),
+            ))
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",
@@ -2301,7 +2333,85 @@ mod tests {
         );
 
         config_mock.assert_async().await;
-        rename_table_mock.assert_async().await;
+        load_table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_table_with_refs_snapshot_loading_mode() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let load_table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .match_query(Matcher::UrlEncoded(
+                "snapshots".to_string(),
+                "refs".to_string(),
+            ))
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "load_table_response.json"
+            ))
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([(
+                    REST_CATALOG_PROP_SNAPSHOT_LOADING_MODE.to_string(),
+                    "refs".to_string(),
+                )]))
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let table = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "test1".to_string(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            &TableIdent::from_strs(vec!["ns1", "test1"]).unwrap(),
+            table.identifier()
+        );
+
+        config_mock.assert_async().await;
+        load_table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_table_rejects_invalid_snapshot_loading_mode() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([(
+                    REST_CATALOG_PROP_SNAPSHOT_LOADING_MODE.to_string(),
+                    "invalid".to_string(),
+                )]))
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let err = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "test1".to_string(),
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        config_mock.assert_async().await;
     }
 
     #[tokio::test]
@@ -2310,8 +2420,12 @@ mod tests {
 
         let config_mock = create_config_mock(&mut server).await;
 
-        let rename_table_mock = server
+        let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .match_query(Matcher::UrlEncoded(
+                "snapshots".to_string(),
+                "all".to_string(),
+            ))
             .with_status(404)
             .with_body(r#"
 {
@@ -2341,7 +2455,7 @@ mod tests {
         assert!(table.err().unwrap().message().contains("does not exist"));
 
         config_mock.assert_async().await;
-        rename_table_mock.assert_async().await;
+        load_table_mock.assert_async().await;
     }
 
     #[tokio::test]

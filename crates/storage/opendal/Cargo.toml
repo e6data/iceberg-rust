@@ -42,6 +42,7 @@ anyhow = { workspace = true }
 cfg-if = { workspace = true }
 iceberg = { workspace = true }
 opendal = { workspace = true }
+prometheus = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 reqsign = { version = "0.16.3", optional = true, default-features = false }

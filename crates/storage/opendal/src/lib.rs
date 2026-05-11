@@ -22,6 +22,7 @@
 //! [`StorageFactory`](iceberg::io::StorageFactory) traits from the `iceberg` crate
 //! using [OpenDAL](https://opendal.apache.org/) as the backend.
 
+mod metrics_layer;
 mod utils;
 
 use std::collections::HashMap;
@@ -402,6 +403,7 @@ impl OpenDalStorage {
         // Transient errors are common for object stores; however there's no
         // harm in retrying temporary failures for other storage backends as well.
         let operator = operator.layer(RetryLayer::new());
+        let operator = operator.layer(metrics_layer::IcebergMetricsLayer);
         Ok((operator, relative_path))
     }
 
@@ -678,6 +680,28 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.to_string().contains(OPENDAL_WRITER_CONCURRENCY));
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_storage_metrics_are_recorded() {
+        let storage = test_storage(OpenDalStorageBackend::Memory(default_memory_operator()));
+
+        storage
+            .write("memory:/metrics-file", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let bytes = storage.read("memory:/metrics-file").await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        let metric_names = prometheus::gather()
+            .into_iter()
+            .map(|family| family.name().to_string())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(metric_names.contains("iceberg_storage_ops_total"));
+        assert!(metric_names.contains("iceberg_storage_ops_duration_seconds"));
+        assert!(metric_names.contains("iceberg_storage_bytes_total"));
     }
 
     #[cfg(feature = "opendal-memory")]

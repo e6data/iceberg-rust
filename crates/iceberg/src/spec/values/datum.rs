@@ -317,8 +317,8 @@ impl Display for Datum {
             ) => {
                 write!(f, "{}", Decimal::from_i128_with_scale(*val, *scale))
             }
-            (_, _) => {
-                unreachable!()
+            (ty, lit) => {
+                write!(f, "<Datum({ty:?}, {lit:?})>")
             }
         }
     }

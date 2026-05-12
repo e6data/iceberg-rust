@@ -111,10 +111,10 @@ impl RewriteManifestsAction {
             }
         }
 
-        // Stream manifests in bounded chunks to avoid loading all entries
-        // into memory at once. Process CHUNK_SIZE manifests at a time:
-        // load their entries, write consolidated output, then drop.
-        const CHUNK_SIZE: usize = 50;
+        // Stream manifests with per-spec buffering. Accumulate entries
+        // by spec_id and flush to S3 when a buffer reaches the target size.
+        // Memory bounded: at most target_entries_per_manifest entries per spec
+        // in flight, plus one manifest's entries being loaded.
 
         let commit_uuid = Uuid::now_v7();
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
@@ -124,75 +124,137 @@ impl RewriteManifestsAction {
         let mut compacted_data_manifests: Vec<ManifestFile> = Vec::new();
         let mut manifest_counter: u64 = 0;
 
-        // Process data manifests in chunks of CHUNK_SIZE
-        for manifest_chunk in data_manifests.chunks(CHUNK_SIZE) {
-            // Load entries from this chunk only, grouped by spec_id
-            let mut entries_by_spec: HashMap<i32, Vec<ManifestEntry>> = HashMap::new();
-            for mf in manifest_chunk {
-                let manifest = mf.load_manifest(table.file_io()).await?;
-                for entry in manifest.entries() {
-                    if entry.is_alive() {
-                        entries_by_spec
-                            .entry(entry.data_file().partition_spec_id)
-                            .or_default()
-                            .push(entry.as_ref().clone());
+        // Per-spec entry buffers — flush when full
+        let mut spec_buffers: HashMap<i32, Vec<ManifestEntry>> = HashMap::new();
+
+        // Helper closure to flush a spec buffer to a manifest file
+        let flush_buffer = |entries: &[ManifestEntry],
+                            spec_id: i32,
+                            counter: &mut u64,
+                            output: &mut Vec<ManifestFile>|
+         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            // Can't use async closure, so we'll flush inline below
+            Box::pin(async { Ok(()) })
+        };
+        let _ = flush_buffer; // suppress unused
+
+        for mf in &data_manifests {
+            let manifest = mf.load_manifest(table.file_io()).await?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    let spec_id = entry.data_file().partition_spec_id;
+                    let buffer = spec_buffers.entry(spec_id).or_default();
+                    buffer.push(entry.as_ref().clone());
+
+                    // Flush when buffer reaches target size
+                    if buffer.len() >= self.target_entries_per_manifest {
+                        let spec = table
+                            .metadata()
+                            .partition_spec_by_id(spec_id)
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!("partition spec {spec_id} not found"),
+                                )
+                            })?;
+
+                        let manifest_path = format!(
+                            "{}/metadata/{}-m{}.{}",
+                            table.metadata().location(),
+                            commit_uuid,
+                            manifest_counter,
+                            DataFileFormat::Avro,
+                        );
+                        manifest_counter += 1;
+
+                        let output_file = table.file_io().new_output(&manifest_path)?;
+                        let builder = ManifestWriterBuilder::new(
+                            output_file,
+                            Some(snapshot_id),
+                            None,
+                            schema.clone(),
+                            spec.as_ref().clone(),
+                        );
+                        let mut writer = match format_version {
+                            FormatVersion::V1 => builder.build_v1(),
+                            FormatVersion::V2 => builder.build_v2_data(),
+                            FormatVersion::V3 => builder.build_v3_data(),
+                        };
+
+                        let to_flush = std::mem::take(buffer);
+                        for e in &to_flush {
+                            let existing = ManifestEntry::builder()
+                                .status(ManifestStatus::Existing)
+                                .snapshot_id(e.snapshot_id().unwrap_or(0))
+                                .sequence_number(e.sequence_number().unwrap_or(0))
+                                .file_sequence_number_opt(e.file_sequence_number)
+                                .data_file(e.data_file().clone())
+                                .build();
+                            writer.add_entry(existing)?;
+                        }
+
+                        let manifest_file = writer.write_manifest_file().await?;
+                        compacted_data_manifests.push(manifest_file);
                     }
                 }
             }
+            // Each manifest's entries are consumed into buffers and the
+            // loaded Manifest is dropped here — bounded memory.
+        }
 
-            // Write consolidated manifests for this chunk
-            for (spec_id, entries) in &entries_by_spec {
-                let spec = table
-                    .metadata()
-                    .partition_spec_by_id(*spec_id)
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("partition spec {spec_id} not found in table metadata"),
-                        )
-                    })?;
-
-                for chunk in entries.chunks(self.target_entries_per_manifest) {
-                    let manifest_path = format!(
-                        "{}/metadata/{}-m{}.{}",
-                        table.metadata().location(),
-                        commit_uuid,
-                        manifest_counter,
-                        DataFileFormat::Avro,
-                    );
-                    manifest_counter += 1;
-
-                    let output_file = table.file_io().new_output(&manifest_path)?;
-                    let builder = ManifestWriterBuilder::new(
-                        output_file,
-                        Some(snapshot_id),
-                        None,
-                        schema.clone(),
-                        spec.as_ref().clone(),
-                    );
-
-                    let mut writer = match format_version {
-                        FormatVersion::V1 => builder.build_v1(),
-                        FormatVersion::V2 => builder.build_v2_data(),
-                        FormatVersion::V3 => builder.build_v3_data(),
-                    };
-
-                    for entry in chunk {
-                        let existing = ManifestEntry::builder()
-                            .status(ManifestStatus::Existing)
-                            .snapshot_id(entry.snapshot_id().unwrap_or(0))
-                            .sequence_number(entry.sequence_number().unwrap_or(0))
-                            .file_sequence_number_opt(entry.file_sequence_number)
-                            .data_file(entry.data_file().clone())
-                            .build();
-                        writer.add_entry(existing)?;
-                    }
-
-                    let manifest_file = writer.write_manifest_file().await?;
-                    compacted_data_manifests.push(manifest_file);
-                }
+        // Flush remaining entries in all spec buffers
+        for (spec_id, entries) in spec_buffers {
+            if entries.is_empty() {
+                continue;
             }
-            // entries_by_spec dropped here — memory freed before loading next chunk
+            let spec = table
+                .metadata()
+                .partition_spec_by_id(spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("partition spec {spec_id} not found"),
+                    )
+                })?;
+
+            for chunk in entries.chunks(self.target_entries_per_manifest) {
+                let manifest_path = format!(
+                    "{}/metadata/{}-m{}.{}",
+                    table.metadata().location(),
+                    commit_uuid,
+                    manifest_counter,
+                    DataFileFormat::Avro,
+                );
+                manifest_counter += 1;
+
+                let output_file = table.file_io().new_output(&manifest_path)?;
+                let builder = ManifestWriterBuilder::new(
+                    output_file,
+                    Some(snapshot_id),
+                    None,
+                    schema.clone(),
+                    spec.as_ref().clone(),
+                );
+                let mut writer = match format_version {
+                    FormatVersion::V1 => builder.build_v1(),
+                    FormatVersion::V2 => builder.build_v2_data(),
+                    FormatVersion::V3 => builder.build_v3_data(),
+                };
+
+                for e in chunk {
+                    let existing = ManifestEntry::builder()
+                        .status(ManifestStatus::Existing)
+                        .snapshot_id(e.snapshot_id().unwrap_or(0))
+                        .sequence_number(e.sequence_number().unwrap_or(0))
+                        .file_sequence_number_opt(e.file_sequence_number)
+                        .data_file(e.data_file().clone())
+                        .build();
+                    writer.add_entry(existing)?;
+                }
+
+                let manifest_file = writer.write_manifest_file().await?;
+                compacted_data_manifests.push(manifest_file);
+            }
         }
 
         // Phase 1 complete — compacted manifests are on S3 and immutable.

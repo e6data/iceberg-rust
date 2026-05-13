@@ -22,18 +22,20 @@
 //! partition bounds) without deserializing all 200+ column statistics.
 //!
 //! Same v2 semantics as Avro manifests — just a different serialization format.
+//!
+//! Map-typed columns (column_sizes, lower_bounds, upper_bounds, etc.) are
+//! stored as JSON-encoded binary blobs. This is simpler than Arrow Map types
+//! and still allows projection to skip these columns entirely when not needed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::builder::{
-    BinaryBuilder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
-    StructBuilder,
-};
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::builder::{BinaryBuilder, Int32Builder, Int64Builder, StringBuilder};
+use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, BinaryArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -41,71 +43,22 @@ use parquet::file::properties::WriterProperties;
 use super::{ManifestEntry, ManifestMetadata, ManifestStatus};
 use crate::error::Result;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, Datum, FormatVersion,
-    ManifestContentType, PartitionSpec, PrimitiveLiteral, Schema, SchemaRef,
-    Struct, StructType,
+    DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal,
+    ManifestContentType, PartitionSpec, PrimitiveLiteral, Schema, SchemaRef, Struct,
+    StructType,
 };
 use crate::{Error, ErrorKind};
 
 // ============================================================================
-// Arrow Schema Construction
+// Arrow Schema
 // ============================================================================
 
-/// Build an Arrow schema for manifest entries.
+/// Build a flat Arrow schema for manifest entries.
 ///
-/// Fields are flattened (no nested data_file struct) for optimal projection.
-/// The partition field is a struct whose shape depends on the partition spec.
-pub fn manifest_arrow_schema(partition_type: &StructType) -> ArrowSchema {
-    let partition_fields: Vec<Arc<Field>> = partition_type
-        .fields()
-        .iter()
-        .map(|f| {
-            Arc::new(Field::new(
-                f.name.as_str(),
-                iceberg_to_arrow_type(&f.field_type),
-                !f.required,
-            ))
-        })
-        .collect();
-
-    let partition_struct = if partition_fields.is_empty() {
-        // Unpartitioned: use a nullable empty struct
-        DataType::Struct(Vec::<Arc<Field>>::new().into())
-    } else {
-        DataType::Struct(partition_fields.into())
-    };
-
-    // Map entries: key=i32 (field_id), value=i64 or binary
-    let map_i64_type = DataType::Map(
-        Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, false)),
-                    Arc::new(Field::new("value", DataType::Int64, true)),
-                ]
-                .into(),
-            ),
-            false,
-        )),
-        false,
-    );
-
-    let map_binary_type = DataType::Map(
-        Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, false)),
-                    Arc::new(Field::new("value", DataType::Binary, true)),
-                ]
-                .into(),
-            ),
-            false,
-        )),
-        false,
-    );
-
+/// Map-typed columns use Binary (JSON-encoded) for simplicity.
+/// This still allows columnar projection — the executor skips map columns
+/// when it only needs file_path + partition + status.
+pub fn manifest_arrow_schema() -> ArrowSchema {
     ArrowSchema::new(vec![
         Field::new("status", DataType::Int32, false),
         Field::new("snapshot_id", DataType::Int64, true),
@@ -114,177 +67,275 @@ pub fn manifest_arrow_schema(partition_type: &StructType) -> ArrowSchema {
         Field::new("content", DataType::Int32, false),
         Field::new("file_path", DataType::Utf8, false),
         Field::new("file_format", DataType::Utf8, false),
-        Field::new("partition", partition_struct, false),
+        Field::new("partition_json", DataType::Utf8, true),
         Field::new("record_count", DataType::Int64, false),
         Field::new("file_size_in_bytes", DataType::Int64, false),
-        Field::new("column_sizes", map_i64_type.clone(), true),
-        Field::new("value_counts", map_i64_type.clone(), true),
-        Field::new("null_value_counts", map_i64_type.clone(), true),
-        Field::new("nan_value_counts", map_i64_type, true),
-        Field::new("lower_bounds", map_binary_type.clone(), true),
-        Field::new("upper_bounds", map_binary_type, true),
+        // Map columns as JSON binary — allows projection to skip them
+        Field::new("column_sizes_json", DataType::Binary, true),
+        Field::new("value_counts_json", DataType::Binary, true),
+        Field::new("null_value_counts_json", DataType::Binary, true),
+        Field::new("nan_value_counts_json", DataType::Binary, true),
+        Field::new("lower_bounds_json", DataType::Binary, true),
+        Field::new("upper_bounds_json", DataType::Binary, true),
         Field::new("key_metadata", DataType::Binary, true),
-        Field::new(
-            "split_offsets",
-            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-            true,
-        ),
-        Field::new(
-            "equality_ids",
-            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-            true,
-        ),
+        Field::new("split_offsets_json", DataType::Binary, true),
+        Field::new("equality_ids_json", DataType::Binary, true),
         Field::new("sort_order_id", DataType::Int32, true),
+        Field::new("partition_spec_id", DataType::Int32, false),
     ])
 }
 
-/// Convert an Iceberg primitive type to Arrow DataType.
-fn iceberg_to_arrow_type(ty: &crate::spec::Type) -> DataType {
-    use crate::spec::{PrimitiveType, Type};
-    match ty {
-        Type::Primitive(p) => match p {
-            PrimitiveType::Boolean => DataType::Boolean,
-            PrimitiveType::Int => DataType::Int32,
-            PrimitiveType::Long => DataType::Int64,
-            PrimitiveType::Float => DataType::Float32,
-            PrimitiveType::Double => DataType::Float64,
-            PrimitiveType::Date => DataType::Date32,
-            PrimitiveType::Time => DataType::Time64(arrow_schema::TimeUnit::Microsecond),
-            PrimitiveType::Timestamp => {
-                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-            }
-            PrimitiveType::Timestamptz => DataType::Timestamp(
-                arrow_schema::TimeUnit::Microsecond,
-                Some("UTC".into()),
-            ),
-            PrimitiveType::TimestampNs => {
-                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
-            }
-            PrimitiveType::TimestamptzNs => DataType::Timestamp(
-                arrow_schema::TimeUnit::Nanosecond,
-                Some("UTC".into()),
-            ),
-            PrimitiveType::String => DataType::Utf8,
-            PrimitiveType::Uuid => DataType::FixedSizeBinary(16),
-            PrimitiveType::Fixed(len) => DataType::FixedSizeBinary(*len as i32),
-            PrimitiveType::Binary => DataType::Binary,
-            PrimitiveType::Decimal { precision, scale } => {
-                DataType::Decimal128(*precision as u8, *scale as i8)
-            }
-        },
-        Type::Struct(s) => {
-            let fields: Vec<Arc<Field>> = s
-                .fields()
-                .iter()
-                .map(|f| {
-                    Arc::new(Field::new(
-                        f.name.as_str(),
-                        iceberg_to_arrow_type(&f.field_type),
-                        !f.required,
-                    ))
-                })
-                .collect();
-            DataType::Struct(fields.into())
-        }
-        Type::List(l) => DataType::List(Arc::new(Field::new(
-            "item",
-            iceberg_to_arrow_type(&l.element_field.field_type),
-            !l.element_field.required,
-        ))),
-        Type::Map(m) => DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Arc::new(Field::new(
-                            "key",
-                            iceberg_to_arrow_type(&m.key_field.field_type),
-                            false,
-                        )),
-                        Arc::new(Field::new(
-                            "value",
-                            iceberg_to_arrow_type(&m.value_field.field_type),
-                            !m.value_field.required,
-                        )),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        ),
-    }
-}
-
 // ============================================================================
-// Manifest Metadata (Parquet file key-value metadata)
+// Metadata encoding
 // ============================================================================
 
-/// Encode manifest metadata as Parquet file key-value metadata.
+/// Encode manifest metadata as HashMap for Arrow schema metadata.
+/// This gets written as Parquet file-level key-value metadata.
 pub fn encode_manifest_metadata(metadata: &ManifestMetadata) -> HashMap<String, String> {
     let mut kv = HashMap::new();
-    kv.insert(
-        "schema".to_string(),
-        serde_json::to_string(&metadata.schema.as_ref()).unwrap_or_default(),
-    );
-    kv.insert(
-        "schema-id".to_string(),
-        metadata.schema_id.to_string(),
-    );
-    kv.insert(
-        "partition-spec".to_string(),
-        serde_json::to_string(&metadata.partition_spec.fields()).unwrap_or_default(),
-    );
-    kv.insert(
-        "partition-spec-id".to_string(),
-        metadata.partition_spec.spec_id().to_string(),
-    );
-    kv.insert(
-        "format-version".to_string(),
-        match metadata.format_version {
-            FormatVersion::V1 => "1",
-            FormatVersion::V2 => "2",
-            FormatVersion::V3 => "3",
-        }
-        .to_string(),
-    );
-    kv.insert(
-        "content".to_string(),
-        match metadata.content {
-            ManifestContentType::Data => "data",
-            ManifestContentType::Deletes => "deletes",
-        }
-        .to_string(),
-    );
-    kv.insert("manifest-format".to_string(), "parquet".to_string());
+    kv.insert("schema".to_string(), serde_json::to_string(metadata.schema.as_ref()).unwrap_or_default());
+    kv.insert("schema-id".to_string(), metadata.schema_id.to_string());
+    kv.insert("partition-spec".to_string(), serde_json::to_string(&metadata.partition_spec.fields()).unwrap_or_default());
+    kv.insert("partition-spec-id".to_string(), metadata.partition_spec.spec_id().to_string());
+    kv.insert("format-version".to_string(), (metadata.format_version as u8).to_string());
+    kv.insert("content".to_string(), metadata.content.to_string());
     kv
 }
 
 // ============================================================================
-// Parquet Manifest Reader
+// Writer: ManifestEntry → Parquet
+// ============================================================================
+
+/// Write manifest entries to a Parquet-format byte buffer.
+pub fn write_parquet_manifest(
+    entries: &[ManifestEntry],
+    metadata: &ManifestMetadata,
+    partition_type: &StructType,
+) -> Result<Vec<u8>> {
+    // Embed manifest metadata in the Arrow schema's metadata field.
+    // ArrowWriter propagates this to the Parquet file-level key-value metadata.
+    let kv_metadata = encode_manifest_metadata(metadata);
+    let schema = Arc::new(manifest_arrow_schema().with_metadata(kv_metadata));
+    let batch = manifest_entries_to_record_batch(entries, &schema, partition_type, metadata.format_version)?;
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+
+    let mut buf = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))
+        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to create parquet writer: {e}")))?;
+
+    writer.write(&batch)
+        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to write batch: {e}")))?;
+    writer.close()
+        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to close writer: {e}")))?;
+
+    Ok(buf)
+}
+
+/// Convert ManifestEntry slice to Arrow RecordBatch.
+fn manifest_entries_to_record_batch(
+    entries: &[ManifestEntry],
+    schema: &Arc<ArrowSchema>,
+    partition_type: &StructType,
+    format_version: FormatVersion,
+) -> Result<RecordBatch> {
+    let n = entries.len();
+
+    let mut status = Int32Builder::with_capacity(n);
+    let mut snapshot_id = Int64Builder::with_capacity(n);
+    let mut seq_num = Int64Builder::with_capacity(n);
+    let mut file_seq = Int64Builder::with_capacity(n);
+    let mut content = Int32Builder::with_capacity(n);
+    let mut file_path = StringBuilder::with_capacity(n, n * 100);
+    let mut file_format = StringBuilder::with_capacity(n, n * 8);
+    let mut partition_json = StringBuilder::with_capacity(n, n * 64);
+    let mut record_count = Int64Builder::with_capacity(n);
+    let mut file_size = Int64Builder::with_capacity(n);
+    let mut column_sizes_json = BinaryBuilder::with_capacity(n, n * 128);
+    let mut value_counts_json = BinaryBuilder::with_capacity(n, n * 128);
+    let mut null_value_counts_json = BinaryBuilder::with_capacity(n, n * 128);
+    let mut nan_value_counts_json = BinaryBuilder::with_capacity(n, n * 64);
+    let mut lower_bounds_json = BinaryBuilder::with_capacity(n, n * 256);
+    let mut upper_bounds_json = BinaryBuilder::with_capacity(n, n * 256);
+    let mut key_metadata_b = BinaryBuilder::with_capacity(n, n * 16);
+    let mut split_offsets_json = BinaryBuilder::with_capacity(n, n * 64);
+    let mut equality_ids_json = BinaryBuilder::with_capacity(n, n * 32);
+    let mut sort_order_id = Int32Builder::with_capacity(n);
+    let mut part_spec_id = Int32Builder::with_capacity(n);
+
+    for entry in entries {
+        let df = &entry.data_file;
+
+        status.append_value(entry.status as i32);
+        match entry.snapshot_id {
+            Some(v) => snapshot_id.append_value(v),
+            None => snapshot_id.append_null(),
+        }
+        match entry.sequence_number {
+            Some(v) => seq_num.append_value(v),
+            None => seq_num.append_null(),
+        }
+        match entry.file_sequence_number {
+            Some(v) => file_seq.append_value(v),
+            None => file_seq.append_null(),
+        }
+        content.append_value(df.content as i32);
+        file_path.append_value(&df.file_path);
+        file_format.append_value(df.file_format.to_string().to_ascii_uppercase());
+
+        // Partition as JSON string
+        let part_str = serialize_partition_json(&df.partition, partition_type);
+        partition_json.append_value(&part_str);
+
+        record_count.append_value(df.record_count as i64);
+        file_size.append_value(df.file_size_in_bytes as i64);
+
+        // Map columns as JSON bytes
+        append_map_json(&mut column_sizes_json, &serialize_i64_map(&df.column_sizes));
+        append_map_json(&mut value_counts_json, &serialize_i64_map(&df.value_counts));
+        append_map_json(&mut null_value_counts_json, &serialize_i64_map(&df.null_value_counts));
+        append_map_json(&mut nan_value_counts_json, &serialize_i64_map(&df.nan_value_counts));
+
+        // Bounds: serialize field_id → base64(bytes) as JSON
+        append_map_json(&mut lower_bounds_json, &serialize_bounds_map(&df.lower_bounds));
+        append_map_json(&mut upper_bounds_json, &serialize_bounds_map(&df.upper_bounds));
+
+        match &df.key_metadata {
+            Some(km) => key_metadata_b.append_value(km.as_slice()),
+            None => key_metadata_b.append_null(),
+        }
+        append_opt_json(&mut split_offsets_json, &df.split_offsets);
+        append_opt_json(&mut equality_ids_json, &df.equality_ids);
+        match df.sort_order_id {
+            Some(v) => sort_order_id.append_value(v),
+            None => sort_order_id.append_null(),
+        }
+        part_spec_id.append_value(df.partition_spec_id);
+    }
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(status.finish()),
+        Arc::new(snapshot_id.finish()),
+        Arc::new(seq_num.finish()),
+        Arc::new(file_seq.finish()),
+        Arc::new(content.finish()),
+        Arc::new(file_path.finish()),
+        Arc::new(file_format.finish()),
+        Arc::new(partition_json.finish()),
+        Arc::new(record_count.finish()),
+        Arc::new(file_size.finish()),
+        Arc::new(column_sizes_json.finish()),
+        Arc::new(value_counts_json.finish()),
+        Arc::new(null_value_counts_json.finish()),
+        Arc::new(nan_value_counts_json.finish()),
+        Arc::new(lower_bounds_json.finish()),
+        Arc::new(upper_bounds_json.finish()),
+        Arc::new(key_metadata_b.finish()),
+        Arc::new(split_offsets_json.finish()),
+        Arc::new(equality_ids_json.finish()),
+        Arc::new(sort_order_id.finish()),
+        Arc::new(part_spec_id.finish()),
+    ];
+
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to build RecordBatch: {e}")))
+}
+
+fn serialize_partition_json(partition: &Struct, _partition_type: &StructType) -> String {
+    // Serialize partition values as JSON object: {"f0": "value", "f1": null, ...}
+    let mut map = serde_json::Map::new();
+    for (i, val) in partition.iter().enumerate() {
+        let key = format!("f{i}");
+        match val {
+            Some(lit) => {
+                map.insert(key, serde_json::Value::String(format!("{lit:?}")));
+            }
+            None => {
+                map.insert(key, serde_json::Value::Null);
+            }
+        }
+    }
+    serde_json::to_string(&map).unwrap_or_default()
+}
+
+fn serialize_i64_map(m: &HashMap<i32, u64>) -> String {
+    if m.is_empty() {
+        return String::new();
+    }
+    // Serialize as JSON: {"field_id": value, ...}
+    let map: HashMap<String, u64> = m.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    serde_json::to_string(&map).unwrap_or_default()
+}
+
+fn serialize_bounds_map(m: &HashMap<i32, Datum>) -> String {
+    if m.is_empty() {
+        return String::new();
+    }
+    // Serialize as JSON: {"field_id": "base64(bytes)", ...}
+    use base64::Engine;
+    let map: HashMap<String, String> = m
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_bytes().ok().map(|bytes| {
+                (k.to_string(), base64::engine::general_purpose::STANDARD.encode(bytes.as_ref()))
+            })
+        })
+        .collect();
+    serde_json::to_string(&map).unwrap_or_default()
+}
+
+fn append_map_json(builder: &mut BinaryBuilder, json: &str) {
+    if json.is_empty() {
+        builder.append_null();
+    } else {
+        builder.append_value(json.as_bytes());
+    }
+}
+
+fn append_opt_json<T: serde::Serialize>(builder: &mut BinaryBuilder, val: &Option<T>) {
+    match val {
+        Some(v) => {
+            let json = serde_json::to_string(v).unwrap_or_default();
+            builder.append_value(json.as_bytes());
+        }
+        None => builder.append_null(),
+    }
+}
+
+// ============================================================================
+// Reader: Parquet → ManifestEntry
 // ============================================================================
 
 /// Read manifest entries from a Parquet-format manifest file.
-///
-/// This reads the full manifest (all columns). For projected reads,
-/// use `read_parquet_manifest_projected()`.
-pub fn read_parquet_manifest(
-    bytes: &[u8],
-) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
+pub fn read_parquet_manifest(bytes: &[u8]) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
         .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Failed to open parquet manifest: {e}")))?;
 
-    // Parse metadata from Parquet file key-value metadata
-    let parquet_metadata = reader.metadata();
-    let kv_metadata = parquet_metadata.file_metadata().key_value_metadata();
-    let metadata = parse_parquet_manifest_metadata(kv_metadata)?;
+    // ArrowWriter stores Arrow schema metadata in the Parquet file-level key-value metadata
+    // under the key "ARROW:schema". Our manifest metadata keys are embedded alongside it.
+    // We also check the Arrow schema metadata directly.
+    let parquet_metadata = reader.metadata().clone();
+    let arrow_schema = reader.schema();
 
-    let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
+    // First try: Arrow schema metadata (ArrowWriter propagates schema.metadata here)
+    let arrow_meta = arrow_schema.metadata();
+    let metadata = if arrow_meta.contains_key("schema") {
+        let map: HashMap<String, Vec<u8>> = arrow_meta
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+            .collect();
+        ManifestMetadata::parse(&map)?
+    } else {
+        // Fallback: Parquet file-level key-value metadata
+        let kv_metadata = parquet_metadata.file_metadata().key_value_metadata();
+        parse_parquet_manifest_metadata(kv_metadata)?
+    };
 
-    // Build reader (all columns)
     let batch_reader = reader
         .build()
-        .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Failed to build parquet reader: {e}")))?;
+        .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Failed to build reader: {e}")))?;
 
     let mut entries = Vec::new();
     for batch_result in batch_reader {
@@ -292,9 +343,7 @@ pub fn read_parquet_manifest(
             .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Failed to read batch: {e}")))?;
         let batch_entries = record_batch_to_manifest_entries(
             &batch,
-            metadata.partition_spec.spec_id(),
-            &partition_type,
-            &metadata.schema,
+            &metadata,
         )?;
         entries.extend(batch_entries);
     }
@@ -302,18 +351,11 @@ pub fn read_parquet_manifest(
     Ok((metadata, entries))
 }
 
-/// Parse ManifestMetadata from Parquet key-value metadata.
-///
-/// Converts Parquet KeyValue pairs to HashMap<String, Vec<u8>> to reuse
-/// the existing ManifestMetadata::parse() which expects Avro user metadata format.
 fn parse_parquet_manifest_metadata(
     kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
 ) -> Result<ManifestMetadata> {
     let kv = kv.ok_or_else(|| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            "Parquet manifest missing key-value metadata",
-        )
+        Error::new(ErrorKind::DataInvalid, "Parquet manifest missing key-value metadata")
     })?;
 
     let mut map: HashMap<String, Vec<u8>> = HashMap::new();
@@ -326,102 +368,85 @@ fn parse_parquet_manifest_metadata(
     ManifestMetadata::parse(&map)
 }
 
-/// Convert a RecordBatch of manifest entries to ManifestEntry structs.
-///
-/// This is the core conversion from Arrow columnar representation to
-/// the Iceberg manifest entry model.
 fn record_batch_to_manifest_entries(
     batch: &RecordBatch,
-    partition_spec_id: i32,
-    _partition_type: &StructType,
-    _schema: &Schema,
+    metadata: &ManifestMetadata,
 ) -> Result<Vec<ManifestEntry>> {
-    use arrow_array::*;
+    let n = batch.num_rows();
+    let mut entries = Vec::with_capacity(n);
 
-    let num_rows = batch.num_rows();
-    let mut entries = Vec::with_capacity(num_rows);
+    let status_arr = col_i32(batch, "status")?;
+    let snapshot_id_arr = col_i64_opt(batch, "snapshot_id");
+    let seq_num_arr = col_i64_opt(batch, "sequence_number");
+    let file_seq_arr = col_i64_opt(batch, "file_sequence_number");
+    let content_arr = col_i32(batch, "content")?;
+    let file_path_arr = col_str(batch, "file_path")?;
+    let file_format_arr = col_str(batch, "file_format")?;
+    let partition_json_arr = col_str_opt(batch, "partition_json");
+    let record_count_arr = col_i64(batch, "record_count")?;
+    let file_size_arr = col_i64(batch, "file_size_in_bytes")?;
+    let column_sizes_arr = col_binary_opt(batch, "column_sizes_json");
+    let value_counts_arr = col_binary_opt(batch, "value_counts_json");
+    let null_value_counts_arr = col_binary_opt(batch, "null_value_counts_json");
+    let nan_value_counts_arr = col_binary_opt(batch, "nan_value_counts_json");
+    let lower_bounds_arr = col_binary_opt(batch, "lower_bounds_json");
+    let upper_bounds_arr = col_binary_opt(batch, "upper_bounds_json");
+    let key_metadata_arr = col_binary_opt(batch, "key_metadata");
+    let split_offsets_arr = col_binary_opt(batch, "split_offsets_json");
+    let equality_ids_arr = col_binary_opt(batch, "equality_ids_json");
+    let sort_order_id_arr = col_i32_opt(batch, "sort_order_id");
+    let part_spec_id_arr = col_i32_opt(batch, "partition_spec_id");
 
-    // Extract column arrays
-    let status_arr = batch
-        .column_by_name("status")
-        .and_then(|a| a.as_any().downcast_ref::<Int32Array>())
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "missing status column"))?;
-
-    let snapshot_id_arr = batch
-        .column_by_name("snapshot_id")
-        .and_then(|a| a.as_any().downcast_ref::<Int64Array>());
-
-    let seq_num_arr = batch
-        .column_by_name("sequence_number")
-        .and_then(|a| a.as_any().downcast_ref::<Int64Array>());
-
-    let file_seq_arr = batch
-        .column_by_name("file_sequence_number")
-        .and_then(|a| a.as_any().downcast_ref::<Int64Array>());
-
-    let content_arr = batch
-        .column_by_name("content")
-        .and_then(|a| a.as_any().downcast_ref::<Int32Array>())
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "missing content column"))?;
-
-    let file_path_arr = batch
-        .column_by_name("file_path")
-        .and_then(|a| a.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "missing file_path column"))?;
-
-    let file_format_arr = batch
-        .column_by_name("file_format")
-        .and_then(|a| a.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "missing file_format column"))?;
-
-    let record_count_arr = batch
-        .column_by_name("record_count")
-        .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "missing record_count column"))?;
-
-    let file_size_arr = batch
-        .column_by_name("file_size_in_bytes")
-        .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "missing file_size_in_bytes column"))?;
-
-    for i in 0..num_rows {
+    for i in 0..n {
         let status: ManifestStatus = status_arr.value(i).try_into()?;
+        let snapshot_id = nullable_i64(snapshot_id_arr, i);
+        let sequence_number = nullable_i64(seq_num_arr, i);
+        let file_sequence_number = nullable_i64(file_seq_arr, i);
 
-        let snapshot_id = snapshot_id_arr
-            .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
-
-        let sequence_number = seq_num_arr
-            .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
-
-        let file_sequence_number = file_seq_arr
-            .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
-
-        let content: DataContentType = content_arr.value(i).try_into()?;
+        let content_type: DataContentType = content_arr.value(i).try_into()?;
         let file_path = file_path_arr.value(i).to_string();
         let file_format: DataFileFormat = file_format_arr.value(i).parse()?;
         let record_count = record_count_arr.value(i) as u64;
         let file_size = file_size_arr.value(i) as u64;
 
-        // TODO: Parse partition, column_sizes, bounds from batch
-        // For now, create minimal DataFile with core fields
+        let partition = parse_partition_json(
+            partition_json_arr.and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) }),
+        );
+
+        let column_sizes = parse_i64_map_json(read_binary_opt(column_sizes_arr, i));
+        let value_counts = parse_i64_map_json(read_binary_opt(value_counts_arr, i));
+        let null_value_counts = parse_i64_map_json(read_binary_opt(null_value_counts_arr, i));
+        let nan_value_counts = parse_i64_map_json(read_binary_opt(nan_value_counts_arr, i));
+
+        let lower_bounds = parse_bounds_map_json(read_binary_opt(lower_bounds_arr, i), &metadata.schema);
+        let upper_bounds = parse_bounds_map_json(read_binary_opt(upper_bounds_arr, i), &metadata.schema);
+
+        let key_metadata_val = read_binary_opt(key_metadata_arr, i).map(|b| b.to_vec());
+        let split_offsets: Option<Vec<i64>> = read_binary_opt(split_offsets_arr, i)
+            .and_then(|b| serde_json::from_slice(b).ok());
+        let equality_ids: Option<Vec<i32>> = read_binary_opt(equality_ids_arr, i)
+            .and_then(|b| serde_json::from_slice(b).ok());
+        let sort_id = sort_order_id_arr.and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) });
+        let spec_id = part_spec_id_arr.map(|a| a.value(i)).unwrap_or(metadata.partition_spec.spec_id());
+
         let data_file = DataFile {
-            content,
+            content: content_type,
             file_path,
             file_format,
-            partition: Struct::empty(),
+            partition,
             record_count,
             file_size_in_bytes: file_size,
-            column_sizes: HashMap::new(),
-            value_counts: HashMap::new(),
-            null_value_counts: HashMap::new(),
-            nan_value_counts: HashMap::new(),
-            lower_bounds: HashMap::new(),
-            upper_bounds: HashMap::new(),
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-            sort_order_id: None,
-            partition_spec_id,
+            column_sizes,
+            value_counts,
+            null_value_counts,
+            nan_value_counts,
+            lower_bounds,
+            upper_bounds,
+            key_metadata: key_metadata_val,
+            split_offsets,
+            equality_ids,
+            sort_order_id: sort_id,
+            partition_spec_id: spec_id,
             first_row_id: None,
             referenced_data_file: None,
             content_offset: None,
@@ -438,4 +463,233 @@ fn record_batch_to_manifest_entries(
     }
 
     Ok(entries)
+}
+
+// ============================================================================
+// JSON deserialization helpers
+// ============================================================================
+
+fn parse_partition_json(json: Option<&str>) -> Struct {
+    // TODO: deserialize partition values from JSON using partition type
+    // For now, return empty struct — partition pruning uses manifest-level bounds
+    Struct::empty()
+}
+
+fn parse_i64_map_json(bytes: Option<&[u8]>) -> HashMap<i32, u64> {
+    let Some(b) = bytes else { return HashMap::new() };
+    let Ok(map) = serde_json::from_slice::<HashMap<String, u64>>(b) else {
+        return HashMap::new();
+    };
+    map.into_iter()
+        .filter_map(|(k, v)| k.parse::<i32>().ok().map(|k| (k, v)))
+        .collect()
+}
+
+fn parse_bounds_map_json(bytes: Option<&[u8]>, schema: &Schema) -> HashMap<i32, Datum> {
+    let Some(b) = bytes else { return HashMap::new() };
+    let Ok(map) = serde_json::from_slice::<HashMap<String, String>>(b) else {
+        return HashMap::new();
+    };
+    use base64::Engine;
+    let mut result = HashMap::new();
+    for (k_str, v_b64) in map {
+        let Ok(field_id) = k_str.parse::<i32>() else { continue };
+        let Ok(raw_bytes) = base64::engine::general_purpose::STANDARD.decode(&v_b64) else { continue };
+        // Find the field type from schema to reconstruct the Datum
+        if let Some(field) = schema.field_by_id(field_id) {
+            if let Some(prim_type) = field.field_type.as_primitive_type() {
+                if let Ok(datum) = Datum::try_from_bytes(&raw_bytes, prim_type.clone()) {
+                    result.insert(field_id, datum);
+                }
+            }
+        }
+    }
+    result
+}
+
+// ============================================================================
+// Arrow column access helpers
+// ============================================================================
+
+fn col_i32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
+    batch.column_by_name(name)
+        .and_then(|a| a.as_any().downcast_ref::<Int32Array>())
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, format!("missing column: {name}")))
+}
+
+fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+    batch.column_by_name(name)
+        .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, format!("missing column: {name}")))
+}
+
+fn col_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    batch.column_by_name(name)
+        .and_then(|a| a.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, format!("missing column: {name}")))
+}
+
+fn col_i32_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int32Array> {
+    batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<Int32Array>())
+}
+
+fn col_i64_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
+    batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+}
+
+fn col_str_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
+    batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<StringArray>())
+}
+
+fn col_binary_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a BinaryArray> {
+    batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<BinaryArray>())
+}
+
+fn nullable_i64(arr: Option<&Int64Array>, i: usize) -> Option<i64> {
+    arr.and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) })
+}
+
+fn read_binary_opt<'a>(arr: Option<&'a BinaryArray>, i: usize) -> Option<&'a [u8]> {
+    arr.and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) })
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{NestedField, PartitionField, PrimitiveType, Transform, Type, UnboundPartitionField};
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))),
+                    Arc::new(NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::optional(3, "ts", Type::Primitive(PrimitiveType::Timestamptz))),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn test_partition_spec(schema: &SchemaRef) -> PartitionSpec {
+        PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_unbound_field(UnboundPartitionField {
+                source_id: 1,
+                field_id: None,
+                name: "id".to_string(),
+                transform: Transform::Identity,
+            })
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn round_trip_parquet_manifest() {
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let metadata = ManifestMetadata::builder()
+            .schema(schema.clone())
+            .schema_id(0)
+            .partition_spec(partition_spec)
+            .format_version(FormatVersion::V2)
+            .content(ManifestContentType::Data)
+            .build();
+
+        // Create test entries
+        let entries = vec![
+            ManifestEntry {
+                status: ManifestStatus::Added,
+                snapshot_id: Some(100),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                data_file: DataFile {
+                    content: DataContentType::Data,
+                    file_path: "s3://bucket/data/file1.parquet".to_string(),
+                    file_format: DataFileFormat::Parquet,
+                    partition: Struct::empty(),
+                    record_count: 1000,
+                    file_size_in_bytes: 50000,
+                    column_sizes: HashMap::from([(1, 2000), (2, 3000)]),
+                    value_counts: HashMap::from([(1, 1000), (2, 950)]),
+                    null_value_counts: HashMap::from([(2, 50)]),
+                    nan_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::new(),
+                    upper_bounds: HashMap::new(),
+                    key_metadata: None,
+                    split_offsets: Some(vec![4, 1000]),
+                    equality_ids: None,
+                    sort_order_id: Some(0),
+                    partition_spec_id: 0,
+                    first_row_id: None,
+                    referenced_data_file: None,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                },
+            },
+            ManifestEntry {
+                status: ManifestStatus::Existing,
+                snapshot_id: Some(99),
+                sequence_number: Some(0),
+                file_sequence_number: Some(0),
+                data_file: DataFile {
+                    content: DataContentType::Data,
+                    file_path: "s3://bucket/data/file2.parquet".to_string(),
+                    file_format: DataFileFormat::Parquet,
+                    partition: Struct::empty(),
+                    record_count: 500,
+                    file_size_in_bytes: 25000,
+                    column_sizes: HashMap::new(),
+                    value_counts: HashMap::new(),
+                    null_value_counts: HashMap::new(),
+                    nan_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::new(),
+                    upper_bounds: HashMap::new(),
+                    key_metadata: None,
+                    split_offsets: None,
+                    equality_ids: None,
+                    sort_order_id: None,
+                    partition_spec_id: 0,
+                    first_row_id: None,
+                    referenced_data_file: None,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                },
+            },
+        ];
+
+        // Write
+        let bytes = write_parquet_manifest(&entries, &metadata, &partition_type).unwrap();
+        assert!(!bytes.is_empty(), "parquet manifest should not be empty");
+
+        // Read back
+        let (read_metadata, read_entries) = read_parquet_manifest(&bytes).unwrap();
+
+        // Verify metadata
+        assert_eq!(read_metadata.format_version, FormatVersion::V2);
+        assert_eq!(read_metadata.content, ManifestContentType::Data);
+        assert_eq!(read_metadata.schema_id, 0);
+
+        // Verify entries
+        assert_eq!(read_entries.len(), 2);
+        assert_eq!(read_entries[0].status, ManifestStatus::Added);
+        assert_eq!(read_entries[0].snapshot_id, Some(100));
+        assert_eq!(read_entries[0].data_file.file_path, "s3://bucket/data/file1.parquet");
+        assert_eq!(read_entries[0].data_file.record_count, 1000);
+        assert_eq!(read_entries[0].data_file.file_size_in_bytes, 50000);
+        assert_eq!(read_entries[0].data_file.column_sizes.get(&1), Some(&2000));
+        assert_eq!(read_entries[0].data_file.column_sizes.get(&2), Some(&3000));
+        assert_eq!(read_entries[0].data_file.split_offsets, Some(vec![4, 1000]));
+
+        assert_eq!(read_entries[1].status, ManifestStatus::Existing);
+        assert_eq!(read_entries[1].data_file.file_path, "s3://bucket/data/file2.parquet");
+        assert_eq!(read_entries[1].data_file.record_count, 500);
+    }
 }

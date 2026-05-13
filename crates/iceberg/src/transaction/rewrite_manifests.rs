@@ -119,6 +119,12 @@ impl RewriteManifestsAction {
         let commit_uuid = Uuid::now_v7();
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
         let format_version = table.metadata().format_version();
+        let use_parquet_manifests = table
+            .metadata()
+            .properties()
+            .get("write.metadata.codec")
+            .map(|v| v.eq_ignore_ascii_case("parquet"))
+            .unwrap_or(false);
         let schema = table.metadata().current_schema().clone();
 
         let mut compacted_data_manifests: Vec<ManifestFile> = Vec::new();
@@ -158,8 +164,7 @@ impl RewriteManifestsAction {
                                 )
                             })?;
 
-                        let use_parquet = matches!(format_version, FormatVersion::V2 | FormatVersion::V3);
-                        let ext = if use_parquet { "parquet" } else { "avro" };
+                        let ext = if use_parquet_manifests { "parquet" } else { "avro" };
                         let manifest_path = format!(
                             "{}/metadata/{}-m{}.{}",
                             table.metadata().location(),
@@ -195,7 +200,7 @@ impl RewriteManifestsAction {
                             writer.add_entry(existing)?;
                         }
 
-                        let manifest_file = if use_parquet {
+                        let manifest_file = if use_parquet_manifests {
                             writer.write_manifest_file_parquet().await?
                         } else {
                             writer.write_manifest_file().await?
@@ -223,8 +228,7 @@ impl RewriteManifestsAction {
                     )
                 })?;
 
-            let use_parquet_m = matches!(format_version, FormatVersion::V2 | FormatVersion::V3);
-            let ext_m = if use_parquet_m { "parquet" } else { "avro" };
+            let ext_m = if use_parquet_manifests { "parquet" } else { "avro" };
             for chunk in entries.chunks(self.target_entries_per_manifest) {
                 let manifest_path = format!(
                     "{}/metadata/{}-m{}.{}",
@@ -472,6 +476,12 @@ impl TransactionAction for RewriteManifestsAction {
         let commit_uuid = Uuid::now_v7();
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
         let format_version = table.metadata().format_version();
+        let use_parquet_manifests = table
+            .metadata()
+            .properties()
+            .get("write.metadata.codec")
+            .map(|v| v.eq_ignore_ascii_case("parquet"))
+            .unwrap_or(false);
         let schema = table.metadata().current_schema().clone();
 
         let mut new_data_manifests: Vec<ManifestFile> = Vec::new();
@@ -488,8 +498,7 @@ impl TransactionAction for RewriteManifestsAction {
                     )
                 })?;
 
-            let use_parquet_m = matches!(format_version, FormatVersion::V2 | FormatVersion::V3);
-            let ext_m = if use_parquet_m { "parquet" } else { "avro" };
+            let ext_m = if use_parquet_manifests { "parquet" } else { "avro" };
             for chunk in entries.chunks(self.target_entries_per_manifest) {
                 let manifest_path = format!(
                     "{}/metadata/{}-m{}.{}",

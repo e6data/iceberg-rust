@@ -261,12 +261,17 @@ impl<'a> SnapshotProducer<'a> {
         self.snapshot_id
     }
 
-    /// Whether this table should use Parquet manifests (V2+) or Avro (V1).
+    /// Whether this table should use Parquet manifests.
+    ///
+    /// Opt-in via table property `write.metadata.codec = "parquet"`.
+    /// Avro remains the default for ecosystem compatibility (Spark, Trino, Flink).
     fn use_parquet_manifests(&self) -> bool {
-        matches!(
-            self.table.metadata().format_version(),
-            FormatVersion::V2 | FormatVersion::V3
-        )
+        self.table
+            .metadata()
+            .properties()
+            .get("write.metadata.codec")
+            .map(|v| v.eq_ignore_ascii_case("parquet"))
+            .unwrap_or(false)
     }
 
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {

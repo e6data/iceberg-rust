@@ -158,12 +158,14 @@ impl RewriteManifestsAction {
                                 )
                             })?;
 
+                        let use_parquet = matches!(format_version, FormatVersion::V2 | FormatVersion::V3);
+                        let ext = if use_parquet { "parquet" } else { "avro" };
                         let manifest_path = format!(
                             "{}/metadata/{}-m{}.{}",
                             table.metadata().location(),
                             commit_uuid,
                             manifest_counter,
-                            DataFileFormat::Avro,
+                            ext,
                         );
                         manifest_counter += 1;
 
@@ -193,7 +195,11 @@ impl RewriteManifestsAction {
                             writer.add_entry(existing)?;
                         }
 
-                        let manifest_file = writer.write_manifest_file().await?;
+                        let manifest_file = if use_parquet {
+                            writer.write_manifest_file_parquet().await?
+                        } else {
+                            writer.write_manifest_file().await?
+                        };
                         compacted_data_manifests.push(manifest_file);
                     }
                 }
@@ -217,13 +223,15 @@ impl RewriteManifestsAction {
                     )
                 })?;
 
+            let use_parquet_m = matches!(format_version, FormatVersion::V2 | FormatVersion::V3);
+            let ext_m = if use_parquet_m { "parquet" } else { "avro" };
             for chunk in entries.chunks(self.target_entries_per_manifest) {
                 let manifest_path = format!(
                     "{}/metadata/{}-m{}.{}",
                     table.metadata().location(),
                     commit_uuid,
                     manifest_counter,
-                    DataFileFormat::Avro,
+                    ext_m,
                 );
                 manifest_counter += 1;
 
@@ -480,13 +488,15 @@ impl TransactionAction for RewriteManifestsAction {
                     )
                 })?;
 
+            let use_parquet_m = matches!(format_version, FormatVersion::V2 | FormatVersion::V3);
+            let ext_m = if use_parquet_m { "parquet" } else { "avro" };
             for chunk in entries.chunks(self.target_entries_per_manifest) {
                 let manifest_path = format!(
                     "{}/metadata/{}-m{}.{}",
                     table.metadata().location(),
                     commit_uuid,
                     manifest_counter,
-                    DataFileFormat::Avro,
+                    ext_m,
                 );
                 manifest_counter += 1;
 

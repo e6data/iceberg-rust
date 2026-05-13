@@ -261,14 +261,23 @@ impl<'a> SnapshotProducer<'a> {
         self.snapshot_id
     }
 
+    /// Whether this table should use Parquet manifests (V2+) or Avro (V1).
+    fn use_parquet_manifests(&self) -> bool {
+        matches!(
+            self.table.metadata().format_version(),
+            FormatVersion::V2 | FormatVersion::V3
+        )
+    }
+
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
+        let ext = if self.use_parquet_manifests() { "parquet" } else { "avro" };
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
             self.table.metadata().location(),
             META_ROOT_PATH,
             self.commit_uuid,
             self.manifest_counter.next().unwrap(),
-            DataFileFormat::Avro
+            ext
         );
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
         let builder = ManifestWriterBuilder::new(
@@ -354,7 +363,11 @@ impl<'a> SnapshotProducer<'a> {
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
-        writer.write_manifest_file().await
+        if self.use_parquet_manifests() {
+            writer.write_manifest_file_parquet().await
+        } else {
+            writer.write_manifest_file().await
+        }
     }
 
     // Write manifest file for added delete files and return the ManifestFile for ManifestList.
@@ -406,7 +419,11 @@ impl<'a> SnapshotProducer<'a> {
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
-        writer.write_manifest_file().await
+        if self.use_parquet_manifests() {
+            writer.write_manifest_file_parquet().await
+        } else {
+            writer.write_manifest_file().await
+        }
     }
 
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(

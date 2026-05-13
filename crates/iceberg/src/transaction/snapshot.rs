@@ -340,6 +340,78 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
+    /// Try to merge new data files into the most recent existing data manifest
+    /// if it's below the entry count threshold. Returns true if merged.
+    ///
+    /// This reduces manifest proliferation from frequent micro-batch commits
+    /// (e.g., 30-second OTel ingestion cycles). Instead of creating 2,880
+    /// manifests/day, small manifests get merged inline.
+    async fn try_merge_into_existing(
+        &mut self,
+        existing_manifests: &mut Vec<ManifestFile>,
+        min_count: usize,
+    ) -> Result<bool> {
+        // Find the most recent data manifest that's small enough to merge into
+        let merge_candidate_idx = existing_manifests.iter().rposition(|mf| {
+            mf.content == ManifestContentType::Data
+                && mf.added_files_count.unwrap_or(0) + mf.existing_files_count.unwrap_or(0)
+                    < min_count as u32
+        });
+
+        let Some(idx) = merge_candidate_idx else {
+            return Ok(false);
+        };
+
+        // Load the existing manifest entries
+        let candidate = &existing_manifests[idx];
+        let manifest = candidate.load_manifest(self.table.file_io()).await?;
+        let (existing_entries, _metadata) = manifest.into_parts();
+
+        // Create a new merged manifest with existing + new entries
+        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+
+        // Re-add existing entries
+        for entry_ref in &existing_entries {
+            let entry = entry_ref.as_ref();
+            if entry.is_alive() {
+                writer.add_existing_file(
+                    entry.data_file.clone(),
+                    entry.snapshot_id.unwrap_or(0),
+                    entry.sequence_number.unwrap_or(0),
+                    entry.file_sequence_number,
+                )?;
+            }
+        }
+
+        // Add new entries
+        let added_data_files = std::mem::take(&mut self.added_data_files);
+        let snapshot_id = self.snapshot_id;
+        let format_version = self.table.metadata().format_version();
+        for data_file in added_data_files {
+            let builder = ManifestEntry::builder()
+                .status(crate::spec::ManifestStatus::Added)
+                .data_file(data_file);
+            let entry = if format_version == FormatVersion::V1 {
+                builder.snapshot_id(snapshot_id).build()
+            } else {
+                builder.build()
+            };
+            writer.add_entry(entry)?;
+        }
+
+        // Write merged manifest
+        let merged_manifest = if self.use_parquet_manifests() {
+            writer.write_manifest_file_parquet().await?
+        } else {
+            writer.write_manifest_file().await?
+        };
+
+        // Replace the old manifest with the merged one
+        existing_manifests[idx] = merged_manifest;
+
+        Ok(true)
+    }
+
     // Write manifest file for added data files and return the ManifestFile for ManifestList.
     async fn write_added_manifest(&mut self) -> Result<ManifestFile> {
         let added_data_files = std::mem::take(&mut self.added_data_files);
@@ -455,9 +527,35 @@ impl<'a> SnapshotProducer<'a> {
         let mut manifest_files = existing_manifests;
 
         // Process added entries.
+        // When manifest merging is enabled, merge new entries into the most
+        // recent small manifest instead of creating a new one every commit.
         if !self.added_data_files.is_empty() {
-            let added_manifest = self.write_added_manifest().await?;
-            manifest_files.push(added_manifest);
+            let merge_enabled = self
+                .table
+                .metadata()
+                .properties()
+                .get("commit.manifest-merge.enabled")
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let min_count = self
+                .table
+                .metadata()
+                .properties()
+                .get("commit.manifest.min-count-to-merge")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(100);
+
+            let merged = if merge_enabled {
+                self.try_merge_into_existing(&mut manifest_files, min_count)
+                    .await?
+            } else {
+                false
+            };
+
+            if !merged {
+                let added_manifest = self.write_added_manifest().await?;
+                manifest_files.push(added_manifest);
+            }
         }
 
         // Process added delete files.

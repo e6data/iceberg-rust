@@ -83,12 +83,27 @@ impl ObjectCache {
         }
     }
 
+    /// Planning-optimized projection columns for Parquet manifests.
+    /// Skips column_sizes, value_counts, nan_value_counts, key_metadata.
+    const PLANNING_PROJECTION: &'static [&'static str] = &[
+        "status", "snapshot_id", "sequence_number", "file_sequence_number",
+        "content", "file_path", "file_format", "partition_json",
+        "record_count", "file_size_in_bytes",
+        "null_value_counts_json", "lower_bounds_json", "upper_bounds_json",
+        "split_offsets_json", "equality_ids_json", "sort_order_id", "partition_spec_id",
+    ];
+
     /// Retrieves an Arc [`Manifest`] from the cache
-    /// or retrieves one from FileIO and parses it if not present
+    /// or retrieves one from FileIO and parses it if not present.
+    ///
+    /// When the cache is disabled and the manifest is Parquet format,
+    /// uses projected reads to skip unused statistics columns.
     pub(crate) async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
+            // For Parquet manifests without caching, use projected read
+            // to skip column_sizes, value_counts, nan_value_counts, key_metadata
             return manifest_file
-                .load_manifest(&self.file_io)
+                .load_manifest_projected(&self.file_io, Self::PLANNING_PROJECTION)
                 .await
                 .map(Arc::new);
         }

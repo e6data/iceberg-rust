@@ -44,8 +44,8 @@ use super::{ManifestEntry, ManifestMetadata, ManifestStatus};
 use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal,
-    ManifestContentType, PartitionSpec, PrimitiveLiteral, Schema, SchemaRef, Struct,
-    StructType,
+    ManifestContentType, PartitionSpec, PrimitiveLiteral, RawLiteral, Schema,
+    SchemaRef, Struct, StructType, Type,
 };
 use crate::{Error, ErrorKind};
 
@@ -243,21 +243,13 @@ fn manifest_entries_to_record_batch(
         .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to build RecordBatch: {e}")))
 }
 
-fn serialize_partition_json(partition: &Struct, _partition_type: &StructType) -> String {
-    // Serialize partition values as JSON object: {"f0": "value", "f1": null, ...}
-    let mut map = serde_json::Map::new();
-    for (i, val) in partition.iter().enumerate() {
-        let key = format!("f{i}");
-        match val {
-            Some(lit) => {
-                map.insert(key, serde_json::Value::String(format!("{lit:?}")));
-            }
-            None => {
-                map.insert(key, serde_json::Value::Null);
-            }
-        }
+fn serialize_partition_json(partition: &Struct, partition_type: &StructType) -> String {
+    // Use RawLiteral for proper Iceberg partition value serialization.
+    // RawLiteral handles all type conversions (timestamps, decimals, etc.) correctly.
+    match RawLiteral::try_from(Literal::Struct(partition.clone()), &Type::Struct(partition_type.clone())) {
+        Ok(raw) => serde_json::to_string(&raw).unwrap_or_default(),
+        Err(_) => "null".to_string(),
     }
-    serde_json::to_string(&map).unwrap_or_default()
 }
 
 fn serialize_i64_map(m: &HashMap<i32, u64>) -> String {
@@ -333,6 +325,8 @@ pub fn read_parquet_manifest(bytes: &[u8]) -> Result<(ManifestMetadata, Vec<Mani
         parse_parquet_manifest_metadata(kv_metadata)?
     };
 
+    let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
+
     let batch_reader = reader
         .build()
         .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Failed to build reader: {e}")))?;
@@ -344,6 +338,7 @@ pub fn read_parquet_manifest(bytes: &[u8]) -> Result<(ManifestMetadata, Vec<Mani
         let batch_entries = record_batch_to_manifest_entries(
             &batch,
             &metadata,
+            &partition_type,
         )?;
         entries.extend(batch_entries);
     }
@@ -398,6 +393,8 @@ pub fn read_parquet_manifest_projected(
         projection_indices,
     );
 
+    let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
+
     let batch_reader = builder
         .with_projection(projection)
         .build()
@@ -407,7 +404,7 @@ pub fn read_parquet_manifest_projected(
     for batch_result in batch_reader {
         let batch = batch_result
             .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Failed to read batch: {e}")))?;
-        let batch_entries = record_batch_to_manifest_entries(&batch, &metadata)?;
+        let batch_entries = record_batch_to_manifest_entries(&batch, &metadata, &partition_type)?;
         entries.extend(batch_entries);
     }
 
@@ -434,6 +431,7 @@ fn parse_parquet_manifest_metadata(
 fn record_batch_to_manifest_entries(
     batch: &RecordBatch,
     metadata: &ManifestMetadata,
+    partition_type: &StructType,
 ) -> Result<Vec<ManifestEntry>> {
     let n = batch.num_rows();
     let mut entries = Vec::with_capacity(n);
@@ -474,6 +472,7 @@ fn record_batch_to_manifest_entries(
 
         let partition = parse_partition_json(
             partition_json_arr.and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) }),
+            partition_type,
         );
 
         let column_sizes = parse_i64_map_json(read_binary_opt(column_sizes_arr, i));
@@ -532,10 +531,22 @@ fn record_batch_to_manifest_entries(
 // JSON deserialization helpers
 // ============================================================================
 
-fn parse_partition_json(json: Option<&str>) -> Struct {
-    // TODO: deserialize partition values from JSON using partition type
-    // For now, return empty struct — partition pruning uses manifest-level bounds
-    Struct::empty()
+fn parse_partition_json(json: Option<&str>, partition_type: &StructType) -> Struct {
+    let Some(json_str) = json else { return Struct::empty() };
+    if json_str == "null" || json_str.is_empty() {
+        return Struct::empty();
+    }
+
+    // Deserialize via RawLiteral for proper Iceberg type handling
+    let raw: RawLiteral = match serde_json::from_str(json_str) {
+        Ok(r) => r,
+        Err(_) => return Struct::empty(),
+    };
+
+    match raw.try_into(&Type::Struct(partition_type.clone())) {
+        Ok(Some(Literal::Struct(s))) => s,
+        _ => Struct::empty(),
+    }
 }
 
 fn parse_i64_map_json(bytes: Option<&[u8]>) -> HashMap<i32, u64> {
@@ -816,5 +827,61 @@ mod tests {
         // Statistics should be empty since we didn't project them
         assert!(projected_entries[0].data_file.column_sizes.is_empty());
         assert!(projected_entries[0].data_file.value_counts.is_empty());
+    }
+
+    #[test]
+    fn partition_value_round_trip() {
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let metadata = ManifestMetadata::builder()
+            .schema(schema.clone())
+            .schema_id(0)
+            .partition_spec(partition_spec)
+            .format_version(FormatVersion::V2)
+            .content(ManifestContentType::Data)
+            .build();
+
+        // Create entry with non-empty partition value
+        let partition = vec![Some(Literal::long(42))].into_iter().collect::<Struct>();
+
+        let entries = vec![ManifestEntry {
+            status: ManifestStatus::Added,
+            snapshot_id: Some(100),
+            sequence_number: Some(1),
+            file_sequence_number: Some(1),
+            data_file: DataFile {
+                content: DataContentType::Data,
+                file_path: "s3://bucket/data/partitioned.parquet".to_string(),
+                file_format: DataFileFormat::Parquet,
+                partition,
+                record_count: 500,
+                file_size_in_bytes: 25000,
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+                sort_order_id: None,
+                partition_spec_id: 0,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        }];
+
+        let bytes = write_parquet_manifest(&entries, &metadata, &partition_type).unwrap();
+        let (_, read_entries) = read_parquet_manifest(&bytes).unwrap();
+
+        assert_eq!(read_entries.len(), 1);
+        let read_partition = &read_entries[0].data_file.partition;
+        assert_eq!(read_partition.fields().len(), 1);
+        assert_eq!(read_partition[0], Some(Literal::long(42)));
     }
 }

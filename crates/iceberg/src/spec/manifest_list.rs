@@ -846,9 +846,13 @@ impl ManifestFile {
     ///
     /// This method will also initialize inherited values of [`ManifestEntry`], such as `sequence_number`.
     pub async fn load_manifest(&self, file_io: &FileIO) -> Result<Manifest> {
-        let avro = file_io.new_input(&self.manifest_path)?.read().await?;
+        let bytes = file_io.new_input(&self.manifest_path)?.read().await?;
 
-        let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
+        let (metadata, mut entries) = if self.manifest_path.ends_with(".parquet") {
+            super::manifest::parquet_manifest::read_parquet_manifest(&bytes)?
+        } else {
+            Manifest::try_from_avro_bytes(&bytes)?
+        };
 
         // Let entries inherit values from the manifest list entry.
         for entry in &mut entries {

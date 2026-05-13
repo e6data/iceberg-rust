@@ -884,4 +884,85 @@ mod tests {
         assert_eq!(read_partition.fields().len(), 1);
         assert_eq!(read_partition[0], Some(Literal::long(42)));
     }
+
+    #[test]
+    fn bounds_round_trip() {
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let metadata = ManifestMetadata::builder()
+            .schema(schema.clone())
+            .schema_id(0)
+            .partition_spec(partition_spec)
+            .format_version(FormatVersion::V2)
+            .content(ManifestContentType::Data)
+            .build();
+
+        // field 1 = Long, field 2 = String
+        let lower_bounds = HashMap::from([
+            (1, Datum::long(100)),
+            (2, Datum::string("aaa")),
+        ]);
+        let upper_bounds = HashMap::from([
+            (1, Datum::long(999)),
+            (2, Datum::string("zzz")),
+        ]);
+
+        let entries = vec![ManifestEntry {
+            status: ManifestStatus::Added,
+            snapshot_id: Some(100),
+            sequence_number: Some(1),
+            file_sequence_number: Some(1),
+            data_file: DataFile {
+                content: DataContentType::Data,
+                file_path: "s3://bucket/data/with_bounds.parquet".to_string(),
+                file_format: DataFileFormat::Parquet,
+                partition: Struct::empty(),
+                record_count: 1000,
+                file_size_in_bytes: 50000,
+                column_sizes: HashMap::from([(1, 4000), (2, 8000)]),
+                value_counts: HashMap::from([(1, 1000), (2, 1000)]),
+                null_value_counts: HashMap::from([(1, 0), (2, 10)]),
+                nan_value_counts: HashMap::new(),
+                lower_bounds,
+                upper_bounds,
+                key_metadata: Some(vec![1, 2, 3, 4]),
+                split_offsets: Some(vec![4, 5000, 10000]),
+                equality_ids: None,
+                sort_order_id: Some(0),
+                partition_spec_id: 0,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        }];
+
+        let bytes = write_parquet_manifest(&entries, &metadata, &partition_type).unwrap();
+        let (_, read_entries) = read_parquet_manifest(&bytes).unwrap();
+
+        assert_eq!(read_entries.len(), 1);
+        let df = &read_entries[0].data_file;
+
+        // Verify bounds
+        assert_eq!(df.lower_bounds.get(&1), Some(&Datum::long(100)));
+        assert_eq!(df.lower_bounds.get(&2), Some(&Datum::string("aaa")));
+        assert_eq!(df.upper_bounds.get(&1), Some(&Datum::long(999)));
+        assert_eq!(df.upper_bounds.get(&2), Some(&Datum::string("zzz")));
+
+        // Verify column sizes
+        assert_eq!(df.column_sizes.get(&1), Some(&4000));
+        assert_eq!(df.column_sizes.get(&2), Some(&8000));
+
+        // Verify value counts
+        assert_eq!(df.value_counts.get(&1), Some(&1000));
+        assert_eq!(df.null_value_counts.get(&2), Some(&10));
+
+        // Verify key metadata
+        assert_eq!(df.key_metadata, Some(vec![1, 2, 3, 4]));
+
+        // Verify split offsets
+        assert_eq!(df.split_offsets, Some(vec![4, 5000, 10000]));
+    }
 }

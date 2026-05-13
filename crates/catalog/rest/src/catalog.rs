@@ -2673,6 +2673,10 @@ mod tests {
 
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .match_query(Matcher::UrlEncoded(
+                "snapshots".to_string(),
+                "all".to_string(),
+            ))
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",
@@ -2810,6 +2814,10 @@ mod tests {
 
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .match_query(Matcher::UrlEncoded(
+                "snapshots".to_string(),
+                "all".to_string(),
+            ))
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",

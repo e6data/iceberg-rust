@@ -351,6 +351,69 @@ pub fn read_parquet_manifest(bytes: &[u8]) -> Result<(ManifestMetadata, Vec<Mani
     Ok((metadata, entries))
 }
 
+/// Read manifest entries with column projection.
+///
+/// Only the specified columns are read from the Parquet file. Columns not
+/// requested will be empty/default in the returned ManifestEntry.
+///
+/// Common projection sets:
+/// - Planning: `["status", "content", "file_path", "file_format", "record_count", "file_size_in_bytes", "partition_spec_id"]`
+/// - Pruning:  above + `["lower_bounds_json", "upper_bounds_json"]`
+/// - Full:     all columns (use `read_parquet_manifest` instead)
+pub fn read_parquet_manifest_projected(
+    bytes: &[u8],
+    columns: &[&str],
+) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+        .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Failed to open parquet manifest: {e}")))?;
+
+    let arrow_schema = builder.schema();
+    let arrow_meta = arrow_schema.metadata();
+    let metadata = if arrow_meta.contains_key("schema") {
+        let map: HashMap<String, Vec<u8>> = arrow_meta
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+            .collect();
+        ManifestMetadata::parse(&map)?
+    } else {
+        let parquet_metadata = builder.metadata().clone();
+        let kv_metadata = parquet_metadata.file_metadata().key_value_metadata();
+        parse_parquet_manifest_metadata(kv_metadata)?
+    };
+
+    // Build projection mask from requested columns
+    let parquet_schema = builder.parquet_schema();
+    let mut projection_indices = Vec::new();
+    for col_name in columns {
+        for (idx, field) in arrow_schema.fields().iter().enumerate() {
+            if field.name() == *col_name {
+                projection_indices.push(idx);
+                break;
+            }
+        }
+    }
+
+    let projection = parquet::arrow::ProjectionMask::leaves(
+        parquet_schema,
+        projection_indices,
+    );
+
+    let batch_reader = builder
+        .with_projection(projection)
+        .build()
+        .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Failed to build projected reader: {e}")))?;
+
+    let mut entries = Vec::new();
+    for batch_result in batch_reader {
+        let batch = batch_result
+            .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Failed to read batch: {e}")))?;
+        let batch_entries = record_batch_to_manifest_entries(&batch, &metadata)?;
+        entries.extend(batch_entries);
+    }
+
+    Ok((metadata, entries))
+}
+
 fn parse_parquet_manifest_metadata(
     kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
 ) -> Result<ManifestMetadata> {
@@ -691,5 +754,67 @@ mod tests {
         assert_eq!(read_entries[1].status, ManifestStatus::Existing);
         assert_eq!(read_entries[1].data_file.file_path, "s3://bucket/data/file2.parquet");
         assert_eq!(read_entries[1].data_file.record_count, 500);
+    }
+
+    #[test]
+    fn projected_read_skips_statistics() {
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let metadata = ManifestMetadata::builder()
+            .schema(schema.clone())
+            .schema_id(0)
+            .partition_spec(partition_spec)
+            .format_version(FormatVersion::V2)
+            .content(ManifestContentType::Data)
+            .build();
+
+        let entries = vec![ManifestEntry {
+            status: ManifestStatus::Added,
+            snapshot_id: Some(100),
+            sequence_number: Some(1),
+            file_sequence_number: Some(1),
+            data_file: DataFile {
+                content: DataContentType::Data,
+                file_path: "s3://bucket/data/file1.parquet".to_string(),
+                file_format: DataFileFormat::Parquet,
+                partition: Struct::empty(),
+                record_count: 1000,
+                file_size_in_bytes: 50000,
+                column_sizes: HashMap::from([(1, 2000), (2, 3000)]),
+                value_counts: HashMap::from([(1, 1000)]),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                split_offsets: Some(vec![4, 1000]),
+                equality_ids: None,
+                sort_order_id: Some(0),
+                partition_spec_id: 0,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        }];
+
+        let bytes = write_parquet_manifest(&entries, &metadata, &partition_type).unwrap();
+
+        // Projected read: only planning columns (skip all statistics)
+        let planning_cols = &[
+            "status", "content", "file_path", "file_format",
+            "record_count", "file_size_in_bytes", "partition_spec_id",
+        ];
+        let (_, projected_entries) = read_parquet_manifest_projected(&bytes, planning_cols).unwrap();
+
+        assert_eq!(projected_entries.len(), 1);
+        assert_eq!(projected_entries[0].data_file.file_path, "s3://bucket/data/file1.parquet");
+        assert_eq!(projected_entries[0].data_file.record_count, 1000);
+        assert_eq!(projected_entries[0].status, ManifestStatus::Added);
+        // Statistics should be empty since we didn't project them
+        assert!(projected_entries[0].data_file.column_sizes.is_empty());
+        assert!(projected_entries[0].data_file.value_counts.is_empty());
     }
 }

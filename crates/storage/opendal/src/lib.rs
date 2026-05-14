@@ -22,6 +22,7 @@
 //! [`StorageFactory`](iceberg::io::StorageFactory) traits from the `iceberg` crate
 //! using [OpenDAL](https://opendal.apache.org/) as the backend.
 
+mod metrics_layer;
 mod utils;
 
 use std::collections::HashMap;
@@ -92,6 +93,43 @@ cfg_if! {
 mod resolving;
 pub use resolving::{OpenDalResolvingStorage, OpenDalResolvingStorageFactory};
 
+/// OpenDAL storage property key for output writer chunk size in bytes.
+pub const OPENDAL_WRITER_CHUNK_SIZE: &str = "opendal.writer.chunk-size";
+/// OpenDAL storage property key for output writer concurrency.
+pub const OPENDAL_WRITER_CONCURRENCY: &str = "opendal.writer.concurrency";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct OpenDalWriterOptions {
+    chunk_size: Option<usize>,
+    concurrency: Option<usize>,
+}
+
+impl OpenDalWriterOptions {
+    pub(crate) fn from_config(config: &StorageConfig) -> Result<Self> {
+        Ok(Self {
+            chunk_size: parse_optional_usize(config, OPENDAL_WRITER_CHUNK_SIZE)?,
+            concurrency: parse_optional_usize(config, OPENDAL_WRITER_CONCURRENCY)?,
+        })
+    }
+}
+
+fn parse_optional_usize(config: &StorageConfig, key: &str) -> Result<Option<usize>> {
+    match config.get(key) {
+        None => Ok(None),
+        Some(value) => {
+            let parsed = value.parse::<usize>().map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Invalid {key}: expected non-negative integer, got {value}"),
+                )
+                .with_source(e)
+            })?;
+
+            Ok(Some(parsed))
+        }
+    }
+}
+
 /// OpenDAL-based storage factory.
 ///
 /// Maps scheme to the corresponding OpenDalStorage storage variant.
@@ -126,32 +164,50 @@ pub enum OpenDalStorageFactory {
 impl StorageFactory for OpenDalStorageFactory {
     #[allow(unused_variables)]
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        let writer_options = OpenDalWriterOptions::from_config(config)?;
+
         match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorageFactory::Memory => {
-                Ok(Arc::new(OpenDalStorage::Memory(memory_config_build()?)))
-            }
+            OpenDalStorageFactory::Memory => Ok(Arc::new(OpenDalStorage::new(
+                OpenDalStorageBackend::Memory(memory_config_build()?),
+                writer_options,
+            ))),
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::LocalFs)),
+            OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::new(
+                OpenDalStorageBackend::LocalFs,
+                writer_options,
+            ))),
             #[cfg(feature = "opendal-s3")]
             OpenDalStorageFactory::S3 {
                 customized_credential_load,
-            } => Ok(Arc::new(OpenDalStorage::S3 {
-                config: s3_config_parse(config.props().clone())?.into(),
-                customized_credential_load: customized_credential_load.clone(),
-            })),
+            } => Ok(Arc::new(OpenDalStorage::new(
+                OpenDalStorageBackend::S3 {
+                    config: s3_config_parse(config.props().clone())?.into(),
+                    customized_credential_load: customized_credential_load.clone(),
+                },
+                writer_options,
+            ))),
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
-                config: gcs_config_parse(config.props().clone())?.into(),
-            })),
+            OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::new(
+                OpenDalStorageBackend::Gcs {
+                    config: gcs_config_parse(config.props().clone())?.into(),
+                },
+                writer_options,
+            ))),
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorageFactory::Oss => Ok(Arc::new(OpenDalStorage::Oss {
-                config: oss_config_parse(config.props().clone())?.into(),
-            })),
+            OpenDalStorageFactory::Oss => Ok(Arc::new(OpenDalStorage::new(
+                OpenDalStorageBackend::Oss {
+                    config: oss_config_parse(config.props().clone())?.into(),
+                },
+                writer_options,
+            ))),
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorageFactory::Azdls => Ok(Arc::new(OpenDalStorage::Azdls {
-                config: azdls_config_parse(config.props().clone())?.into(),
-            })),
+            OpenDalStorageFactory::Azdls => Ok(Arc::new(OpenDalStorage::new(
+                OpenDalStorageBackend::Azdls {
+                    config: azdls_config_parse(config.props().clone())?.into(),
+                },
+                writer_options,
+            ))),
             #[cfg(all(
                 not(feature = "opendal-memory"),
                 not(feature = "opendal-fs"),
@@ -176,7 +232,25 @@ fn default_memory_operator() -> Operator {
 
 /// OpenDAL-based storage implementation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum OpenDalStorage {
+pub struct OpenDalStorage {
+    backend: OpenDalStorageBackend,
+    writer_options: OpenDalWriterOptions,
+}
+
+impl OpenDalStorage {
+    pub(crate) fn new(
+        backend: OpenDalStorageBackend,
+        writer_options: OpenDalWriterOptions,
+    ) -> Self {
+        Self {
+            backend,
+            writer_options,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum OpenDalStorageBackend {
     /// Memory storage variant.
     #[cfg(feature = "opendal-memory")]
     Memory(#[serde(skip, default = "self::default_memory_operator")] Operator),
@@ -239,9 +313,9 @@ impl OpenDalStorage {
         path: &'a impl AsRef<str>,
     ) -> Result<(Operator, &'a str)> {
         let path = path.as_ref();
-        let (operator, relative_path): (Operator, &str) = match self {
+        let (operator, relative_path): (Operator, &str) = match &self.backend {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorage::Memory(op) => {
+            OpenDalStorageBackend::Memory(op) => {
                 if let Some(stripped) = path.strip_prefix("memory:/") {
                     (op.clone(), stripped)
                 } else {
@@ -249,7 +323,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorage::LocalFs => {
+            OpenDalStorageBackend::LocalFs => {
                 let op = fs_config_build()?;
                 if let Some(stripped) = path.strip_prefix("file:/") {
                     (op, stripped)
@@ -258,7 +332,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-s3")]
-            OpenDalStorage::S3 {
+            OpenDalStorageBackend::S3 {
                 config,
                 customized_credential_load,
             } => {
@@ -284,7 +358,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorage::Gcs { config } => {
+            OpenDalStorageBackend::Gcs { config } => {
                 let operator = gcs_config_build(config, path)?;
                 let prefix = format!("gs://{}/", operator.info().name());
                 if path.starts_with(&prefix) {
@@ -297,7 +371,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorage::Oss { config } => {
+            OpenDalStorageBackend::Oss { config } => {
                 let op = oss_config_build(config, path)?;
                 let prefix = format!("oss://{}/", op.info().name());
                 if path.starts_with(&prefix) {
@@ -310,7 +384,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { config } => azdls_create_operator(path, config)?,
+            OpenDalStorageBackend::Azdls { config } => azdls_create_operator(path, config)?,
             #[cfg(all(
                 not(feature = "opendal-s3"),
                 not(feature = "opendal-fs"),
@@ -329,6 +403,7 @@ impl OpenDalStorage {
         // Transient errors are common for object stores; however there's no
         // harm in retrying temporary failures for other storage backends as well.
         let operator = operator.layer(RetryLayer::new());
+        let operator = operator.layer(metrics_layer::IcebergMetricsLayer);
         Ok((operator, relative_path))
     }
 
@@ -339,13 +414,15 @@ impl OpenDalStorage {
     /// available).
     #[allow(unreachable_code, unused_variables)]
     pub(crate) fn relativize_path<'a>(&self, path: &'a str) -> Result<&'a str> {
-        match self {
+        match &self.backend {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorage::Memory(_) => Ok(path.strip_prefix("memory:/").unwrap_or(&path[1..])),
+            OpenDalStorageBackend::Memory(_) => {
+                Ok(path.strip_prefix("memory:/").unwrap_or(&path[1..]))
+            }
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorage::LocalFs => Ok(path.strip_prefix("file:/").unwrap_or(&path[1..])),
+            OpenDalStorageBackend::LocalFs => Ok(path.strip_prefix("file:/").unwrap_or(&path[1..])),
             #[cfg(feature = "opendal-s3")]
-            OpenDalStorage::S3 { .. } => {
+            OpenDalStorageBackend::S3 { .. } => {
                 let url = url::Url::parse(path)?;
                 let bucket = url.host_str().ok_or_else(|| {
                     Error::new(
@@ -364,7 +441,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorage::Gcs { .. } => {
+            OpenDalStorageBackend::Gcs { .. } => {
                 let url = url::Url::parse(path)?;
                 let bucket = url.host_str().ok_or_else(|| {
                     Error::new(
@@ -383,7 +460,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorage::Oss { .. } => {
+            OpenDalStorageBackend::Oss { .. } => {
                 let url = url::Url::parse(path)?;
                 let bucket = url.host_str().ok_or_else(|| {
                     Error::new(
@@ -402,7 +479,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { config } => {
+            OpenDalStorageBackend::Azdls { config } => {
                 let azure_path = path.parse::<AzureStoragePath>()?;
                 match_path_with_config(&azure_path, config)?;
                 let relative_path_len = azure_path.path.len();
@@ -465,8 +542,15 @@ impl Storage for OpenDalStorage {
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
         let (op, relative_path) = self.create_operator(&path)?;
+        let mut writer = op.writer_with(relative_path);
+        if let Some(chunk_size) = self.writer_options.chunk_size {
+            writer = writer.chunk(chunk_size);
+        }
+        if let Some(concurrency) = self.writer_options.concurrency {
+            writer = writer.concurrent(concurrency);
+        }
         Ok(Box::new(OpenDalWriter(
-            op.writer(relative_path).await.map_err(from_opendal_error)?,
+            writer.await.map_err(from_opendal_error)?,
         )))
     }
 
@@ -570,6 +654,56 @@ impl FileWrite for OpenDalWriter {
 mod tests {
     use super::*;
 
+    fn test_storage(backend: OpenDalStorageBackend) -> OpenDalStorage {
+        OpenDalStorage::new(backend, OpenDalWriterOptions::default())
+    }
+
+    #[test]
+    fn test_writer_options_from_config() {
+        let mut props = HashMap::new();
+        props.insert(OPENDAL_WRITER_CHUNK_SIZE.to_string(), "8388608".to_string());
+        props.insert(OPENDAL_WRITER_CONCURRENCY.to_string(), "4".to_string());
+
+        let options = OpenDalWriterOptions::from_config(&StorageConfig::from_props(props)).unwrap();
+
+        assert_eq!(options.chunk_size, Some(8388608));
+        assert_eq!(options.concurrency, Some(4));
+    }
+
+    #[test]
+    fn test_writer_options_from_config_rejects_invalid_value() {
+        let mut props = HashMap::new();
+        props.insert(OPENDAL_WRITER_CONCURRENCY.to_string(), "many".to_string());
+
+        let err = OpenDalWriterOptions::from_config(&StorageConfig::from_props(props))
+            .expect_err("invalid writer option should fail");
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.to_string().contains(OPENDAL_WRITER_CONCURRENCY));
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_storage_metrics_are_recorded() {
+        let storage = test_storage(OpenDalStorageBackend::Memory(default_memory_operator()));
+
+        storage
+            .write("memory:/metrics-file", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let bytes = storage.read("memory:/metrics-file").await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        let metric_names = prometheus::gather()
+            .into_iter()
+            .map(|family| family.name().to_string())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(metric_names.contains("iceberg_storage_ops_total"));
+        assert!(metric_names.contains("iceberg_storage_ops_duration_seconds"));
+        assert!(metric_names.contains("iceberg_storage_bytes_total"));
+    }
+
     #[cfg(feature = "opendal-memory")]
     #[test]
     fn test_default_memory_operator() {
@@ -580,7 +714,7 @@ mod tests {
     #[cfg(feature = "opendal-memory")]
     #[test]
     fn test_relativize_path_memory() {
-        let storage = OpenDalStorage::Memory(default_memory_operator());
+        let storage = test_storage(OpenDalStorageBackend::Memory(default_memory_operator()));
 
         assert_eq!(
             storage.relativize_path("memory:/path/to/file").unwrap(),
@@ -596,7 +730,7 @@ mod tests {
     #[cfg(feature = "opendal-fs")]
     #[test]
     fn test_relativize_path_fs() {
-        let storage = OpenDalStorage::LocalFs;
+        let storage = test_storage(OpenDalStorageBackend::LocalFs);
 
         assert_eq!(
             storage
@@ -613,10 +747,10 @@ mod tests {
     #[cfg(feature = "opendal-s3")]
     #[test]
     fn test_relativize_path_s3() {
-        let storage = OpenDalStorage::S3 {
+        let storage = test_storage(OpenDalStorageBackend::S3 {
             config: Arc::new(S3Config::default()),
             customized_credential_load: None,
-        };
+        });
 
         // All S3-family schemes are accepted by the same storage instance.
         // Custom schemes for S3-compatible stores (e.g., `minio://`) are also
@@ -634,9 +768,9 @@ mod tests {
     #[cfg(feature = "opendal-gcs")]
     #[test]
     fn test_relativize_path_gcs() {
-        let storage = OpenDalStorage::Gcs {
+        let storage = test_storage(OpenDalStorageBackend::Gcs {
             config: Arc::new(GcsConfig::default()),
-        };
+        });
 
         assert_eq!(
             storage
@@ -649,9 +783,9 @@ mod tests {
     #[cfg(feature = "opendal-gcs")]
     #[test]
     fn test_relativize_path_gcs_invalid_scheme() {
-        let storage = OpenDalStorage::Gcs {
+        let storage = test_storage(OpenDalStorageBackend::Gcs {
             config: Arc::new(GcsConfig::default()),
-        };
+        });
 
         assert!(
             storage
@@ -663,9 +797,9 @@ mod tests {
     #[cfg(feature = "opendal-oss")]
     #[test]
     fn test_relativize_path_oss() {
-        let storage = OpenDalStorage::Oss {
+        let storage = test_storage(OpenDalStorageBackend::Oss {
             config: Arc::new(OssConfig::default()),
-        };
+        });
 
         assert_eq!(
             storage
@@ -678,9 +812,9 @@ mod tests {
     #[cfg(feature = "opendal-oss")]
     #[test]
     fn test_relativize_path_oss_invalid_scheme() {
-        let storage = OpenDalStorage::Oss {
+        let storage = test_storage(OpenDalStorageBackend::Oss {
             config: Arc::new(OssConfig::default()),
-        };
+        });
 
         assert!(
             storage
@@ -692,13 +826,13 @@ mod tests {
     #[cfg(feature = "opendal-azdls")]
     #[test]
     fn test_relativize_path_azdls() {
-        let storage = OpenDalStorage::Azdls {
+        let storage = test_storage(OpenDalStorageBackend::Azdls {
             config: Arc::new(AzdlsConfig {
                 account_name: Some("myaccount".to_string()),
                 endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
                 ..Default::default()
             }),
-        };
+        });
 
         assert_eq!(
             storage

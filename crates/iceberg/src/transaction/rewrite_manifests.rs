@@ -122,7 +122,7 @@ impl RewriteManifestsAction {
         let use_parquet_manifests = table
             .metadata()
             .properties()
-            .get("write.metadata.codec")
+            .get("write.parquet.metadata-codec")
             .map(|v| v.eq_ignore_ascii_case("parquet"))
             .unwrap_or(false);
         let schema = table.metadata().current_schema().clone();
@@ -479,7 +479,7 @@ impl TransactionAction for RewriteManifestsAction {
         let use_parquet_manifests = table
             .metadata()
             .properties()
-            .get("write.metadata.codec")
+            .get("write.parquet.metadata-codec")
             .map(|v| v.eq_ignore_ascii_case("parquet"))
             .unwrap_or(false);
         let schema = table.metadata().current_schema().clone();

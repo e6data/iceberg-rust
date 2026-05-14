@@ -276,13 +276,13 @@ impl<'a> SnapshotProducer<'a> {
 
     /// Whether this table should use Parquet manifests.
     ///
-    /// Opt-in via table property `write.metadata.codec = "parquet"`.
+    /// Opt-in via table property `write.parquet.metadata-codec = "parquet"`.
     /// Avro remains the default for ecosystem compatibility (Spark, Trino, Flink).
     fn use_parquet_manifests(&self) -> bool {
         self.table
             .metadata()
             .properties()
-            .get("write.metadata.codec")
+            .get("write.parquet.metadata-codec")
             .map(|v| v.eq_ignore_ascii_case("parquet"))
             .unwrap_or(false)
     }

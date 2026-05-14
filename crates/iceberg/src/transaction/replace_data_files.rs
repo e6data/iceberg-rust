@@ -414,7 +414,7 @@ impl SnapshotProduceOperation for ReplaceOperation {
                 .table
                 .metadata()
                 .properties()
-                .get("write.metadata.codec")
+                .get("write.parquet.metadata-codec")
                 .map(|v| v.eq_ignore_ascii_case("parquet"))
                 .unwrap_or(false);
             let ext = if use_parquet { "parquet" } else { "avro" };

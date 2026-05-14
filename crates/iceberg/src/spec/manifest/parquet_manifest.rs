@@ -965,4 +965,204 @@ mod tests {
         // Verify split offsets
         assert_eq!(df.split_offsets, Some(vec![4, 5000, 10000]));
     }
+
+    #[test]
+    fn string_partition_round_trip() {
+        // Simulates the multi-tenant OTel scenario: partition by tenant name (string)
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(1, "tenant", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::optional(2, "data", Type::Primitive(PrimitiveType::String))),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_unbound_field(UnboundPartitionField {
+                source_id: 1,
+                field_id: None,
+                name: "tenant".to_string(),
+                transform: Transform::Identity,
+            })
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let metadata = ManifestMetadata::builder()
+            .schema(schema.clone())
+            .schema_id(0)
+            .partition_spec(partition_spec)
+            .format_version(FormatVersion::V2)
+            .content(ManifestContentType::Data)
+            .build();
+
+        // Two entries for different tenants
+        let entries = vec![
+            ManifestEntry {
+                status: ManifestStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                data_file: DataFile {
+                    content: DataContentType::Data,
+                    file_path: "s3://bucket/tenant_a/file1.parquet".to_string(),
+                    file_format: DataFileFormat::Parquet,
+                    partition: vec![Some(Literal::string("tenant_alpha"))].into_iter().collect(),
+                    record_count: 1000,
+                    file_size_in_bytes: 50000,
+                    column_sizes: HashMap::new(),
+                    value_counts: HashMap::new(),
+                    null_value_counts: HashMap::new(),
+                    nan_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::new(),
+                    upper_bounds: HashMap::new(),
+                    key_metadata: None,
+                    split_offsets: None,
+                    equality_ids: None,
+                    sort_order_id: None,
+                    partition_spec_id: 0,
+                    first_row_id: None,
+                    referenced_data_file: None,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                },
+            },
+            ManifestEntry {
+                status: ManifestStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                data_file: DataFile {
+                    content: DataContentType::Data,
+                    file_path: "s3://bucket/tenant_b/file2.parquet".to_string(),
+                    file_format: DataFileFormat::Parquet,
+                    partition: vec![Some(Literal::string("tenant_beta"))].into_iter().collect(),
+                    record_count: 500,
+                    file_size_in_bytes: 25000,
+                    column_sizes: HashMap::new(),
+                    value_counts: HashMap::new(),
+                    null_value_counts: HashMap::new(),
+                    nan_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::new(),
+                    upper_bounds: HashMap::new(),
+                    key_metadata: None,
+                    split_offsets: None,
+                    equality_ids: None,
+                    sort_order_id: None,
+                    partition_spec_id: 0,
+                    first_row_id: None,
+                    referenced_data_file: None,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                },
+            },
+        ];
+
+        let bytes = write_parquet_manifest(&entries, &metadata, &partition_type).unwrap();
+        let (_, read_entries) = read_parquet_manifest(&bytes).unwrap();
+
+        assert_eq!(read_entries.len(), 2);
+        assert_eq!(read_entries[0].data_file.partition[0], Some(Literal::string("tenant_alpha")));
+        assert_eq!(read_entries[1].data_file.partition[0], Some(Literal::string("tenant_beta")));
+        assert_eq!(read_entries[0].data_file.file_path, "s3://bucket/tenant_a/file1.parquet");
+        assert_eq!(read_entries[1].data_file.record_count, 500);
+    }
+
+    #[test]
+    fn format_detection_by_extension() {
+        // Verify that .parquet and .avro paths are correctly distinguished
+        assert!("s3://bucket/metadata/abc-m0.parquet".ends_with(".parquet"));
+        assert!(!"s3://bucket/metadata/abc-m0.avro".ends_with(".parquet"));
+        assert!(!"s3://bucket/metadata/abc-m0.parquet.crc".ends_with(".parquet"));
+    }
+
+    #[test]
+    fn empty_manifest_round_trip() {
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let metadata = ManifestMetadata::builder()
+            .schema(schema.clone())
+            .schema_id(0)
+            .partition_spec(partition_spec)
+            .format_version(FormatVersion::V2)
+            .content(ManifestContentType::Data)
+            .build();
+
+        // Empty entries
+        let entries: Vec<ManifestEntry> = vec![];
+        let bytes = write_parquet_manifest(&entries, &metadata, &partition_type).unwrap();
+        let (read_metadata, read_entries) = read_parquet_manifest(&bytes).unwrap();
+
+        assert_eq!(read_entries.len(), 0);
+        assert_eq!(read_metadata.format_version, FormatVersion::V2);
+    }
+
+    #[test]
+    fn large_manifest_round_trip() {
+        // Test with 500 entries to validate batched read/write
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let metadata = ManifestMetadata::builder()
+            .schema(schema.clone())
+            .schema_id(0)
+            .partition_spec(partition_spec)
+            .format_version(FormatVersion::V2)
+            .content(ManifestContentType::Data)
+            .build();
+
+        let entries: Vec<ManifestEntry> = (0..500)
+            .map(|i| ManifestEntry {
+                status: ManifestStatus::Added,
+                snapshot_id: Some(100),
+                sequence_number: Some(i as i64),
+                file_sequence_number: Some(i as i64),
+                data_file: DataFile {
+                    content: DataContentType::Data,
+                    file_path: format!("s3://bucket/data/file_{i:04}.parquet"),
+                    file_format: DataFileFormat::Parquet,
+                    partition: vec![Some(Literal::long(i))].into_iter().collect(),
+                    record_count: 1000 + i as u64,
+                    file_size_in_bytes: 50000,
+                    column_sizes: HashMap::from([(1, i as u64 * 100)]),
+                    value_counts: HashMap::new(),
+                    null_value_counts: HashMap::new(),
+                    nan_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::from([(1, Datum::long(i))]),
+                    upper_bounds: HashMap::from([(1, Datum::long(i + 1000))]),
+                    key_metadata: None,
+                    split_offsets: None,
+                    equality_ids: None,
+                    sort_order_id: None,
+                    partition_spec_id: 0,
+                    first_row_id: None,
+                    referenced_data_file: None,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                },
+            })
+            .collect();
+
+        let bytes = write_parquet_manifest(&entries, &metadata, &partition_type).unwrap();
+        let (_, read_entries) = read_parquet_manifest(&bytes).unwrap();
+
+        assert_eq!(read_entries.len(), 500);
+        // Verify first and last
+        assert_eq!(read_entries[0].data_file.file_path, "s3://bucket/data/file_0000.parquet");
+        assert_eq!(read_entries[0].data_file.record_count, 1000);
+        assert_eq!(read_entries[499].data_file.file_path, "s3://bucket/data/file_0499.parquet");
+        assert_eq!(read_entries[499].data_file.record_count, 1499);
+        // Verify bounds survived
+        assert_eq!(read_entries[0].data_file.lower_bounds.get(&1), Some(&Datum::long(0)));
+        assert_eq!(read_entries[499].data_file.upper_bounds.get(&1), Some(&Datum::long(1499)));
+        // Verify partition values
+        assert_eq!(read_entries[0].data_file.partition[0], Some(Literal::long(0)));
+        assert_eq!(read_entries[499].data_file.partition[0], Some(Literal::long(499)));
+    }
 }

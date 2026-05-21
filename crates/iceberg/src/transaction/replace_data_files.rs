@@ -410,12 +410,20 @@ impl SnapshotProduceOperation for ReplaceOperation {
 
             // Mixed manifest: rewrite it keeping only non-deleted entries
             let counter = REWRITE_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let use_parquet = snapshot_produce
+                .table
+                .metadata()
+                .properties()
+                .get("write.parquet.metadata-codec")
+                .map(|v| v.eq_ignore_ascii_case("parquet"))
+                .unwrap_or(false);
+            let ext = if use_parquet { "parquet" } else { "avro" };
             let new_manifest_path = format!(
                 "{}/metadata/{}-m-rewrite-{}.{}",
                 snapshot_produce.table.metadata().location(),
                 self.commit_uuid,
                 counter,
-                DataFileFormat::Avro
+                ext
             );
             let output_file = snapshot_produce
                 .table
@@ -468,7 +476,11 @@ impl SnapshotProduceOperation for ReplaceOperation {
                 }
             }
 
-            let new_manifest_file = writer.write_manifest_file().await?;
+            let new_manifest_file = if use_parquet {
+                writer.write_manifest_file_parquet().await?
+            } else {
+                writer.write_manifest_file().await?
+            };
             result_manifests.push(new_manifest_file);
         }
 

@@ -846,11 +846,51 @@ impl ManifestFile {
     ///
     /// This method will also initialize inherited values of [`ManifestEntry`], such as `sequence_number`.
     pub async fn load_manifest(&self, file_io: &FileIO) -> Result<Manifest> {
-        let avro = file_io.new_input(&self.manifest_path)?.read().await?;
+        let bytes = file_io.new_input(&self.manifest_path)?.read().await?;
 
-        let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
+        let (metadata, mut entries) = if self.manifest_path.ends_with(".parquet") {
+            super::manifest::parquet_manifest::read_parquet_manifest(&bytes)?
+        } else {
+            Manifest::try_from_avro_bytes(&bytes)?
+        };
 
         // Let entries inherit values from the manifest list entry.
+        for entry in &mut entries {
+            entry.inherit_data(self);
+        }
+
+        Ok(Manifest::new(metadata, entries))
+    }
+
+    /// Load manifest with column projection (Parquet manifests only).
+    ///
+    /// For Parquet manifests, only the specified columns are read from the file.
+    /// For Avro manifests, falls back to full read (Avro doesn't support projection).
+    ///
+    /// Planning projection (skips column_sizes, value_counts, nan_value_counts, key_metadata):
+    /// ```ignore
+    /// manifest_file.load_manifest_projected(file_io, &[
+    ///     "status", "snapshot_id", "sequence_number", "file_sequence_number",
+    ///     "content", "file_path", "file_format", "partition_json",
+    ///     "record_count", "file_size_in_bytes",
+    ///     "null_value_counts_json", "lower_bounds_json", "upper_bounds_json",
+    ///     "split_offsets_json", "equality_ids_json", "sort_order_id", "partition_spec_id",
+    /// ]).await?;
+    /// ```
+    pub async fn load_manifest_projected(
+        &self,
+        file_io: &FileIO,
+        columns: &[&str],
+    ) -> Result<Manifest> {
+        let bytes = file_io.new_input(&self.manifest_path)?.read().await?;
+
+        let (metadata, mut entries) = if self.manifest_path.ends_with(".parquet") {
+            super::manifest::parquet_manifest::read_parquet_manifest_projected(&bytes, columns)?
+        } else {
+            // Avro doesn't support projection — fall back to full read
+            Manifest::try_from_avro_bytes(&bytes)?
+        };
+
         for entry in &mut entries {
             entry.inherit_data(self);
         }

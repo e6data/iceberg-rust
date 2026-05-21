@@ -486,6 +486,49 @@ impl ManifestWriter {
             first_row_id: self.first_row_id,
         })
     }
+
+    /// Write manifest file in Parquet format and return it.
+    ///
+    /// Parquet manifests enable columnar projection during query planning —
+    /// the executor reads only the columns it needs (e.g., file_path + partition bounds)
+    /// without deserializing all column statistics.
+    pub async fn write_manifest_file_parquet(mut self) -> Result<ManifestFile> {
+        let partition_type = self
+            .metadata
+            .partition_spec
+            .partition_type(&self.metadata.schema)?;
+
+        let partition_summary = self.construct_partition_summaries(&partition_type)?;
+
+        let entries = std::mem::take(&mut self.manifest_entries);
+        let content = super::parquet_manifest::write_parquet_manifest(
+            &entries,
+            &self.metadata,
+            &partition_type,
+        )?;
+
+        let length = content.len();
+        self.output.write(Bytes::from(content)).await?;
+
+        Ok(ManifestFile {
+            manifest_path: self.output.location().to_string(),
+            manifest_length: length as i64,
+            partition_spec_id: self.metadata.partition_spec.spec_id(),
+            content: self.metadata.content,
+            sequence_number: UNASSIGNED_SEQUENCE_NUMBER,
+            min_sequence_number: self.min_seq_num.unwrap_or(UNASSIGNED_SEQUENCE_NUMBER),
+            added_snapshot_id: self.snapshot_id.unwrap_or(UNASSIGNED_SNAPSHOT_ID),
+            added_files_count: Some(self.added_files),
+            existing_files_count: Some(self.existing_files),
+            deleted_files_count: Some(self.deleted_files),
+            added_rows_count: Some(self.added_rows),
+            existing_rows_count: Some(self.existing_rows),
+            deleted_rows_count: Some(self.deleted_rows),
+            partitions: Some(partition_summary),
+            key_metadata: self.key_metadata,
+            first_row_id: self.first_row_id,
+        })
+    }
 }
 
 struct PartitionFieldStats {

@@ -265,7 +265,20 @@ impl RewriteManifestsAction {
                     writer.add_entry(existing)?;
                 }
 
-                let manifest_file = writer.write_manifest_file().await?;
+                // Match the format chosen for the file extension above
+                // (line ~232). The path was written as `.parquet` when
+                // use_parquet_manifests is true; we MUST use the parquet
+                // encoder here too, else we produce Avro-content files
+                // with a `.parquet` extension and downstream readers
+                // (lean-executor's iceberg-rust) fail with
+                // "Invalid Parquet file. Corrupt footer". Symmetric
+                // with the loop at lines 204-208 above, which already
+                // had this conditional.
+                let manifest_file = if use_parquet_manifests {
+                    writer.write_manifest_file_parquet().await?
+                } else {
+                    writer.write_manifest_file().await?
+                };
                 compacted_data_manifests.push(manifest_file);
             }
         }
@@ -537,7 +550,14 @@ impl TransactionAction for RewriteManifestsAction {
                     writer.add_entry(existing)?;
                 }
 
-                let manifest_file = writer.write_manifest_file().await?;
+                // Match the format chosen for the file extension above.
+                // See the matching fix in the Phase-1 compaction loop
+                // (~line 268) — same bug pattern, same fix.
+                let manifest_file = if use_parquet_manifests {
+                    writer.write_manifest_file_parquet().await?
+                } else {
+                    writer.write_manifest_file().await?
+                };
                 new_data_manifests.push(manifest_file);
             }
         }

@@ -727,8 +727,18 @@ impl Catalog for RestCatalog {
                 deserialize_catalog_response::<LoadTableResult>(http_response).await?
             }
             StatusCode::NOT_FOUND => {
+                // Definitive "table does not exist" from the catalog.
+                // Must surface as ErrorKind::TableNotFound so downstream
+                // classifiers (e.g. laminar's `is_definitely_table_not_found`,
+                // which trusts ErrorKind exclusively rather than string
+                // matching) can call create_table on cold-boot. Returning
+                // ErrorKind::Unexpected here makes consumers loop forever
+                // — see laminar PR with commit 6c713cd8 for the matching
+                // change on the consumer side. Mirrors the existing
+                // TableNotFound classification in commit_table's 404
+                // branch (~line 906).
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::TableNotFound,
                     "Tried to load a table that does not exist",
                 ));
             }
@@ -770,8 +780,13 @@ impl Catalog for RestCatalog {
 
         match http_response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
+            // Consistent with load_table — a 404 here is a definitive
+            // "table does not exist" response from the catalog, not an
+            // unknown failure mode. ErrorKind::TableNotFound lets callers
+            // treat this as a no-op (drop succeeded / target already
+            // gone) rather than indefinitely retrying.
             StatusCode::NOT_FOUND => Err(Error::new(
-                ErrorKind::Unexpected,
+                ErrorKind::TableNotFound,
                 "Tried to drop a table that does not exist",
             )),
             _ => Err(deserialize_unexpected_catalog_error(http_response).await),
@@ -2171,7 +2186,20 @@ mod tests {
             .await;
 
         assert!(table.is_err());
-        assert!(table.err().unwrap().message().contains("does not exist"));
+        let err = table.err().unwrap();
+        assert!(err.message().contains("does not exist"));
+        // Lock the ErrorKind — downstream classifiers (laminar's
+        // is_definitely_table_not_found and any other ErrorKind-based
+        // 404 detection) need TableNotFound, not Unexpected. Mirrors
+        // the existing TableNotFound mapping in commit_table's 404
+        // branch. Reverting to Unexpected here would silently break
+        // cold-boot create_table behavior in consumers.
+        assert_eq!(
+            err.kind(),
+            ErrorKind::TableNotFound,
+            "load_table on 404 must return ErrorKind::TableNotFound (so consumers can route to create_table); got {:?}",
+            err.kind()
+        );
 
         config_mock.assert_async().await;
         rename_table_mock.assert_async().await;

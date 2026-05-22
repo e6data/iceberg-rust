@@ -448,21 +448,13 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        // Partition-scoped manifests: default true for partitioned tables.
-        // Each tenant gets its own manifest with tight partition bounds,
-        // enabling 90%+ manifest-level pruning.
-        // Set write.manifest.partition-scoped=false to opt out.
-        let partition_scoped = {
-            let prop = self
-                .table
-                .metadata()
-                .properties()
-                .get("write.manifest.partition-scoped");
-            match prop.map(|v| v.as_str()) {
-                Some(v) if v.eq_ignore_ascii_case("false") => false,
-                _ => true,
-            }
-        };
+        let partition_scoped = self
+            .table
+            .metadata()
+            .properties()
+            .get("write.manifest.partition-scoped")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         if !partition_scoped {
             // Original behavior: single manifest for all files

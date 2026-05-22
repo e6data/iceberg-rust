@@ -276,15 +276,24 @@ impl<'a> SnapshotProducer<'a> {
 
     /// Whether this table should use Parquet manifests.
     ///
-    /// Opt-in via table property `write.parquet.metadata-codec = "parquet"`.
-    /// Avro remains the default for ecosystem compatibility (Spark, Trino, Flink).
+    /// Whether to write manifests as Parquet (default for V2+) or Avro.
+    ///
+    /// Parquet manifests enable columnar projection during query planning.
+    /// Default: Parquet for V2+ tables. Set `write.parquet.metadata-codec = avro`
+    /// to opt out for ecosystem compatibility (Spark, Trino, Flink).
     fn use_parquet_manifests(&self) -> bool {
-        self.table
+        let prop = self
+            .table
             .metadata()
             .properties()
-            .get("write.parquet.metadata-codec")
-            .map(|v| v.eq_ignore_ascii_case("parquet"))
-            .unwrap_or(false)
+            .get("write.parquet.metadata-codec");
+        match prop.map(|v| v.as_str()) {
+            Some(v) if v.eq_ignore_ascii_case("avro") => false,
+            _ => matches!(
+                self.table.metadata().format_version(),
+                FormatVersion::V2 | FormatVersion::V3
+            ),
+        }
     }
 
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {

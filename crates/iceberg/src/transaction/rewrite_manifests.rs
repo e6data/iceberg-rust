@@ -119,12 +119,13 @@ impl RewriteManifestsAction {
         let commit_uuid = Uuid::now_v7();
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
         let format_version = table.metadata().format_version();
-        let use_parquet_manifests = table
-            .metadata()
-            .properties()
-            .get("write.parquet.metadata-codec")
-            .map(|v| v.eq_ignore_ascii_case("parquet"))
-            .unwrap_or(false);
+        let use_parquet_manifests = {
+            let prop = table.metadata().properties().get("write.parquet.metadata-codec");
+            match prop.map(|v| v.as_str()) {
+                Some(v) if v.eq_ignore_ascii_case("avro") => false,
+                _ => matches!(format_version, FormatVersion::V2 | FormatVersion::V3),
+            }
+        };
         let schema = table.metadata().current_schema().clone();
 
         let mut compacted_data_manifests: Vec<ManifestFile> = Vec::new();
@@ -476,12 +477,13 @@ impl TransactionAction for RewriteManifestsAction {
         let commit_uuid = Uuid::now_v7();
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
         let format_version = table.metadata().format_version();
-        let use_parquet_manifests = table
-            .metadata()
-            .properties()
-            .get("write.parquet.metadata-codec")
-            .map(|v| v.eq_ignore_ascii_case("parquet"))
-            .unwrap_or(false);
+        let use_parquet_manifests = {
+            let prop = table.metadata().properties().get("write.parquet.metadata-codec");
+            match prop.map(|v| v.as_str()) {
+                Some(v) if v.eq_ignore_ascii_case("avro") => false,
+                _ => matches!(format_version, FormatVersion::V2 | FormatVersion::V3),
+            }
+        };
         let schema = table.metadata().current_schema().clone();
 
         let mut new_data_manifests: Vec<ManifestFile> = Vec::new();

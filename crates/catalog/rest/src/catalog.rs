@@ -754,8 +754,16 @@ impl Catalog for RestCatalog {
             .chain(self.user_config.props.clone())
             .collect();
 
+        // Prefer metadata_location from the response; fall back to the table
+        // metadata's location (a required field in the Iceberg spec) when the
+        // catalog omits metadata-location — e.g. Snowflake Polaris drops it
+        // from the load-table response when `?snapshots=refs` is set.
+        let effective_location = response
+            .metadata_location
+            .as_deref()
+            .or_else(|| Some(response.metadata.location()));
         let file_io = self
-            .load_file_io(response.metadata_location.as_deref(), Some(config))
+            .load_file_io(effective_location, Some(config))
             .await?;
 
         let table_builder = Table::builder()

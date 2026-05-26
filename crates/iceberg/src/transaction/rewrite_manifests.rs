@@ -57,6 +57,10 @@ use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdat
 pub struct RewriteManifestsAction {
     /// Target number of entries per output manifest.
     target_entries_per_manifest: usize,
+    /// When true, skip manifests that fail to load (e.g. 404 on S3) instead
+    /// of aborting. Live data files from valid manifests are preserved;
+    /// broken manifests are dropped from the rewritten manifest list.
+    skip_missing_manifests: bool,
 }
 
 impl RewriteManifestsAction {
@@ -64,12 +68,21 @@ impl RewriteManifestsAction {
     pub fn new() -> Self {
         Self {
             target_entries_per_manifest: 1000,
+            skip_missing_manifests: false,
         }
     }
 
     /// Set the target number of entries per output manifest.
     pub fn target_entries_per_manifest(mut self, n: usize) -> Self {
         self.target_entries_per_manifest = n;
+        self
+    }
+
+    /// When enabled, manifests that cannot be loaded (missing from storage,
+    /// corrupt, etc.) are silently skipped. All live data files from
+    /// readable manifests are preserved in the rewritten output.
+    pub fn skip_missing_manifests(mut self, skip: bool) -> Self {
+        self.skip_missing_manifests = skip;
         self
     }
 
@@ -145,8 +158,22 @@ impl RewriteManifestsAction {
         };
         let _ = flush_buffer; // suppress unused
 
+        let mut skipped_manifests = 0u64;
+
         for mf in &data_manifests {
-            let manifest = mf.load_manifest(table.file_io()).await?;
+            let manifest = match mf.load_manifest(table.file_io()).await {
+                Ok(m) => m,
+                Err(e) if self.skip_missing_manifests => {
+                    skipped_manifests += 1;
+                    eprintln!(
+                        "WARN: Skipping unreadable manifest {}: {}",
+                        mf.manifest_path,
+                        e,
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for entry in manifest.entries() {
                 if entry.is_alive() {
                     let spec_id = entry.data_file().partition_spec_id;
@@ -212,6 +239,14 @@ impl RewriteManifestsAction {
             }
             // Each manifest's entries are consumed into buffers and the
             // loaded Manifest is dropped here — bounded memory.
+        }
+
+        if skipped_manifests > 0 {
+            eprintln!(
+                "INFO: Manifest rewrite: skipped {} broken manifests out of {} total data manifests",
+                skipped_manifests,
+                data_manifests.len(),
+            );
         }
 
         // Flush remaining entries in all spec buffers
@@ -476,7 +511,17 @@ impl TransactionAction for RewriteManifestsAction {
 
         let mut entries_by_spec: HashMap<i32, Vec<ManifestEntry>> = HashMap::new();
         for mf in &data_manifests {
-            let manifest = mf.load_manifest(table.file_io()).await?;
+            let manifest = match mf.load_manifest(table.file_io()).await {
+                Ok(m) => m,
+                Err(e) if self.skip_missing_manifests => {
+                    eprintln!(
+                        "WARN: Skipping unreadable manifest {}: {}",
+                        mf.manifest_path, e,
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for entry in manifest.entries() {
                 if entry.is_alive() {
                     entries_by_spec

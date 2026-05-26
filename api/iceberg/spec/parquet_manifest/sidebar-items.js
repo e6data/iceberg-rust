@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["encode_manifest_metadata","manifest_arrow_schema","read_parquet_manifest","read_parquet_manifest_projected","write_parquet_manifest"]};

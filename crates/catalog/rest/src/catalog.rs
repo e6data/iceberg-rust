@@ -866,9 +866,14 @@ impl Catalog for RestCatalog {
             .into_iter()
             .chain(self.user_config.props.clone())
             .collect();
-
+        
+        let effective_location = response
+            .metadata_location
+            .as_deref()
+            .or_else(|| Some(response.metadata.location()));
+        
         let file_io = self
-            .load_file_io(response.metadata_location.as_deref(), Some(config))
+            .load_file_io(effective_location, Some(config))
             .await?;
 
         let table_builder = Table::builder()

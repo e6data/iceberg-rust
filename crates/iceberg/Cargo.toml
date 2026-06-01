@@ -57,6 +57,7 @@ async-trait = { workspace = true }
 backon = { workspace = true }
 base64 = { workspace = true }
 bimap = { workspace = true }
+log = "0.4"
 bytes = { workspace = true }
 chrono = { workspace = true }
 derive_builder = { workspace = true }

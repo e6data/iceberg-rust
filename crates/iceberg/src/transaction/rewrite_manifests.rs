@@ -61,6 +61,19 @@ pub struct RewriteManifestsAction {
     /// of aborting. Live data files from valid manifests are preserved;
     /// broken manifests are dropped from the rewritten manifest list.
     skip_missing_manifests: bool,
+    /// Caller-provided override for the new snapshot's id. Mirrors
+    /// `FastAppendAction.with_snapshot_id` and
+    /// `ReplaceDataFilesAction.with_snapshot_id`. Set via
+    /// [`Self::with_snapshot_id`]; pair with
+    /// [`crate::transaction::generate_unique_snapshot_id`] to pre-allocate
+    /// an id the caller can also use in `StatisticsFile` entries within
+    /// the same transaction (manifest compaction is a metadata-only
+    /// rewrite, so per-snapshot Puffin stats from the parent stay valid
+    /// and should be carried forward under the new snapshot id — otherwise
+    /// the executor's `metadata.statistics_for_snapshot(current)` returns
+    /// None on the compaction snapshot and the label_values fast path
+    /// falls back to a parquet scan until the next FastAppend lands).
+    snapshot_id_override: Option<i64>,
 }
 
 impl RewriteManifestsAction {
@@ -69,6 +82,7 @@ impl RewriteManifestsAction {
         Self {
             target_entries_per_manifest: 1000,
             skip_missing_manifests: false,
+            snapshot_id_override: None,
         }
     }
 
@@ -83,6 +97,22 @@ impl RewriteManifestsAction {
     /// readable manifests are preserved in the rewritten output.
     pub fn skip_missing_manifests(mut self, skip: bool) -> Self {
         self.skip_missing_manifests = skip;
+        self
+    }
+
+    /// Pre-allocate the new snapshot's id, overriding the random id that
+    /// `execute()` / `commit()` would otherwise generate. Mirror of
+    /// [`super::append::FastAppendAction::with_snapshot_id`] and
+    /// [`super::replace_data_files::ReplaceDataFilesAction::with_snapshot_id`];
+    /// same use case (referencing the snapshot_id elsewhere in the same
+    /// transaction — most commonly to attach carry-forward `StatisticsFile`
+    /// entries to the new compaction snapshot so per-snapshot Puffin
+    /// stats don't orphan).
+    ///
+    /// Pair with [`crate::transaction::generate_unique_snapshot_id`] to
+    /// generate the id before the action is built.
+    pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id_override = Some(snapshot_id);
         self
     }
 
@@ -130,10 +160,18 @@ impl RewriteManifestsAction {
         // in flight, plus one manifest's entries being loaded.
 
         let commit_uuid = Uuid::now_v7();
-        let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
+        // Use caller-provided override when present (lets the caller pre-key
+        // a carry-forward StatisticsFile entry to the same snapshot id we'll
+        // commit here). Falls back to the random id otherwise.
+        let snapshot_id = self
+            .snapshot_id_override
+            .unwrap_or_else(|| SnapshotProducer::generate_unique_snapshot_id_static(table));
         let format_version = table.metadata().format_version();
         let use_parquet_manifests = {
-            let prop = table.metadata().properties().get("write.parquet.metadata-codec");
+            let prop = table
+                .metadata()
+                .properties()
+                .get("write.parquet.metadata-codec");
             match prop.map(|v| v.as_str()) {
                 Some(v) if v.eq_ignore_ascii_case("avro") => false,
                 _ => matches!(format_version, FormatVersion::V2 | FormatVersion::V3),
@@ -152,7 +190,9 @@ impl RewriteManifestsAction {
                             spec_id: i32,
                             counter: &mut u64,
                             output: &mut Vec<ManifestFile>|
-         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+         -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
+        > {
             // Can't use async closure, so we'll flush inline below
             Box::pin(async { Ok(()) })
         };
@@ -167,8 +207,7 @@ impl RewriteManifestsAction {
                     skipped_manifests += 1;
                     eprintln!(
                         "WARN: Skipping unreadable manifest {}: {}",
-                        mf.manifest_path,
-                        e,
+                        mf.manifest_path, e,
                     );
                     continue;
                 }
@@ -182,17 +221,22 @@ impl RewriteManifestsAction {
 
                     // Flush when buffer reaches target size
                     if buffer.len() >= self.target_entries_per_manifest {
-                        let spec = table
-                            .metadata()
-                            .partition_spec_by_id(spec_id)
-                            .ok_or_else(|| {
-                                Error::new(
-                                    ErrorKind::DataInvalid,
-                                    format!("partition spec {spec_id} not found"),
-                                )
-                            })?;
+                        let spec =
+                            table
+                                .metadata()
+                                .partition_spec_by_id(spec_id)
+                                .ok_or_else(|| {
+                                    Error::new(
+                                        ErrorKind::DataInvalid,
+                                        format!("partition spec {spec_id} not found"),
+                                    )
+                                })?;
 
-                        let ext = if use_parquet_manifests { "parquet" } else { "avro" };
+                        let ext = if use_parquet_manifests {
+                            "parquet"
+                        } else {
+                            "avro"
+                        };
                         let manifest_path = format!(
                             "{}/metadata/{}-m{}.{}",
                             table.metadata().location(),
@@ -264,7 +308,11 @@ impl RewriteManifestsAction {
                     )
                 })?;
 
-            let ext_m = if use_parquet_manifests { "parquet" } else { "avro" };
+            let ext_m = if use_parquet_manifests {
+                "parquet"
+            } else {
+                "avro"
+            };
             for chunk in entries.chunks(self.target_entries_per_manifest) {
                 let manifest_path = format!(
                     "{}/metadata/{}-m{}.{}",
@@ -533,10 +581,18 @@ impl TransactionAction for RewriteManifestsAction {
         }
 
         let commit_uuid = Uuid::now_v7();
-        let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
+        // Use caller-provided override when present; see the same branch
+        // in `execute()` above for rationale (carry-forward StatisticsFile
+        // entries keyed to the pre-allocated snapshot id).
+        let snapshot_id = self
+            .snapshot_id_override
+            .unwrap_or_else(|| SnapshotProducer::generate_unique_snapshot_id_static(table));
         let format_version = table.metadata().format_version();
         let use_parquet_manifests = {
-            let prop = table.metadata().properties().get("write.parquet.metadata-codec");
+            let prop = table
+                .metadata()
+                .properties()
+                .get("write.parquet.metadata-codec");
             match prop.map(|v| v.as_str()) {
                 Some(v) if v.eq_ignore_ascii_case("avro") => false,
                 _ => matches!(format_version, FormatVersion::V2 | FormatVersion::V3),
@@ -558,7 +614,11 @@ impl TransactionAction for RewriteManifestsAction {
                     )
                 })?;
 
-            let ext_m = if use_parquet_manifests { "parquet" } else { "avro" };
+            let ext_m = if use_parquet_manifests {
+                "parquet"
+            } else {
+                "avro"
+            };
             for chunk in entries.chunks(self.target_entries_per_manifest) {
                 let manifest_path = format!(
                     "{}/metadata/{}-m{}.{}",
@@ -695,5 +755,52 @@ impl TransactionAction for RewriteManifestsAction {
         ];
 
         Ok(ActionCommit::new(updates, requirements))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::transaction::Transaction;
+    use crate::transaction::rewrite_manifests::RewriteManifestsAction;
+
+    /// Mirrors `append::tests::test_with_snapshot_id_overrides_random_generation`.
+    ///
+    /// The `execute()` / `commit()` paths both require live catalog or S3
+    /// IO (loading the manifest list, etc.) which a unit test can't supply,
+    /// so we verify the override is plumbed onto the action struct. Both
+    /// commit paths consume `self.snapshot_id_override` directly — see
+    /// the `unwrap_or_else` branches at the top of `execute()` and the
+    /// `TransactionAction::commit()` impl.
+    #[test]
+    fn test_with_snapshot_id_overrides_random_generation() {
+        use crate::transaction::generate_unique_snapshot_id;
+        use crate::transaction::tests::make_v2_table;
+
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+
+        // Pre-allocate the snapshot_id the caller wants the commit to use.
+        // This is the pattern laminar's maintenance loop uses to attach a
+        // carry-forward StatisticsFile entry under the same snapshot id
+        // the rewrite-manifests action will land.
+        let snapshot_id = generate_unique_snapshot_id(&table);
+
+        let action = tx.rewrite_manifests().with_snapshot_id(snapshot_id);
+
+        assert_eq!(
+            Some(snapshot_id),
+            action.snapshot_id_override,
+            "RewriteManifestsAction.with_snapshot_id must store the override so \
+             execute()/commit() can adopt it instead of generating a fresh random id"
+        );
+    }
+
+    #[test]
+    fn test_default_has_no_snapshot_id_override() {
+        let action = RewriteManifestsAction::new();
+        assert!(
+            action.snapshot_id_override.is_none(),
+            "default RewriteManifestsAction must not pin a snapshot id"
+        );
     }
 }

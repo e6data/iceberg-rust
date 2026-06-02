@@ -57,6 +57,7 @@ mod append;
 mod replace_data_files;
 mod rewrite_manifests;
 mod snapshot;
+pub use snapshot::generate_unique_snapshot_id;
 mod sort_order;
 mod update_location;
 mod update_properties;

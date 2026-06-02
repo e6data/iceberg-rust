@@ -32,6 +32,19 @@ use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
+/// Generate a snapshot_id that is guaranteed not to collide with any existing
+/// snapshot on `table`. Use this when you need to know the snapshot_id of a
+/// commit *before* it runs — for example, to attach `StatisticsFile` entries
+/// to the same snapshot the commit will create.
+///
+/// Pair with [`FastAppendAction::with_snapshot_id`](super::append::FastAppendAction::with_snapshot_id)
+/// to ensure the action commits under the pre-allocated id rather than
+/// generating a fresh one. Without that pairing, the action will still
+/// allocate its own id and the values will diverge.
+pub fn generate_unique_snapshot_id(table: &Table) -> i64 {
+    SnapshotProducer::generate_unique_snapshot_id_static(table)
+}
+
 const META_ROOT_PATH: &str = "metadata";
 
 /// Extract a string key from the first partition field value for grouping.
@@ -161,6 +174,16 @@ impl<'a> SnapshotProducer<'a> {
 
     pub(crate) fn with_removed_data_files(mut self, files: Vec<DataFile>) -> Self {
         self.removed_data_files = files;
+        self
+    }
+
+    /// Override the auto-generated snapshot_id with a caller-provided one.
+    /// Used by actions (e.g. `FastAppendAction.with_snapshot_id`) that need
+    /// the snapshot_id to be knowable *before* the commit runs — for example,
+    /// when registering `StatisticsFile` entries that reference this snapshot
+    /// within the same transaction.
+    pub(crate) fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = snapshot_id;
         self
     }
 
@@ -294,7 +317,11 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
-        let ext = if self.use_parquet_manifests() { "parquet" } else { "avro" };
+        let ext = if self.use_parquet_manifests() {
+            "parquet"
+        } else {
+            "avro"
+        };
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
             self.table.metadata().location(),
@@ -605,9 +632,7 @@ impl<'a> SnapshotProducer<'a> {
         //
         // This eliminates the need for external manifest rewriting (Tessellate)
         // and keeps the manifest count bounded regardless of commit frequency.
-        let manifest_files = self
-            .merge_manifests_if_needed(manifest_files)
-            .await?;
+        let manifest_files = self.merge_manifests_if_needed(manifest_files).await?;
 
         Ok(manifest_files)
     }
@@ -755,8 +780,7 @@ impl<'a> SnapshotProducer<'a> {
             log::info!(
                 "manifest merge: {} manifests → 1 ({} entries, {} bytes)",
                 bin.len(),
-                merged.added_files_count.unwrap_or(0)
-                    + merged.existing_files_count.unwrap_or(0),
+                merged.added_files_count.unwrap_or(0) + merged.existing_files_count.unwrap_or(0),
                 merged.manifest_length,
             );
 

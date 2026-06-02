@@ -50,6 +50,14 @@ pub struct ReplaceDataFilesAction {
     /// Cached manifest result from the first commit attempt.
     /// On retry, reuse this to skip re-reading all manifests from S3.
     cached_manifests: Arc<Mutex<Option<Vec<ManifestFile>>>>,
+    /// Caller-provided override for the new snapshot's id. Mirrors
+    /// `FastAppendAction.with_snapshot_id`. Set via
+    /// [`Self::with_snapshot_id`]; pair with
+    /// [`crate::transaction::generate_unique_snapshot_id`] to pre-allocate
+    /// an id the caller can also use in `StatisticsFile` entries within
+    /// the same transaction (e.g. for compaction carry-forward of
+    /// per-snapshot Puffin stats).
+    snapshot_id_override: Option<i64>,
 }
 
 impl ReplaceDataFilesAction {
@@ -65,6 +73,7 @@ impl ReplaceDataFilesAction {
             data_sequence_number: None,
             added_delete_files: Vec::new(),
             cached_manifests: Arc::new(Mutex::new(None)),
+            snapshot_id_override: None,
         }
     }
 
@@ -129,12 +138,27 @@ impl ReplaceDataFilesAction {
         self.added_delete_files = files;
         self
     }
+
+    /// Pre-allocate the new snapshot's id, overriding the random id that
+    /// `commit()` would otherwise generate. Mirror of
+    /// [`super::append::FastAppendAction::with_snapshot_id`]; same use case
+    /// (referencing the snapshot_id elsewhere in the same transaction —
+    /// most commonly to attach carry-forward `StatisticsFile` entries to
+    /// the new snapshot in a compaction commit so per-snapshot Puffin
+    /// stats don't orphan).
+    ///
+    /// Pair with [`crate::transaction::generate_unique_snapshot_id`] to
+    /// generate the id before the action is built.
+    pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id_override = Some(snapshot_id);
+        self
+    }
 }
 
 #[async_trait]
 impl TransactionAction for ReplaceDataFilesAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        let snapshot_producer = SnapshotProducer::new(
+        let mut snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             self.key_metadata.clone(),
@@ -144,6 +168,10 @@ impl TransactionAction for ReplaceDataFilesAction {
         )
         .with_removed_data_files(self.files_to_delete.clone())
         .with_data_sequence_number(self.data_sequence_number);
+
+        if let Some(id) = self.snapshot_id_override {
+            snapshot_producer = snapshot_producer.with_snapshot_id(id);
+        }
 
         // Validate added data files if any
         if !self.files_to_add.is_empty() {

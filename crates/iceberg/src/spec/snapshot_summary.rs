@@ -502,14 +502,14 @@ fn update_totals(
         .get(added_property)
         .map(|value| value.parse::<u64>().unwrap())
     {
-        new_total = new_total.saturating_add(value);
+        new_total += value;
     }
     if let Some(value) = summary
         .additional_properties
         .get(removed_property)
         .map(|value| value.parse::<u64>().unwrap())
     {
-        new_total = new_total.saturating_sub(value);
+        new_total -= value;
     }
     summary
         .additional_properties

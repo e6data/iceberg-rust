@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,82 +25,45 @@ use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Result, TableUpdate};
 
-/// A transactional action for updating statistics files in a table.
-///
-/// The Iceberg spec models a table's `statistics` field as a *list* of
-/// [`StatisticsFile`] entries with `(snapshot_id, statistics_path)` as
-/// the unique key — multiple entries with the same `snapshot_id` are
-/// allowed when their paths differ. Tessellate's compaction commit path
-/// relies on this: each chunk replaces ~25 source files with ~25
-/// compacted outputs, each carrying its own Puffin sidecar (one
-/// `StatisticsFile` per output, sharing the new snapshot id but with
-/// distinct paths).
-///
-/// The previous implementation kept `statistics_to_set` as
-/// `HashMap<i64, Option<StatisticsFile>>` keyed on `snapshot_id`, which
-/// silently collapsed multiple calls with the same snapshot id to the
-/// last-write-wins. That was too narrow for the spec and caused
-/// tessellate to lose blobs at commit time: log lines showed 25
-/// `set_statistics` calls per chunk while the catalog persisted 1.
-///
-/// Storage is now a `Vec` for `set_statistics` (preserves order +
-/// duplicates per spec) plus a `HashSet` for `remove_statistics`
-/// (which still applies to *all* entries for a snapshot — removal is
-/// snapshot-keyed in the existing semantics; callers that need
-/// per-path removal can issue a finer-grained TableUpdate themselves).
+/// A transactional action for updating statistics files in a table
 pub struct UpdateStatisticsAction {
-    statistics_to_set: Vec<StatisticsFile>,
-    statistics_to_remove: HashSet<i64>,
+    statistics_to_set: HashMap<i64, Option<StatisticsFile>>,
 }
 
 impl UpdateStatisticsAction {
     pub fn new() -> Self {
         Self {
-            statistics_to_set: Vec::new(),
-            statistics_to_remove: HashSet::new(),
+            statistics_to_set: HashMap::default(),
         }
     }
 
-    /// Append a statistics file to the table's `statistics` list.
-    ///
-    /// Per the Iceberg spec, multiple `StatisticsFile` entries may
-    /// share the same `snapshot_id` as long as their `statistics_path`
-    /// differs. Callers chain this method once per file they want to
-    /// register; previous calls are NOT overwritten by later ones with
-    /// the same snapshot id.
+    /// Set the table's statistics file for given snapshot, replacing the previous statistics file for
+    /// the snapshot if any exists. The snapshot id of the statistics file will be used.
     ///
     /// # Arguments
     ///
-    /// * `statistics_file` - The [`StatisticsFile`] to register.
+    /// * `statistics_file` - The [`StatisticsFile`] to associate with its corresponding snapshot ID.
     ///
     /// # Returns
     ///
-    /// An updated [`UpdateStatisticsAction`] with the new statistics
-    /// file appended.
+    /// An updated [`UpdateStatisticsAction`] with the new statistics file applied.
     pub fn set_statistics(mut self, statistics_file: StatisticsFile) -> Self {
-        self.statistics_to_set.push(statistics_file);
+        self.statistics_to_set
+            .insert(statistics_file.snapshot_id, Some(statistics_file));
         self
     }
 
-    /// Remove all statistics file entries for the given snapshot.
-    ///
-    /// Removal is keyed by snapshot id — every `StatisticsFile` whose
-    /// `snapshot_id` matches is dropped, regardless of path. Mirrors
-    /// the previous behaviour. Calling this *after* `set_statistics`
-    /// for the same snapshot id will, at commit time, both add the
-    /// new entry AND emit a remove for the snapshot; the catalog
-    /// semantics decide ordering.
+    /// Remove the table's statistics file for given snapshot.
     ///
     /// # Arguments
     ///
-    /// * `snapshot_id` - The ID of the snapshot whose statistics
-    ///   entries should be removed.
+    /// * `snapshot_id` - The ID of the snapshot whose statistics file should be removed.
     ///
     /// # Returns
     ///
-    /// An updated [`UpdateStatisticsAction`] with the removal recorded.
+    /// An updated [`UpdateStatisticsAction`] with the removal operation recorded.
     pub fn remove_statistics(mut self, snapshot_id: i64) -> Self {
-        self.statistics_to_remove.insert(snapshot_id);
+        self.statistics_to_set.insert(snapshot_id, None);
         self
     }
 }
@@ -114,19 +77,21 @@ impl Default for UpdateStatisticsAction {
 #[async_trait]
 impl TransactionAction for UpdateStatisticsAction {
     async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
-        let mut updates: Vec<TableUpdate> =
-            Vec::with_capacity(self.statistics_to_set.len() + self.statistics_to_remove.len());
+        let mut updates: Vec<TableUpdate> = vec![];
 
-        for statistics in &self.statistics_to_set {
-            updates.push(TableUpdate::SetStatistics {
-                statistics: statistics.clone(),
+        self.statistics_to_set
+            .iter()
+            .for_each(|(snapshot_id, statistic_file)| {
+                if let Some(statistics) = statistic_file {
+                    updates.push(TableUpdate::SetStatistics {
+                        statistics: statistics.clone(),
+                    })
+                } else {
+                    updates.push(TableUpdate::RemoveStatistics {
+                        snapshot_id: *snapshot_id,
+                    })
+                }
             });
-        }
-        for snapshot_id in &self.statistics_to_remove {
-            updates.push(TableUpdate::RemoveStatistics {
-                snapshot_id: *snapshot_id,
-            });
-        }
 
         Ok(ActionCommit::new(updates, vec![]))
     }
@@ -178,7 +143,7 @@ mod tests {
             }],
         };
 
-        // set stats1, set stats2, remove stats1
+        // set stats1
         let tx = tx
             .update_statistics()
             .set_statistics(statistics_file_1.clone())
@@ -190,26 +155,20 @@ mod tests {
         let action = (*tx.actions[0])
             .downcast_ref::<UpdateStatisticsAction>()
             .unwrap();
-        // Both `set_statistics` calls are recorded — stats1 and stats2
-        // both land in `statistics_to_set` (the catalog applies the
-        // remove on top per the TableUpdate ordering committed below).
-        assert_eq!(action.statistics_to_set.len(), 2);
         assert!(
             action
                 .statistics_to_set
-                .iter()
-                .any(|sf| *sf == statistics_file_1)
-        );
-        assert!(
+                .get(&statistics_file_1.snapshot_id)
+                .unwrap()
+                .is_none()
+        ); // stats1 should have been removed
+        assert_eq!(
             action
                 .statistics_to_set
-                .iter()
-                .any(|sf| *sf == statistics_file_2)
-        );
-        assert!(
-            action
-                .statistics_to_remove
-                .contains(&3055729675574597004i64)
+                .get(&statistics_file_2.snapshot_id)
+                .unwrap()
+                .clone(),
+            Some(statistics_file_2)
         );
     }
 
@@ -239,50 +198,14 @@ mod tests {
             .unwrap();
 
         // Verify that the statistics file is set correctly
-        assert_eq!(action.statistics_to_set.len(), 1);
-        assert_eq!(action.statistics_to_set[0], statistics_file);
-    }
-
-    #[test]
-    fn test_set_multiple_statistics_same_snapshot() {
-        // Regression guard. Per spec, multiple StatisticsFile entries
-        // may share a snapshot_id as long as paths differ -- e.g.
-        // tessellate's chunk commit registers one Puffin per compacted
-        // file, all sharing the new snapshot id. The previous
-        // HashMap<snapshot_id, _> storage silently collapsed these
-        // to one (last-write-wins), losing 24-of-25 entries per chunk.
-        let table = make_v2_table();
-        let tx = Transaction::new(&table);
-        let snapshot_id = 9876543210i64;
-        let mk = |path: &str| StatisticsFile {
-            snapshot_id,
-            statistics_path: path.to_string(),
-            file_size_in_bytes: 100,
-            file_footer_size_in_bytes: 10,
-            key_metadata: None,
-            blob_metadata: vec![],
-        };
-
-        let tx = tx
-            .update_statistics()
-            .set_statistics(mk("s3://a/b/p1.puffin"))
-            .set_statistics(mk("s3://a/b/p2.puffin"))
-            .set_statistics(mk("s3://a/b/p3.puffin"))
-            .apply(tx)
-            .unwrap();
-
-        let action = (*tx.actions[0])
-            .downcast_ref::<UpdateStatisticsAction>()
-            .unwrap();
-        assert_eq!(action.statistics_to_set.len(), 3);
-        let paths: Vec<&str> = action
-            .statistics_to_set
-            .iter()
-            .map(|s| s.statistics_path.as_str())
-            .collect();
-        assert!(paths.contains(&"s3://a/b/p1.puffin"));
-        assert!(paths.contains(&"s3://a/b/p2.puffin"));
-        assert!(paths.contains(&"s3://a/b/p3.puffin"));
+        assert_eq!(
+            action
+                .statistics_to_set
+                .get(&statistics_file.snapshot_id)
+                .unwrap()
+                .clone(),
+            Some(statistics_file)
+        );
     }
 
     #[test]
@@ -299,6 +222,5 @@ mod tests {
 
         // Verify that no statistics are set
         assert!(action.statistics_to_set.is_empty());
-        assert!(action.statistics_to_remove.is_empty());
     }
 }

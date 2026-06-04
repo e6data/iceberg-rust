@@ -502,14 +502,14 @@
 <a href=#502 id=502 data-nosnippet>502</a>        .get(added_property)
 <a href=#503 id=503 data-nosnippet>503</a>        .map(|value| value.parse::&lt;u64&gt;().unwrap())
 <a href=#504 id=504 data-nosnippet>504</a>    {
-<a href=#505 id=505 data-nosnippet>505</a>        new_total += value;
+<a href=#505 id=505 data-nosnippet>505</a>        new_total = new_total.saturating_add(value);
 <a href=#506 id=506 data-nosnippet>506</a>    }
 <a href=#507 id=507 data-nosnippet>507</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(value) = summary
 <a href=#508 id=508 data-nosnippet>508</a>        .additional_properties
 <a href=#509 id=509 data-nosnippet>509</a>        .get(removed_property)
 <a href=#510 id=510 data-nosnippet>510</a>        .map(|value| value.parse::&lt;u64&gt;().unwrap())
 <a href=#511 id=511 data-nosnippet>511</a>    {
-<a href=#512 id=512 data-nosnippet>512</a>        new_total -= value;
+<a href=#512 id=512 data-nosnippet>512</a>        new_total = new_total.saturating_sub(value);
 <a href=#513 id=513 data-nosnippet>513</a>    }
 <a href=#514 id=514 data-nosnippet>514</a>    summary
 <a href=#515 id=515 data-nosnippet>515</a>        .additional_properties

@@ -24,9 +24,12 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
-    TableProperties, update_snapshot_summaries,
+    ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter, ManifestWriterBuilder,
+    Operation, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
+    StructType, Summary, TableProperties, update_snapshot_summaries,
+};
+use crate::spec::root_manifest::{
+    RootManifestEntry, RootManifestMetadata, read_root_manifest, write_root_manifest,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -883,6 +886,11 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<ActionCommit> {
+        // V4 uses root manifest (single-file commit) instead of manifest list
+        if self.table.metadata().format_version() == FormatVersion::V4 {
+            return self.commit_v4(snapshot_produce_operation, process).await;
+        }
+
         let manifest_list_path = self.generate_manifest_list_file_path(0);
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
@@ -976,5 +984,152 @@ impl<'a> SnapshotProducer<'a> {
         ];
 
         Ok(ActionCommit::new(updates, requirements).with_manifest_paths(created_manifest_paths))
+    }
+
+    /// V4 commit path: writes a single root manifest instead of manifest files + manifest list.
+    ///
+    /// For append operations, new data files are inlined directly in the root manifest.
+    /// Existing manifest references from the current snapshot are carried forward unchanged.
+    /// This reduces commit overhead from 3+ S3 PUTs to 1 PUT + 1 CAS.
+    async fn commit_v4<OP: SnapshotProduceOperation, MP: ManifestProcess>(
+        &mut self,
+        snapshot_produce_operation: OP,
+        _process: MP,
+    ) -> Result<ActionCommit> {
+        let next_seq_num = self.table.metadata().next_sequence_number();
+
+        // Generate summary before draining added_data_files
+        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
+            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
+        })?;
+
+        // Load existing root manifest entries from current snapshot
+        let mut entries: Vec<RootManifestEntry> = if let Some(current_snapshot) =
+            self.table.metadata().current_snapshot()
+        {
+            let manifest_list_path = current_snapshot.manifest_list();
+            let bytes = self
+                .table
+                .file_io()
+                .new_input(manifest_list_path)?
+                .read()
+                .await?;
+
+            // Try reading as root manifest; fall back to manifest list for upgrade path
+            match read_root_manifest(&bytes) {
+                Ok((_, existing_entries)) => existing_entries,
+                Err(_) => {
+                    // Upgrading from V3: convert manifest list entries to manifest refs
+                    let manifest_list = crate::spec::ManifestList::parse_with_version(
+                        &bytes,
+                        FormatVersion::V3,
+                    )?;
+                    manifest_list
+                        .entries()
+                        .iter()
+                        .map(|mf| RootManifestEntry::ManifestRef {
+                            manifest_file: mf.clone(),
+                            mdv: None,
+                        })
+                        .collect()
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        // Add new data files as inline entries
+        let added_data_files = std::mem::take(&mut self.added_data_files);
+        for df in added_data_files {
+            entries.push(RootManifestEntry::Inline(ManifestEntry {
+                status: ManifestStatus::Added,
+                snapshot_id: Some(self.snapshot_id),
+                sequence_number: Some(next_seq_num),
+                file_sequence_number: Some(next_seq_num),
+                data_file: df,
+            }));
+        }
+
+        // Add new delete files as inline entries
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        for df in added_delete_files {
+            entries.push(RootManifestEntry::Inline(ManifestEntry {
+                status: ManifestStatus::Added,
+                snapshot_id: Some(self.snapshot_id),
+                sequence_number: Some(next_seq_num),
+                file_sequence_number: Some(next_seq_num),
+                data_file: df,
+            }));
+        }
+
+        // Build root manifest metadata
+        let partition_type = self
+            .table
+            .metadata()
+            .default_partition_spec()
+            .partition_type(self.table.metadata().current_schema())?;
+
+        let rm_metadata = RootManifestMetadata {
+            schema: self.table.metadata().current_schema().clone(),
+            schema_id: self.table.metadata().current_schema_id(),
+            partition_spec: self.table.metadata().default_partition_spec().clone(),
+            format_version: FormatVersion::V4,
+            snapshot_id: self.snapshot_id,
+            sequence_number: next_seq_num,
+            parent_snapshot_id: self.table.metadata().current_snapshot_id(),
+        };
+
+        // Write root manifest as single Parquet file
+        let root_manifest_path = format!(
+            "{}/{}/root-{}-{}.parquet",
+            self.table.metadata().location(),
+            META_ROOT_PATH,
+            self.snapshot_id,
+            self.commit_uuid,
+        );
+
+        let bytes = write_root_manifest(&entries, &rm_metadata, &partition_type)?;
+        self.table
+            .file_io()
+            .new_output(&root_manifest_path)?
+            .write(bytes.into())
+            .await?;
+
+        // Create snapshot — reuses manifest_list field for root manifest path
+        let commit_ts = chrono::Utc::now().timestamp_millis();
+        let new_snapshot = Snapshot::builder()
+            .with_manifest_list(root_manifest_path.clone())
+            .with_snapshot_id(self.snapshot_id)
+            .with_parent_snapshot_id(self.table.metadata().current_snapshot_id())
+            .with_sequence_number(next_seq_num)
+            .with_summary(summary)
+            .with_schema_id(self.table.metadata().current_schema_id())
+            .with_timestamp_ms(commit_ts)
+            .build();
+
+        let updates = vec![
+            TableUpdate::AddSnapshot {
+                snapshot: new_snapshot,
+            },
+            TableUpdate::SetSnapshotRef {
+                ref_name: MAIN_BRANCH.to_string(),
+                reference: SnapshotReference::new(
+                    self.snapshot_id,
+                    SnapshotRetention::branch(None, None, None),
+                ),
+            },
+        ];
+
+        let requirements = vec![
+            TableRequirement::UuidMatch {
+                uuid: self.table.metadata().uuid(),
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: MAIN_BRANCH.to_string(),
+                snapshot_id: self.table.metadata().current_snapshot_id(),
+            },
+        ];
+
+        Ok(ActionCommit::new(updates, requirements).with_manifest_paths(vec![root_manifest_path]))
     }
 }

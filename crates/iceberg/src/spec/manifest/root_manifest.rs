@@ -20,6 +20,13 @@
 //! A root manifest is a single Parquet file that replaces the manifest list in v4.
 //! It can contain both manifest references (pointing to child manifest files) and
 //! inline data/delete file entries, enabling single-file commits for small writes.
+//!
+//! The file uses a two-section layout with two Parquet row groups:
+//! - Row group 0: manifest references (17 columns)
+//! - Row group 1: inline entries (21 columns, same schema as parquet_manifest.rs)
+//!
+//! File-level metadata includes `root-manifest-layout=two-section` to identify
+//! the format.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -36,10 +43,10 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use super::parquet_manifest::{
-    append_map_json, append_opt_json, col_binary_opt, col_i32, col_i32_opt, col_i64_opt,
-    col_str_opt, nullable_i64, parse_bounds_map_json, parse_i64_map_json,
-    parse_partition_json, read_binary_opt, serialize_bounds_map, serialize_i64_map,
-    serialize_partition_json,
+    col_binary_opt, col_i32_opt, col_i64_opt,
+    col_str_opt, nullable_i64, read_binary_opt,
+    manifest_arrow_schema, manifest_entries_to_record_batch,
+    parse_bounds_map_json, parse_i64_map_json, parse_partition_json,
 };
 use super::{ManifestEntry, ManifestStatus};
 use crate::error::Result;
@@ -52,34 +59,6 @@ use crate::{Error, ErrorKind};
 // ============================================================================
 // Types
 // ============================================================================
-
-/// Discriminator for root manifest entry types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum RootEntryType {
-    /// Reference to a child manifest file.
-    ManifestRef = 0,
-    /// Inline data file entry.
-    InlineData = 1,
-    /// Inline delete file entry.
-    InlineDelete = 2,
-}
-
-impl TryFrom<i32> for RootEntryType {
-    type Error = Error;
-
-    fn try_from(v: i32) -> Result<Self> {
-        match v {
-            0 => Ok(RootEntryType::ManifestRef),
-            1 => Ok(RootEntryType::InlineData),
-            2 => Ok(RootEntryType::InlineDelete),
-            _ => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("invalid root entry type: {v}"),
-            )),
-        }
-    }
-}
 
 /// A single entry in the root manifest file.
 #[derive(Debug, Clone)]
@@ -350,18 +329,14 @@ impl RootManifest {
 }
 
 // ============================================================================
-// Arrow Schema
+// Arrow Schema for manifest refs (row group 0)
 // ============================================================================
 
-/// Build the combined Arrow schema for root manifest entries.
+/// Build the Arrow schema for manifest ref entries (row group 0).
 ///
-/// Contains the entry_type discriminator, manifest ref columns, inline entry columns,
-/// and mdv_bitmap column. All columns are nullable except entry_type.
-pub fn root_manifest_arrow_schema() -> ArrowSchema {
+/// 17 columns covering manifest file metadata plus MDV bitmap.
+fn manifest_ref_arrow_schema() -> ArrowSchema {
     ArrowSchema::new(vec![
-        // Discriminator
-        Field::new("entry_type", DataType::Int32, false),
-        // Manifest ref columns
         Field::new("manifest_path", DataType::Utf8, true),
         Field::new("manifest_length", DataType::Int64, true),
         Field::new("manifest_content", DataType::Int32, true),
@@ -378,27 +353,6 @@ pub fn root_manifest_arrow_schema() -> ArrowSchema {
         Field::new("manifest_key_metadata", DataType::Binary, true),
         Field::new("manifest_first_row_id", DataType::Int64, true),
         Field::new("mdv_bitmap", DataType::Binary, true),
-        // Inline entry columns
-        Field::new("status", DataType::Int32, true),
-        Field::new("snapshot_id", DataType::Int64, true),
-        Field::new("sequence_number", DataType::Int64, true),
-        Field::new("file_sequence_number", DataType::Int64, true),
-        Field::new("content", DataType::Int32, true),
-        Field::new("file_path", DataType::Utf8, true),
-        Field::new("file_format", DataType::Utf8, true),
-        Field::new("partition_json", DataType::Utf8, true),
-        Field::new("record_count", DataType::Int64, true),
-        Field::new("file_size_in_bytes", DataType::Int64, true),
-        Field::new("column_sizes_json", DataType::Binary, true),
-        Field::new("value_counts_json", DataType::Binary, true),
-        Field::new("null_value_counts_json", DataType::Binary, true),
-        Field::new("nan_value_counts_json", DataType::Binary, true),
-        Field::new("lower_bounds_json", DataType::Binary, true),
-        Field::new("upper_bounds_json", DataType::Binary, true),
-        Field::new("key_metadata", DataType::Binary, true),
-        Field::new("split_offsets_json", DataType::Binary, true),
-        Field::new("equality_ids_json", DataType::Binary, true),
-        Field::new("sort_order_id", DataType::Int32, true),
         Field::new("partition_spec_id", DataType::Int32, true),
     ])
 }
@@ -435,6 +389,11 @@ fn encode_root_manifest_metadata(metadata: &RootManifestMetadata) -> HashMap<Str
         kv.insert("parent-snapshot-id".to_string(), parent.to_string());
     }
     kv.insert("root-manifest".to_string(), "true".to_string());
+    kv.insert(
+        "root-manifest-layout".to_string(),
+        "two-section".to_string(),
+    );
+    // refs-count and inlines-count are set by the writer after separating entries
     kv
 }
 
@@ -557,37 +516,95 @@ fn decode_root_manifest_metadata(
 }
 
 // ============================================================================
-// Writer: RootManifestEntry -> Parquet
+// Writer: RootManifestEntry -> Parquet (two-section layout)
 // ============================================================================
 
 /// Write root manifest entries to a Parquet-format byte buffer.
+///
+/// Uses a two-section layout:
+/// - Row group 0: manifest refs (17 columns)
+/// - Row group 1: inline entries (21 columns, same schema as parquet_manifest)
+///
+/// Both row groups are always written, even if empty (0 rows).
 pub fn write_root_manifest(
     entries: &[RootManifestEntry],
     metadata: &RootManifestMetadata,
     partition_type: &StructType,
 ) -> Result<Vec<u8>> {
-    let kv_metadata = encode_root_manifest_metadata(metadata);
-    let schema = Arc::new(root_manifest_arrow_schema().with_metadata(kv_metadata));
-    let batch = root_manifest_entries_to_record_batch(entries, &schema, partition_type)?;
+    // Separate entries into refs and inlines
+    let mut refs: Vec<(&ManifestFile, Option<&[u8]>)> = Vec::new();
+    let mut inlines: Vec<&ManifestEntry> = Vec::new();
+
+    for entry in entries {
+        match entry {
+            RootManifestEntry::ManifestRef { manifest_file, mdv } => {
+                refs.push((manifest_file, mdv.as_deref()));
+            }
+            RootManifestEntry::Inline(me) => {
+                inlines.push(me);
+            }
+        }
+    }
+
+    let inline_entries: Vec<ManifestEntry> = inlines.iter().map(|e| (*e).clone()).collect();
+
+    // Build the combined (superset) schema. Parquet requires all row groups to
+    // share the same schema, so we use a union of ref + inline columns (all
+    // nullable). Row group 0 populates only ref columns; row group 1 populates
+    // only inline columns. The entry type is determined by row group index.
+    //
+    // Empty batches (0 rows) don't produce row groups in Parquet, so we track
+    // counts in file-level metadata so the reader knows the layout.
+    let mut kv_metadata = encode_root_manifest_metadata(metadata);
+    kv_metadata.insert("refs-count".to_string(), refs.len().to_string());
+    kv_metadata.insert("inlines-count".to_string(), inline_entries.len().to_string());
+
+    let refs_schema = Arc::new(manifest_ref_arrow_schema().with_metadata(kv_metadata));
+    let combined_schema = build_combined_schema(&refs_schema);
 
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .build();
 
     let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).map_err(|e| {
+    let mut writer = ArrowWriter::try_new(&mut buf, combined_schema.clone(), Some(props)).map_err(|e| {
         Error::new(
             ErrorKind::Unexpected,
             format!("Failed to create parquet writer: {e}"),
         )
     })?;
 
-    writer.write(&batch).map_err(|e| {
-        Error::new(
-            ErrorKind::Unexpected,
-            format!("Failed to write batch: {e}"),
-        )
-    })?;
+    // Row group 0: manifest refs (only written if non-empty)
+    if !refs.is_empty() {
+        let rg0_batch = build_combined_batch_for_refs(&refs, &combined_schema, metadata)?;
+        writer.write(&rg0_batch).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to write refs batch: {e}"),
+            )
+        })?;
+        if !inline_entries.is_empty() {
+            // Flush to force a new row group boundary before inlines
+            writer.flush().map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to flush refs row group: {e}"),
+                )
+            })?;
+        }
+    }
+
+    // Row group 1 (or 0 if no refs): inline entries (only written if non-empty)
+    if !inline_entries.is_empty() {
+        let rg1_batch = build_combined_batch_for_inlines(&inline_entries, &combined_schema, partition_type, metadata)?;
+        writer.write(&rg1_batch).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to write inlines batch: {e}"),
+            )
+        })?;
+    }
+
     writer.close().map_err(|e| {
         Error::new(
             ErrorKind::Unexpected,
@@ -598,15 +615,44 @@ pub fn write_root_manifest(
     Ok(buf)
 }
 
-fn root_manifest_entries_to_record_batch(
-    entries: &[RootManifestEntry],
-    schema: &Arc<ArrowSchema>,
-    partition_type: &StructType,
-) -> Result<RecordBatch> {
-    let n = entries.len();
+/// Build the combined (superset) schema for the two-section layout.
+///
+/// Contains all manifest ref columns + all inline entry columns (no entry_type).
+/// All columns are nullable since each row group only populates its own subset.
+fn build_combined_schema(refs_schema: &Arc<ArrowSchema>) -> Arc<ArrowSchema> {
+    // Manifest ref columns (from refs_schema, preserving metadata)
+    let mut fields: Vec<Field> = refs_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            // Ensure all fields are nullable
+            Field::new(f.name(), f.data_type().clone(), true)
+        })
+        .collect();
 
-    // Discriminator
-    let mut entry_type = Int32Builder::with_capacity(n);
+    // Inline entry columns from manifest_arrow_schema
+    // Skip partition_spec_id since it's already in refs schema
+    let inline_schema = manifest_arrow_schema();
+    for field in inline_schema.fields() {
+        if field.name() == "partition_spec_id" {
+            continue; // Already present from refs schema
+        }
+        fields.push(Field::new(field.name(), field.data_type().clone(), true));
+    }
+
+    let metadata = refs_schema.metadata().clone();
+    Arc::new(ArrowSchema::new(fields).with_metadata(metadata))
+}
+
+/// Build a combined RecordBatch for row group 0 (manifest refs).
+///
+/// Ref columns are populated, inline columns are all null.
+fn build_combined_batch_for_refs(
+    refs: &[(&ManifestFile, Option<&[u8]>)],
+    schema: &Arc<ArrowSchema>,
+    _metadata: &RootManifestMetadata,
+) -> Result<RecordBatch> {
+    let n = refs.len();
 
     // Manifest ref columns
     let mut manifest_path = StringBuilder::with_capacity(n, n * 100);
@@ -625,193 +671,72 @@ fn root_manifest_entries_to_record_batch(
     let mut manifest_key_metadata = BinaryBuilder::with_capacity(n, n * 16);
     let mut manifest_first_row_id = Int64Builder::with_capacity(n);
     let mut mdv_bitmap = BinaryBuilder::with_capacity(n, n * 64);
-
-    // Inline entry columns
-    let mut status = Int32Builder::with_capacity(n);
-    let mut snapshot_id = Int64Builder::with_capacity(n);
-    let mut seq_num = Int64Builder::with_capacity(n);
-    let mut file_seq = Int64Builder::with_capacity(n);
-    let mut content = Int32Builder::with_capacity(n);
-    let mut file_path = StringBuilder::with_capacity(n, n * 100);
-    let mut file_format = StringBuilder::with_capacity(n, n * 8);
-    let mut partition_json = StringBuilder::with_capacity(n, n * 64);
-    let mut record_count = Int64Builder::with_capacity(n);
-    let mut file_size = Int64Builder::with_capacity(n);
-    let mut column_sizes_json = BinaryBuilder::with_capacity(n, n * 128);
-    let mut value_counts_json = BinaryBuilder::with_capacity(n, n * 128);
-    let mut null_value_counts_json = BinaryBuilder::with_capacity(n, n * 128);
-    let mut nan_value_counts_json = BinaryBuilder::with_capacity(n, n * 64);
-    let mut lower_bounds_json = BinaryBuilder::with_capacity(n, n * 256);
-    let mut upper_bounds_json = BinaryBuilder::with_capacity(n, n * 256);
-    let mut key_metadata_b = BinaryBuilder::with_capacity(n, n * 16);
-    let mut split_offsets_json = BinaryBuilder::with_capacity(n, n * 64);
-    let mut equality_ids_json = BinaryBuilder::with_capacity(n, n * 32);
-    let mut sort_order_id = Int32Builder::with_capacity(n);
     let mut part_spec_id = Int32Builder::with_capacity(n);
 
-    for entry in entries {
-        match entry {
-            RootManifestEntry::ManifestRef { manifest_file: mf, mdv } => {
-                entry_type.append_value(RootEntryType::ManifestRef as i32);
-
-                // Fill manifest ref columns
-                manifest_path.append_value(&mf.manifest_path);
-                manifest_length.append_value(mf.manifest_length);
-                manifest_content.append_value(mf.content as i32);
-                manifest_seq_number.append_value(mf.sequence_number);
-                manifest_min_seq_number.append_value(mf.min_sequence_number);
-                manifest_added_snapshot.append_value(mf.added_snapshot_id);
-                match mf.added_files_count {
-                    Some(v) => manifest_added_files.append_value(v as i32),
-                    None => manifest_added_files.append_null(),
-                }
-                match mf.existing_files_count {
-                    Some(v) => manifest_existing_files.append_value(v as i32),
-                    None => manifest_existing_files.append_null(),
-                }
-                match mf.deleted_files_count {
-                    Some(v) => manifest_deleted_files.append_value(v as i32),
-                    None => manifest_deleted_files.append_null(),
-                }
-                match mf.added_rows_count {
-                    Some(v) => manifest_added_rows.append_value(v as i64),
-                    None => manifest_added_rows.append_null(),
-                }
-                match mf.existing_rows_count {
-                    Some(v) => manifest_existing_rows.append_value(v as i64),
-                    None => manifest_existing_rows.append_null(),
-                }
-                match mf.deleted_rows_count {
-                    Some(v) => manifest_deleted_rows.append_value(v as i64),
-                    None => manifest_deleted_rows.append_null(),
-                }
-                // Partitions as JSON
-                match &mf.partitions {
-                    Some(parts) => {
-                        let json = serde_json::to_vec(parts).unwrap_or_default();
-                        manifest_partitions_json.append_value(&json);
-                    }
-                    None => manifest_partitions_json.append_null(),
-                }
-                match &mf.key_metadata {
-                    Some(km) => manifest_key_metadata.append_value(km.as_slice()),
-                    None => manifest_key_metadata.append_null(),
-                }
-                match mf.first_row_id {
-                    Some(v) => manifest_first_row_id.append_value(v as i64),
-                    None => manifest_first_row_id.append_null(),
-                }
-                match mdv {
-                    Some(bm) => mdv_bitmap.append_value(bm.as_slice()),
-                    None => mdv_bitmap.append_null(),
-                }
-
-                // Null out inline columns
-                status.append_null();
-                snapshot_id.append_null();
-                seq_num.append_null();
-                file_seq.append_null();
-                content.append_null();
-                file_path.append_null();
-                file_format.append_null();
-                partition_json.append_null();
-                record_count.append_null();
-                file_size.append_null();
-                column_sizes_json.append_null();
-                value_counts_json.append_null();
-                null_value_counts_json.append_null();
-                nan_value_counts_json.append_null();
-                lower_bounds_json.append_null();
-                upper_bounds_json.append_null();
-                key_metadata_b.append_null();
-                split_offsets_json.append_null();
-                equality_ids_json.append_null();
-                sort_order_id.append_null();
-                part_spec_id.append_null();
-            }
-            RootManifestEntry::Inline(me) => {
-                let df = &me.data_file;
-                let etype = match df.content {
-                    DataContentType::Data => RootEntryType::InlineData,
-                    DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
-                        RootEntryType::InlineDelete
-                    }
-                };
-                entry_type.append_value(etype as i32);
-
-                // Null out manifest ref columns
-                manifest_path.append_null();
-                manifest_length.append_null();
-                manifest_content.append_null();
-                manifest_seq_number.append_null();
-                manifest_min_seq_number.append_null();
-                manifest_added_snapshot.append_null();
-                manifest_added_files.append_null();
-                manifest_existing_files.append_null();
-                manifest_deleted_files.append_null();
-                manifest_added_rows.append_null();
-                manifest_existing_rows.append_null();
-                manifest_deleted_rows.append_null();
-                manifest_partitions_json.append_null();
-                manifest_key_metadata.append_null();
-                manifest_first_row_id.append_null();
-                mdv_bitmap.append_null();
-
-                // Fill inline columns
-                status.append_value(me.status as i32);
-                match me.snapshot_id {
-                    Some(v) => snapshot_id.append_value(v),
-                    None => snapshot_id.append_null(),
-                }
-                match me.sequence_number {
-                    Some(v) => seq_num.append_value(v),
-                    None => seq_num.append_null(),
-                }
-                match me.file_sequence_number {
-                    Some(v) => file_seq.append_value(v),
-                    None => file_seq.append_null(),
-                }
-                content.append_value(df.content as i32);
-                file_path.append_value(&df.file_path);
-                file_format.append_value(df.file_format.to_string().to_ascii_uppercase());
-
-                let part_str = serialize_partition_json(&df.partition, partition_type);
-                partition_json.append_value(&part_str);
-
-                record_count.append_value(df.record_count as i64);
-                file_size.append_value(df.file_size_in_bytes as i64);
-
-                append_map_json(&mut column_sizes_json, &serialize_i64_map(&df.column_sizes));
-                append_map_json(&mut value_counts_json, &serialize_i64_map(&df.value_counts));
-                append_map_json(
-                    &mut null_value_counts_json,
-                    &serialize_i64_map(&df.null_value_counts),
-                );
-                append_map_json(
-                    &mut nan_value_counts_json,
-                    &serialize_i64_map(&df.nan_value_counts),
-                );
-                append_map_json(&mut lower_bounds_json, &serialize_bounds_map(&df.lower_bounds));
-                append_map_json(&mut upper_bounds_json, &serialize_bounds_map(&df.upper_bounds));
-
-                match &df.key_metadata {
-                    Some(km) => key_metadata_b.append_value(km.as_slice()),
-                    None => key_metadata_b.append_null(),
-                }
-                append_opt_json(&mut split_offsets_json, &df.split_offsets);
-                append_opt_json(&mut equality_ids_json, &df.equality_ids);
-                match df.sort_order_id {
-                    Some(v) => sort_order_id.append_value(v),
-                    None => sort_order_id.append_null(),
-                }
-                part_spec_id.append_value(df.partition_spec_id);
-            }
+    for (mf, mdv) in refs {
+        manifest_path.append_value(&mf.manifest_path);
+        manifest_length.append_value(mf.manifest_length);
+        manifest_content.append_value(mf.content as i32);
+        manifest_seq_number.append_value(mf.sequence_number);
+        manifest_min_seq_number.append_value(mf.min_sequence_number);
+        manifest_added_snapshot.append_value(mf.added_snapshot_id);
+        match mf.added_files_count {
+            Some(v) => manifest_added_files.append_value(v as i32),
+            None => manifest_added_files.append_null(),
         }
+        match mf.existing_files_count {
+            Some(v) => manifest_existing_files.append_value(v as i32),
+            None => manifest_existing_files.append_null(),
+        }
+        match mf.deleted_files_count {
+            Some(v) => manifest_deleted_files.append_value(v as i32),
+            None => manifest_deleted_files.append_null(),
+        }
+        match mf.added_rows_count {
+            Some(v) => manifest_added_rows.append_value(v as i64),
+            None => manifest_added_rows.append_null(),
+        }
+        match mf.existing_rows_count {
+            Some(v) => manifest_existing_rows.append_value(v as i64),
+            None => manifest_existing_rows.append_null(),
+        }
+        match mf.deleted_rows_count {
+            Some(v) => manifest_deleted_rows.append_value(v as i64),
+            None => manifest_deleted_rows.append_null(),
+        }
+        match &mf.partitions {
+            Some(parts) => {
+                let json = serde_json::to_vec(parts).unwrap_or_default();
+                manifest_partitions_json.append_value(&json);
+            }
+            None => manifest_partitions_json.append_null(),
+        }
+        match &mf.key_metadata {
+            Some(km) => manifest_key_metadata.append_value(km.as_slice()),
+            None => manifest_key_metadata.append_null(),
+        }
+        match mf.first_row_id {
+            Some(v) => manifest_first_row_id.append_value(v as i64),
+            None => manifest_first_row_id.append_null(),
+        }
+        match mdv {
+            Some(bm) => mdv_bitmap.append_value(bm),
+            None => mdv_bitmap.append_null(),
+        }
+        part_spec_id.append_value(mf.partition_spec_id);
     }
 
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(entry_type.finish()),
-        // Manifest ref columns
+    // Build null columns for all inline fields
+    let inline_schema = manifest_arrow_schema();
+    let mut null_inline_columns: Vec<ArrayRef> = Vec::new();
+    for field in inline_schema.fields() {
+        if field.name() == "partition_spec_id" {
+            continue;
+        }
+        null_inline_columns.push(make_null_array(field.data_type(), n));
+    }
+
+    let mut columns: Vec<ArrayRef> = vec![
         Arc::new(manifest_path.finish()),
         Arc::new(manifest_length.finish()),
         Arc::new(manifest_content.finish()),
@@ -828,43 +753,124 @@ fn root_manifest_entries_to_record_batch(
         Arc::new(manifest_key_metadata.finish()),
         Arc::new(manifest_first_row_id.finish()),
         Arc::new(mdv_bitmap.finish()),
-        // Inline entry columns
-        Arc::new(status.finish()),
-        Arc::new(snapshot_id.finish()),
-        Arc::new(seq_num.finish()),
-        Arc::new(file_seq.finish()),
-        Arc::new(content.finish()),
-        Arc::new(file_path.finish()),
-        Arc::new(file_format.finish()),
-        Arc::new(partition_json.finish()),
-        Arc::new(record_count.finish()),
-        Arc::new(file_size.finish()),
-        Arc::new(column_sizes_json.finish()),
-        Arc::new(value_counts_json.finish()),
-        Arc::new(null_value_counts_json.finish()),
-        Arc::new(nan_value_counts_json.finish()),
-        Arc::new(lower_bounds_json.finish()),
-        Arc::new(upper_bounds_json.finish()),
-        Arc::new(key_metadata_b.finish()),
-        Arc::new(split_offsets_json.finish()),
-        Arc::new(equality_ids_json.finish()),
-        Arc::new(sort_order_id.finish()),
         Arc::new(part_spec_id.finish()),
     ];
+    columns.extend(null_inline_columns);
 
     RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to build RecordBatch: {e}")))
+        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to build refs RecordBatch: {e}")))
+}
+
+/// Build a combined RecordBatch for row group 1 (inline entries).
+///
+/// Inline columns are populated, ref columns are all null.
+fn build_combined_batch_for_inlines(
+    entries: &[ManifestEntry],
+    schema: &Arc<ArrowSchema>,
+    partition_type: &StructType,
+    metadata: &RootManifestMetadata,
+) -> Result<RecordBatch> {
+    let n = entries.len();
+
+    // Build null columns for all ref fields (17 columns from manifest_ref_arrow_schema)
+    let ref_schema = manifest_ref_arrow_schema();
+    let mut null_ref_columns: Vec<ArrayRef> = Vec::new();
+    for field in ref_schema.fields() {
+        null_ref_columns.push(make_null_array(field.data_type(), n));
+    }
+
+    // Build inline columns using manifest_entries_to_record_batch
+    let inline_schema = Arc::new(manifest_arrow_schema());
+    let inline_batch = manifest_entries_to_record_batch(
+        entries,
+        &inline_schema,
+        partition_type,
+        metadata.format_version,
+    )?;
+
+    // Combine: ref null columns + inline columns (skip partition_spec_id from inline since it's in ref null columns)
+    let mut columns: Vec<ArrayRef> = null_ref_columns;
+
+    let inline_schema_tmp = manifest_arrow_schema();
+    let inline_field_names: Vec<&str> = inline_schema_tmp
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+
+    for (idx, name) in inline_field_names.iter().enumerate() {
+        if *name == "partition_spec_id" {
+            // partition_spec_id is already covered by the ref schema null column;
+            // we need to replace that null column with the actual inline values
+            // Find the index of partition_spec_id in ref_schema
+            let ref_psi_idx = ref_schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == "partition_spec_id")
+                .unwrap();
+            columns[ref_psi_idx] = inline_batch.column(idx).clone();
+            continue;
+        }
+        columns.push(inline_batch.column(idx).clone());
+    }
+
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to build inlines RecordBatch: {e}")))
+}
+
+/// Create a null array of the given data type and length.
+fn make_null_array(data_type: &DataType, n: usize) -> ArrayRef {
+    match data_type {
+        DataType::Int32 => {
+            let mut b = Int32Builder::with_capacity(n);
+            for _ in 0..n {
+                b.append_null();
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Int64 => {
+            let mut b = Int64Builder::with_capacity(n);
+            for _ in 0..n {
+                b.append_null();
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Utf8 => {
+            let mut b = StringBuilder::with_capacity(n, 0);
+            for _ in 0..n {
+                b.append_null();
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Binary => {
+            let mut b = BinaryBuilder::with_capacity(n, 0);
+            for _ in 0..n {
+                b.append_null();
+            }
+            Arc::new(b.finish())
+        }
+        _ => {
+            // Fallback: use arrow's null array
+            Arc::new(arrow_array::new_null_array(data_type, n))
+        }
+    }
 }
 
 // ============================================================================
-// Reader: Parquet -> RootManifestEntry
+// Reader: Parquet -> RootManifestEntry (two-section layout)
 // ============================================================================
 
 /// Read root manifest from Parquet bytes.
+///
+/// Expects a two-section layout:
+/// - Row group 0: manifest refs
+/// - Row group 1: inline entries
+///
+/// The layout is identified by `root-manifest-layout=two-section` in file metadata.
 pub fn read_root_manifest(
     bytes: &[u8],
 ) -> Result<(RootManifestMetadata, Vec<RootManifestEntry>)> {
-    let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+    let reader_builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
         .map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -872,48 +878,126 @@ pub fn read_root_manifest(
             )
         })?;
 
-    let arrow_schema = reader.schema();
+    let arrow_schema = reader_builder.schema();
     let arrow_meta = arrow_schema.metadata();
 
-    // Convert to HashMap<String, String> for our decoder
+    // Decode metadata
     let metadata = decode_root_manifest_metadata(arrow_meta)?;
-
     let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
 
-    let batch_reader = reader.build().map_err(|e| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            format!("Failed to build reader: {e}"),
-        )
-    })?;
+    let parquet_meta = reader_builder.metadata().clone();
+    let num_row_groups = parquet_meta.num_row_groups();
+
+    // Determine layout from metadata counts.
+    // refs-count and inlines-count tell us how many entries of each type exist.
+    // The writer only creates row groups for non-empty sections:
+    // - Both non-empty: RG0=refs, RG1=inlines (2 row groups)
+    // - Only refs: RG0=refs (1 row group)
+    // - Only inlines: RG0=inlines (1 row group)
+    // - Both empty: 0 row groups
+    let refs_count: usize = arrow_meta
+        .get("refs-count")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let inlines_count: usize = arrow_meta
+        .get("inlines-count")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let has_refs = refs_count > 0;
+    let has_inlines = inlines_count > 0;
 
     let mut entries = Vec::new();
-    for batch_result in batch_reader {
-        let batch = batch_result.map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Failed to read batch: {e}"),
-            )
-        })?;
-        let batch_entries =
-            record_batch_to_root_manifest_entries(&batch, &metadata, &partition_type)?;
-        entries.extend(batch_entries);
+
+    // Determine row group indices
+    let refs_rg: Option<usize> = if has_refs && num_row_groups > 0 {
+        Some(0)
+    } else {
+        None
+    };
+    let inlines_rg: Option<usize> = if has_inlines {
+        if has_refs && num_row_groups > 1 {
+            Some(1) // RG1 when refs occupy RG0
+        } else if !has_refs && num_row_groups > 0 {
+            Some(0) // RG0 when no refs
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Read manifest refs from their row group
+    if let Some(rg_idx) = refs_rg {
+        let rg_reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Failed to open root manifest for refs: {e}"),
+                )
+            })?
+            .with_row_groups(vec![rg_idx])
+            .build()
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Failed to build refs reader: {e}"),
+                )
+            })?;
+
+        for batch_result in rg_reader {
+            let batch = batch_result.map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Failed to read refs batch: {e}"),
+                )
+            })?;
+            let ref_entries = record_batch_to_manifest_refs(&batch, &metadata)?;
+            entries.extend(ref_entries);
+        }
+    }
+
+    // Read inline entries from their row group
+    if let Some(rg_idx) = inlines_rg {
+        let rg_reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Failed to open root manifest for inlines: {e}"),
+                )
+            })?
+            .with_row_groups(vec![rg_idx])
+            .build()
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Failed to build inlines reader: {e}"),
+                )
+            })?;
+
+        for batch_result in rg_reader {
+            let batch = batch_result.map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Failed to read inlines batch: {e}"),
+                )
+            })?;
+            let inline_entries = record_batch_to_inline_entries(&batch, &metadata, &partition_type)?;
+            entries.extend(inline_entries);
+        }
     }
 
     Ok((metadata, entries))
 }
 
-fn record_batch_to_root_manifest_entries(
+/// Parse manifest ref entries from a RecordBatch (row group 0).
+fn record_batch_to_manifest_refs(
     batch: &RecordBatch,
     metadata: &RootManifestMetadata,
-    partition_type: &StructType,
 ) -> Result<Vec<RootManifestEntry>> {
     let n = batch.num_rows();
     let mut entries = Vec::with_capacity(n);
 
-    let entry_type_arr = col_i32(batch, "entry_type")?;
-
-    // Manifest ref columns
     let manifest_path_arr = col_str_opt(batch, "manifest_path");
     let manifest_length_arr = col_i64_opt(batch, "manifest_length");
     let manifest_content_arr = col_i32_opt(batch, "manifest_content");
@@ -930,8 +1014,122 @@ fn record_batch_to_root_manifest_entries(
     let manifest_key_metadata_arr = col_binary_opt(batch, "manifest_key_metadata");
     let manifest_first_row_id_arr = col_i64_opt(batch, "manifest_first_row_id");
     let mdv_bitmap_arr = col_binary_opt(batch, "mdv_bitmap");
+    let part_spec_id_arr = col_i32_opt(batch, "partition_spec_id");
 
-    // Inline entry columns
+    for i in 0..n {
+        let mf_path = manifest_path_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i).to_string())
+                }
+            })
+            .unwrap_or_default();
+        let mf_length = nullable_i64(manifest_length_arr, i).unwrap_or(0);
+        let mf_content: ManifestContentType = manifest_content_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i))
+                }
+            })
+            .unwrap_or(0)
+            .try_into()?;
+        let mf_seq = nullable_i64(manifest_seq_number_arr, i).unwrap_or(0);
+        let mf_min_seq = nullable_i64(manifest_min_seq_number_arr, i).unwrap_or(0);
+        let mf_added_snap = nullable_i64(manifest_added_snapshot_arr, i).unwrap_or(0);
+
+        let mf_added_files = manifest_added_files_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i) as u32)
+                }
+            });
+        let mf_existing_files = manifest_existing_files_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i) as u32)
+                }
+            });
+        let mf_deleted_files = manifest_deleted_files_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i) as u32)
+                }
+            });
+        let mf_added_rows = nullable_i64(manifest_added_rows_arr, i).map(|v| v as u64);
+        let mf_existing_rows =
+            nullable_i64(manifest_existing_rows_arr, i).map(|v| v as u64);
+        let mf_deleted_rows =
+            nullable_i64(manifest_deleted_rows_arr, i).map(|v| v as u64);
+
+        let partitions: Option<Vec<crate::spec::FieldSummary>> =
+            read_binary_opt(manifest_partitions_json_arr, i)
+                .and_then(|b| serde_json::from_slice(b).ok());
+
+        let mf_key_metadata =
+            read_binary_opt(manifest_key_metadata_arr, i).map(|b| b.to_vec());
+
+        let mf_first_row_id =
+            nullable_i64(manifest_first_row_id_arr, i).map(|v| v as u64);
+
+        let mdv = read_binary_opt(mdv_bitmap_arr, i).map(|b| b.to_vec());
+
+        let spec_id = part_spec_id_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i))
+                }
+            })
+            .unwrap_or(metadata.partition_spec.spec_id());
+
+        let manifest_file = ManifestFile {
+            manifest_path: mf_path,
+            manifest_length: mf_length,
+            partition_spec_id: spec_id,
+            content: mf_content,
+            sequence_number: mf_seq,
+            min_sequence_number: mf_min_seq,
+            added_snapshot_id: mf_added_snap,
+            added_files_count: mf_added_files,
+            existing_files_count: mf_existing_files,
+            deleted_files_count: mf_deleted_files,
+            added_rows_count: mf_added_rows,
+            existing_rows_count: mf_existing_rows,
+            deleted_rows_count: mf_deleted_rows,
+            partitions,
+            key_metadata: mf_key_metadata,
+            first_row_id: mf_first_row_id,
+        };
+
+        entries.push(RootManifestEntry::ManifestRef { manifest_file, mdv });
+    }
+
+    Ok(entries)
+}
+
+/// Parse inline entries from a RecordBatch (row group 1).
+///
+/// Uses the same column layout as parquet_manifest entries but wraps them
+/// as RootManifestEntry::Inline.
+fn record_batch_to_inline_entries(
+    batch: &RecordBatch,
+    metadata: &RootManifestMetadata,
+    partition_type: &StructType,
+) -> Result<Vec<RootManifestEntry>> {
+    let n = batch.num_rows();
+    let mut entries = Vec::with_capacity(n);
+
     let status_arr = col_i32_opt(batch, "status");
     let snapshot_id_arr = col_i64_opt(batch, "snapshot_id");
     let seq_num_arr = col_i64_opt(batch, "sequence_number");
@@ -955,224 +1153,130 @@ fn record_batch_to_root_manifest_entries(
     let part_spec_id_arr = col_i32_opt(batch, "partition_spec_id");
 
     for i in 0..n {
-        let etype: RootEntryType = entry_type_arr.value(i).try_into()?;
+        let status_val: ManifestStatus = status_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i))
+                }
+            })
+            .unwrap_or(0)
+            .try_into()?;
+        let snap_id = nullable_i64(snapshot_id_arr, i);
+        let seq_number = nullable_i64(seq_num_arr, i);
+        let file_seq_number = nullable_i64(file_seq_arr, i);
 
-        match etype {
-            RootEntryType::ManifestRef => {
-                let mf_path = manifest_path_arr
-                    .and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i).to_string())
-                        }
-                    })
-                    .unwrap_or_default();
-                let mf_length = nullable_i64(manifest_length_arr, i).unwrap_or(0);
-                let mf_content: ManifestContentType = manifest_content_arr
-                    .and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i))
-                        }
-                    })
-                    .unwrap_or(0)
-                    .try_into()?;
-                let mf_seq = nullable_i64(manifest_seq_number_arr, i).unwrap_or(0);
-                let mf_min_seq = nullable_i64(manifest_min_seq_number_arr, i).unwrap_or(0);
-                let mf_added_snap = nullable_i64(manifest_added_snapshot_arr, i).unwrap_or(0);
+        let content_type: DataContentType = content_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i))
+                }
+            })
+            .unwrap_or(0)
+            .try_into()?;
 
-                let mf_added_files = manifest_added_files_arr
-                    .and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i) as u32)
-                        }
-                    });
-                let mf_existing_files = manifest_existing_files_arr
-                    .and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i) as u32)
-                        }
-                    });
-                let mf_deleted_files = manifest_deleted_files_arr
-                    .and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i) as u32)
-                        }
-                    });
-                let mf_added_rows = nullable_i64(manifest_added_rows_arr, i).map(|v| v as u64);
-                let mf_existing_rows =
-                    nullable_i64(manifest_existing_rows_arr, i).map(|v| v as u64);
-                let mf_deleted_rows =
-                    nullable_i64(manifest_deleted_rows_arr, i).map(|v| v as u64);
+        let fpath = file_path_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i).to_string())
+                }
+            })
+            .unwrap_or_default();
 
-                let partitions: Option<Vec<crate::spec::FieldSummary>> =
-                    read_binary_opt(manifest_partitions_json_arr, i)
-                        .and_then(|b| serde_json::from_slice(b).ok());
+        let fformat: DataFileFormat = file_format_arr
+            .and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i))
+                }
+            })
+            .unwrap_or("PARQUET")
+            .parse()?;
 
-                let mf_key_metadata =
-                    read_binary_opt(manifest_key_metadata_arr, i).map(|b| b.to_vec());
+        let partition = parse_partition_json(
+            partition_json_arr.and_then(|a| {
+                if Array::is_null(a, i) {
+                    None
+                } else {
+                    Some(a.value(i))
+                }
+            }),
+            partition_type,
+        );
 
-                let mf_first_row_id =
-                    nullable_i64(manifest_first_row_id_arr, i).map(|v| v as u64);
+        let rec_count = nullable_i64(record_count_arr, i).unwrap_or(0) as u64;
+        let f_size = nullable_i64(file_size_arr, i).unwrap_or(0) as u64;
 
-                let mdv = read_binary_opt(mdv_bitmap_arr, i).map(|b| b.to_vec());
+        let column_sizes = parse_i64_map_json(read_binary_opt(column_sizes_arr, i));
+        let value_counts = parse_i64_map_json(read_binary_opt(value_counts_arr, i));
+        let null_value_counts =
+            parse_i64_map_json(read_binary_opt(null_value_counts_arr, i));
+        let nan_value_counts =
+            parse_i64_map_json(read_binary_opt(nan_value_counts_arr, i));
+        let lower_bounds =
+            parse_bounds_map_json(read_binary_opt(lower_bounds_arr, i), &metadata.schema);
+        let upper_bounds =
+            parse_bounds_map_json(read_binary_opt(upper_bounds_arr, i), &metadata.schema);
 
-                let manifest_file = ManifestFile {
-                    manifest_path: mf_path,
-                    manifest_length: mf_length,
-                    partition_spec_id: metadata.partition_spec.spec_id(),
-                    content: mf_content,
-                    sequence_number: mf_seq,
-                    min_sequence_number: mf_min_seq,
-                    added_snapshot_id: mf_added_snap,
-                    added_files_count: mf_added_files,
-                    existing_files_count: mf_existing_files,
-                    deleted_files_count: mf_deleted_files,
-                    added_rows_count: mf_added_rows,
-                    existing_rows_count: mf_existing_rows,
-                    deleted_rows_count: mf_deleted_rows,
-                    partitions,
-                    key_metadata: mf_key_metadata,
-                    first_row_id: mf_first_row_id,
-                };
-
-                entries.push(RootManifestEntry::ManifestRef { manifest_file, mdv });
+        let key_meta = read_binary_opt(key_metadata_arr, i).map(|b| b.to_vec());
+        let split_offs: Option<Vec<i64>> = read_binary_opt(split_offsets_arr, i)
+            .and_then(|b| serde_json::from_slice(b).ok());
+        let eq_ids: Option<Vec<i32>> = read_binary_opt(equality_ids_arr, i)
+            .and_then(|b| serde_json::from_slice(b).ok());
+        let sort_id = sort_order_id_arr.and_then(|a| {
+            if Array::is_null(a, i) {
+                None
+            } else {
+                Some(a.value(i))
             }
-            RootEntryType::InlineData | RootEntryType::InlineDelete => {
-                let status_val: ManifestStatus = status_arr
-                    .and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i))
-                        }
-                    })
-                    .unwrap_or(0)
-                    .try_into()?;
-                let snap_id = nullable_i64(snapshot_id_arr, i);
-                let seq_number = nullable_i64(seq_num_arr, i);
-                let file_seq_number = nullable_i64(file_seq_arr, i);
+        });
+        let spec_id = part_spec_id_arr
+            .map(|a| {
+                if Array::is_null(a, i) {
+                    metadata.partition_spec.spec_id()
+                } else {
+                    a.value(i)
+                }
+            })
+            .unwrap_or(metadata.partition_spec.spec_id());
 
-                let content_type: DataContentType = content_arr
-                    .and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i))
-                        }
-                    })
-                    .unwrap_or(0)
-                    .try_into()?;
+        let data_file = DataFile {
+            content: content_type,
+            file_path: fpath,
+            file_format: fformat,
+            partition,
+            record_count: rec_count,
+            file_size_in_bytes: f_size,
+            column_sizes,
+            value_counts,
+            null_value_counts,
+            nan_value_counts,
+            lower_bounds,
+            upper_bounds,
+            key_metadata: key_meta,
+            split_offsets: split_offs,
+            equality_ids: eq_ids,
+            sort_order_id: sort_id,
+            partition_spec_id: spec_id,
+            first_row_id: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
 
-                let fpath = file_path_arr
-                    .and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i).to_string())
-                        }
-                    })
-                    .unwrap_or_default();
-
-                let fformat: DataFileFormat = file_format_arr
-                    .and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i))
-                        }
-                    })
-                    .unwrap_or("PARQUET")
-                    .parse()?;
-
-                let partition = parse_partition_json(
-                    partition_json_arr.and_then(|a| {
-                        if Array::is_null(a, i) {
-                            None
-                        } else {
-                            Some(a.value(i))
-                        }
-                    }),
-                    partition_type,
-                );
-
-                let rec_count = nullable_i64(record_count_arr, i).unwrap_or(0) as u64;
-                let f_size = nullable_i64(file_size_arr, i).unwrap_or(0) as u64;
-
-                let column_sizes = parse_i64_map_json(read_binary_opt(column_sizes_arr, i));
-                let value_counts = parse_i64_map_json(read_binary_opt(value_counts_arr, i));
-                let null_value_counts =
-                    parse_i64_map_json(read_binary_opt(null_value_counts_arr, i));
-                let nan_value_counts =
-                    parse_i64_map_json(read_binary_opt(nan_value_counts_arr, i));
-                let lower_bounds =
-                    parse_bounds_map_json(read_binary_opt(lower_bounds_arr, i), &metadata.schema);
-                let upper_bounds =
-                    parse_bounds_map_json(read_binary_opt(upper_bounds_arr, i), &metadata.schema);
-
-                let key_meta = read_binary_opt(key_metadata_arr, i).map(|b| b.to_vec());
-                let split_offs: Option<Vec<i64>> = read_binary_opt(split_offsets_arr, i)
-                    .and_then(|b| serde_json::from_slice(b).ok());
-                let eq_ids: Option<Vec<i32>> = read_binary_opt(equality_ids_arr, i)
-                    .and_then(|b| serde_json::from_slice(b).ok());
-                let sort_id = sort_order_id_arr.and_then(|a| {
-                    if Array::is_null(a, i) {
-                        None
-                    } else {
-                        Some(a.value(i))
-                    }
-                });
-                let spec_id = part_spec_id_arr
-                    .map(|a| {
-                        if Array::is_null(a, i) {
-                            metadata.partition_spec.spec_id()
-                        } else {
-                            a.value(i)
-                        }
-                    })
-                    .unwrap_or(metadata.partition_spec.spec_id());
-
-                let data_file = DataFile {
-                    content: content_type,
-                    file_path: fpath,
-                    file_format: fformat,
-                    partition,
-                    record_count: rec_count,
-                    file_size_in_bytes: f_size,
-                    column_sizes,
-                    value_counts,
-                    null_value_counts,
-                    nan_value_counts,
-                    lower_bounds,
-                    upper_bounds,
-                    key_metadata: key_meta,
-                    split_offsets: split_offs,
-                    equality_ids: eq_ids,
-                    sort_order_id: sort_id,
-                    partition_spec_id: spec_id,
-                    first_row_id: None,
-                    referenced_data_file: None,
-                    content_offset: None,
-                    content_size_in_bytes: None,
-                };
-
-                entries.push(RootManifestEntry::Inline(ManifestEntry {
-                    status: status_val,
-                    snapshot_id: snap_id,
-                    sequence_number: seq_number,
-                    file_sequence_number: file_seq_number,
-                    data_file,
-                }));
-            }
-        }
+        entries.push(RootManifestEntry::Inline(ManifestEntry {
+            status: status_val,
+            snapshot_id: snap_id,
+            sequence_number: seq_number,
+            file_sequence_number: file_seq_number,
+            data_file,
+        }));
     }
 
     Ok(entries)
@@ -1329,10 +1433,10 @@ mod tests {
         assert_eq!(read_meta.parent_snapshot_id, Some(99));
         assert_eq!(read_meta.schema_id, 0);
 
-        // Verify entry count and types
+        // With two-section layout, refs come first (row group 0), then inlines (row group 1)
         assert_eq!(read_entries.len(), 4);
 
-        // First entry: ManifestRef
+        // First two entries: ManifestRefs (from row group 0)
         match &read_entries[0] {
             RootManifestEntry::ManifestRef { manifest_file, mdv } => {
                 assert_eq!(manifest_file.manifest_path, "s3://bucket/metadata/m0.avro");
@@ -1343,8 +1447,16 @@ mod tests {
             _ => panic!("Expected ManifestRef"),
         }
 
-        // Second entry: Inline
         match &read_entries[1] {
+            RootManifestEntry::ManifestRef { manifest_file, mdv } => {
+                assert_eq!(manifest_file.manifest_path, "s3://bucket/metadata/m1.avro");
+                assert!(mdv.is_none());
+            }
+            _ => panic!("Expected ManifestRef"),
+        }
+
+        // Last two entries: Inlines (from row group 1)
+        match &read_entries[2] {
             RootManifestEntry::Inline(me) => {
                 assert_eq!(me.data_file.file_path, "s3://bucket/data/file1.parquet");
                 assert_eq!(me.data_file.record_count, 1000);
@@ -1357,7 +1469,6 @@ mod tests {
             _ => panic!("Expected Inline"),
         }
 
-        // Fourth entry: Inline
         match &read_entries[3] {
             RootManifestEntry::Inline(me) => {
                 assert_eq!(me.data_file.file_path, "s3://bucket/data/file2.parquet");
@@ -1605,5 +1716,34 @@ mod tests {
         // Verify the kept inline entry
         let kept = rm.inline_entries().next().unwrap();
         assert_eq!(kept.data_file.file_path, "s3://bucket/keep.parquet");
+    }
+
+    #[test]
+    fn two_section_layout_metadata() {
+        // Verify that the layout metadata is present in the written file
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+        let metadata = test_metadata(&schema, &partition_spec);
+
+        let entries = vec![
+            RootManifestEntry::ManifestRef {
+                manifest_file: test_manifest_file("s3://bucket/metadata/m0.avro"),
+                mdv: None,
+            },
+        ];
+
+        let bytes = write_root_manifest(&entries, &metadata, &partition_type).unwrap();
+
+        // Read the parquet metadata directly to check for layout marker
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(&bytes)).unwrap();
+        let arrow_meta = reader.schema().metadata().clone();
+        assert_eq!(arrow_meta.get("root-manifest-layout").map(|s| s.as_str()), Some("two-section"));
+        assert_eq!(arrow_meta.get("root-manifest").map(|s| s.as_str()), Some("true"));
+        assert_eq!(arrow_meta.get("refs-count").map(|s| s.as_str()), Some("1"));
+        assert_eq!(arrow_meta.get("inlines-count").map(|s| s.as_str()), Some("0"));
+
+        // Only 1 row group (refs only, empty inlines don't get a row group)
+        assert_eq!(reader.metadata().num_row_groups(), 1);
     }
 }

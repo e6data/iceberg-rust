@@ -1169,13 +1169,73 @@ impl<'a> SnapshotProducer<'a> {
             }));
         }
 
-        // Build root manifest metadata
+        // Adaptive inline→child flush: when inline count exceeds threshold,
+        // flush inline entries to a child manifest and replace with a manifest ref.
+        // This eliminates the need for separate table maintenance.
         let partition_type = self
             .table
             .metadata()
             .default_partition_spec()
             .partition_type(self.table.metadata().current_schema())?;
 
+        let inline_threshold = self
+            .table
+            .metadata()
+            .properties()
+            .get("root-manifest.inline-threshold")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(500);
+
+        let inline_count = entries
+            .iter()
+            .filter(|e| matches!(e, RootManifestEntry::Inline(_)))
+            .count();
+
+        if inline_count > inline_threshold {
+            // Extract inline entries, keep manifest refs
+            let mut inline_entries: Vec<ManifestEntry> = Vec::new();
+            entries.retain(|e| match e {
+                RootManifestEntry::Inline(me) => {
+                    inline_entries.push(me.clone());
+                    false // remove from entries
+                }
+                RootManifestEntry::ManifestRef { .. } => true, // keep
+            });
+
+            // Write inline entries as a child manifest file
+            if !inline_entries.is_empty() {
+                let child_manifest_path = format!(
+                    "{}/{}/{}-m{}.parquet",
+                    self.table.metadata().location(),
+                    META_ROOT_PATH,
+                    self.commit_uuid,
+                    self.manifest_counter.next().unwrap_or(0),
+                );
+
+                let mut writer = ManifestWriterBuilder::new(
+                    self.table
+                        .file_io()
+                        .new_output(&child_manifest_path)?,
+                    Some(self.snapshot_id),
+                    self.key_metadata.clone(),
+                    self.table.metadata().current_schema().clone(),
+                    self.table.metadata().default_partition_spec().as_ref().clone(),
+                )
+                .build_v3_data();
+
+                for entry in &inline_entries {
+                    writer.add_entry(entry.clone())?;
+                }
+                let child_manifest_file = writer.write_manifest_file().await?;
+
+                entries.push(RootManifestEntry::ManifestRef {
+                    manifest_file: child_manifest_file,
+                    mdv: None,
+                });
+            }
+        }
+
+        // Build root manifest metadata
         let rm_metadata = RootManifestMetadata {
             schema: self.table.metadata().current_schema().clone(),
             schema_id: self.table.metadata().current_schema_id(),

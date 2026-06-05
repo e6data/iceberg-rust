@@ -135,7 +135,7 @@ pub fn write_parquet_manifest(
 }
 
 /// Convert ManifestEntry slice to Arrow RecordBatch.
-fn manifest_entries_to_record_batch(
+pub(super) fn manifest_entries_to_record_batch(
     entries: &[ManifestEntry],
     schema: &Arc<ArrowSchema>,
     partition_type: &StructType,
@@ -428,7 +428,7 @@ fn parse_parquet_manifest_metadata(
     ManifestMetadata::parse(&map)
 }
 
-fn record_batch_to_manifest_entries(
+pub(super) fn record_batch_to_manifest_entries(
     batch: &RecordBatch,
     metadata: &ManifestMetadata,
     partition_type: &StructType,

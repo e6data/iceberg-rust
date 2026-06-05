@@ -16,6 +16,8 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
+#[allow(unused_imports)]
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::ops::RangeFrom;
 
@@ -1037,6 +1039,59 @@ impl<'a> SnapshotProducer<'a> {
         } else {
             vec![]
         };
+
+        // Handle file removals (compaction / overwrite operations)
+        let removed_data_files = std::mem::take(&mut self.removed_data_files);
+        if !removed_data_files.is_empty() {
+            let paths_to_remove: HashSet<String> = removed_data_files
+                .iter()
+                .map(|df| df.file_path.clone())
+                .collect();
+
+            // Remove matching inline entries directly
+            entries.retain(|entry| match entry {
+                RootManifestEntry::Inline(me) => !paths_to_remove.contains(&me.data_file.file_path),
+                RootManifestEntry::ManifestRef { .. } => true,
+            });
+
+            // For manifest refs: build MDVs by scanning child manifests for removed paths.
+            // Load each referenced manifest, find row indices of files being removed,
+            // and create/merge MDV bitmaps.
+            for entry in entries.iter_mut() {
+                if let RootManifestEntry::ManifestRef {
+                    manifest_file,
+                    mdv,
+                } = entry
+                {
+                    let manifest = manifest_file
+                        .load_manifest(self.table.file_io())
+                        .await?;
+
+                    let mut new_mdv = match mdv.as_ref() {
+                        Some(existing_bytes) => {
+                            use crate::spec::root_manifest::ManifestDeleteVector;
+                            ManifestDeleteVector::deserialize(existing_bytes)?
+                        }
+                        None => {
+                            use crate::spec::root_manifest::ManifestDeleteVector;
+                            ManifestDeleteVector::new()
+                        }
+                    };
+
+                    let mut found_any = false;
+                    for (idx, entry) in manifest.entries().iter().enumerate() {
+                        if paths_to_remove.contains(&entry.data_file.file_path) {
+                            new_mdv.mark_deleted(idx as u32);
+                            found_any = true;
+                        }
+                    }
+
+                    if found_any {
+                        *mdv = Some(new_mdv.serialize()?);
+                    }
+                }
+            }
+        }
 
         // Add new data files as inline entries
         let added_data_files = std::mem::take(&mut self.added_data_files);

@@ -21,8 +21,10 @@
 //! It can contain both manifest references (pointing to child manifest files) and
 //! inline data/delete file entries, enabling single-file commits for small writes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+use roaring::RoaringBitmap;
 
 use arrow_array::builder::{BinaryBuilder, Int32Builder, Int64Builder, StringBuilder};
 use arrow_array::{Array, ArrayRef, RecordBatch};
@@ -91,6 +93,81 @@ pub enum RootManifestEntry {
     },
     /// Inline data or delete file entry (same shape as ManifestEntry).
     Inline(ManifestEntry),
+}
+
+/// A manifest delete vector: marks specific row indices in a child manifest as
+/// logically deleted without rewriting the manifest file.
+///
+/// Used during compaction (replace_data_files) on V4 tables to soft-delete
+/// entries in child manifests. The bitmap is serialized as roaring bitmap bytes
+/// and stored in the `mdv_bitmap` column of root manifest reference entries.
+#[derive(Debug, Clone)]
+pub struct ManifestDeleteVector {
+    bitmap: RoaringBitmap,
+}
+
+impl ManifestDeleteVector {
+    /// Create an empty MDV.
+    pub fn new() -> Self {
+        Self {
+            bitmap: RoaringBitmap::new(),
+        }
+    }
+
+    /// Mark a row index as deleted.
+    pub fn mark_deleted(&mut self, row_index: u32) {
+        self.bitmap.insert(row_index);
+    }
+
+    /// Check if a row index is deleted.
+    pub fn is_deleted(&self, row_index: u32) -> bool {
+        self.bitmap.contains(row_index)
+    }
+
+    /// Number of deleted entries.
+    pub fn deleted_count(&self) -> u64 {
+        self.bitmap.len()
+    }
+
+    /// Check if the MDV is empty (no deletions).
+    pub fn is_empty(&self) -> bool {
+        self.bitmap.is_empty()
+    }
+
+    /// Serialize to bytes for storage in root manifest.
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.bitmap
+            .serialize_into(&mut buf)
+            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("MDV serialize failed: {e}")))?;
+        Ok(buf)
+    }
+
+    /// Deserialize from bytes read from root manifest.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+        let bitmap = RoaringBitmap::deserialize_from(bytes)
+            .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("MDV deserialize failed: {e}")))?;
+        Ok(Self { bitmap })
+    }
+
+    /// Merge another MDV into this one (union of deleted indices).
+    pub fn merge(&mut self, other: &ManifestDeleteVector) {
+        self.bitmap |= &other.bitmap;
+    }
+
+    /// Fraction of entries deleted (for compaction threshold checks).
+    pub fn deleted_fraction(&self, total_entries: u32) -> f64 {
+        if total_entries == 0 {
+            return 0.0;
+        }
+        self.bitmap.len() as f64 / total_entries as f64
+    }
+}
+
+impl Default for ManifestDeleteVector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Metadata stored in root manifest Parquet file-level key-value metadata.
@@ -164,6 +241,24 @@ impl RootManifest {
             .iter()
             .filter(|e| matches!(e, RootManifestEntry::Inline(_)))
             .count()
+    }
+
+    /// Apply file removals to the root manifest entries.
+    ///
+    /// For inline entries: removes entries whose file_path is in `paths_to_remove`.
+    /// For manifest ref entries: the caller must build MDVs separately by scanning
+    /// child manifests to find row indices matching the removed paths.
+    ///
+    /// Returns the entries with inline removals applied. Manifest refs are unchanged.
+    pub fn remove_inline_files(&mut self, paths_to_remove: &HashSet<String>) {
+        self.entries.retain(|entry| {
+            match entry {
+                RootManifestEntry::Inline(me) => {
+                    !paths_to_remove.contains(&me.data_file.file_path)
+                }
+                RootManifestEntry::ManifestRef { .. } => true,
+            }
+        });
     }
 
     /// Compatibility shim: convert root manifest to a ManifestList.

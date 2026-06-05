@@ -24,7 +24,7 @@ use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
-use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
+use crate::spec::{FormatVersion, SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -161,6 +161,45 @@ pub struct Table {
     object_cache: Arc<ObjectCache>,
 }
 
+/// Custom table property that opts a table into V4 behaviour even when its
+/// catalog-declared `format-version` is V1/V2/V3.
+///
+/// Background: V4 is an in-fork format extension (single-file root manifest +
+/// MDV-based compaction). REST catalogs that pre-date the extension (e.g.
+/// Lakekeeper at commit `bb70173`) validate the declared `format-version`
+/// against `{V1, V2, V3}` at `CREATE TABLE` time and reject anything outside
+/// that set. Patching the catalog isn't always practical -- but the catalog
+/// has no need to understand V4 internals: it stores `metadata.json` blobs,
+/// the snapshot's `manifest_list` field as an opaque S3 path, and table
+/// properties verbatim. The V4 mechanics live entirely inside the Parquet
+/// root-manifest file content on object storage; the catalog never reads it.
+///
+/// The pattern, end to end:
+///
+/// 1. Create the table with `format-version = "3"` (or V2/V1). The catalog
+///    accepts.
+/// 2. Set this property to `"4"` either at create time or via a
+///    `SetProperties` update. The catalog stores it verbatim.
+/// 3. ALL e6-controlled writers and readers MUST route behaviour through
+///    [`Table::effective_format_version`] rather than
+///    [`TableMetadata::format_version`]. The latter remains the source of
+///    truth for catalog wire-format serialisation; the former is what
+///    decides "do I take the V4 commit / scan path".
+/// 4. Internal V4 writes (root manifest content, MDV bitmaps, etc.) live in
+///    the manifest file's own header -- a catalog round-trip never sees or
+///    rewrites them.
+///
+/// IMPORTANT: this opt-in is invisible to non-e6 readers (Trino, Spark via
+/// upstream iceberg lib). Those readers will see `format-version = 3`, try to
+/// read the `manifest_list` as an Avro file, and fail because it is actually
+/// a Parquet root manifest. Tables using this property MUST only be served by
+/// readers that honour [`Table::effective_format_version`].
+pub const E6_ACTUAL_FORMAT_VERSION_KEY: &str = "e6.actual-format-version";
+
+/// Property value that means "treat this table as V4 even though the
+/// catalog-declared format-version is lower". Anything else is ignored.
+const E6_ACTUAL_FORMAT_VERSION_V4: &str = "4";
+
 impl Table {
     /// Sets the [`Table`] metadata and returns an updated instance with the new metadata applied.
     pub(crate) fn with_metadata(mut self, metadata: TableMetadataRef) -> Self {
@@ -186,6 +225,39 @@ impl Table {
     /// Returns current metadata.
     pub fn metadata(&self) -> &TableMetadata {
         &self.metadata
+    }
+
+    /// Returns the format version that should drive **behaviour** dispatch for
+    /// this table (which commit path to take, whether the rebalance action is
+    /// available, which scan implementation to use, etc.). This is NOT the
+    /// version used for catalog wire-format serialisation -- use
+    /// [`TableMetadata::format_version`] for that.
+    ///
+    /// Precedence:
+    ///
+    /// 1. If `metadata.format_version()` is already [`FormatVersion::V4`],
+    ///    return V4. (Lets in-process / file-system / lakekeeper-fork-aware
+    ///    setups skip the property dance.)
+    /// 2. If the table property `e6.actual-format-version` equals `"4"`,
+    ///    return V4. (The portable-with-V3-catalog path.)
+    /// 3. Otherwise return `metadata.format_version()` as-is.
+    ///
+    /// See [`E6_ACTUAL_FORMAT_VERSION_KEY`] for the property semantics.
+    pub fn effective_format_version(&self) -> FormatVersion {
+        let declared = self.metadata.format_version();
+        if declared == FormatVersion::V4 {
+            return FormatVersion::V4;
+        }
+        if self
+            .metadata
+            .properties()
+            .get(E6_ACTUAL_FORMAT_VERSION_KEY)
+            .map(String::as_str)
+            == Some(E6_ACTUAL_FORMAT_VERSION_V4)
+        {
+            return FormatVersion::V4;
+        }
+        declared
     }
 
     /// Returns current metadata ref.
@@ -416,5 +488,102 @@ mod tests {
             .unwrap();
         assert!(!table.readonly());
         assert_eq!(table.identifier.name(), "table");
+    }
+
+    // -- effective_format_version tests -----------------------------------
+
+    /// Build a Table whose metadata declares V2 (from a fixture) but lets the
+    /// caller plug a properties map in. Returns a (table, declared) tuple so
+    /// the assertion side can keep `declared` separate from `effective`.
+    async fn build_v2_table_with_properties(
+        properties: std::collections::HashMap<String, String>,
+    ) -> Table {
+        let metadata_file_name = "TableMetadataV2Valid.json";
+        let metadata_file_path = format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            metadata_file_name
+        );
+        let file_io = FileIO::from_path(&metadata_file_path)
+            .unwrap()
+            .build()
+            .unwrap();
+        let metadata_file = file_io.new_input(&metadata_file_path).unwrap();
+        let metadata_bytes = metadata_file.read().await.unwrap();
+        let table_metadata =
+            serde_json::from_slice::<TableMetadata>(&metadata_bytes).unwrap();
+
+        let new_metadata = table_metadata
+            .into_builder(Some(metadata_file_path.clone()))
+            .set_properties(properties)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+        Table::builder()
+            .metadata(new_metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .build()
+            .unwrap()
+    }
+
+    /// A V2 table without the property reports its declared version.
+    #[tokio::test]
+    async fn effective_format_version_declared_v2_no_property() {
+        let table = build_v2_table_with_properties(Default::default()).await;
+        assert_eq!(table.metadata().format_version(), FormatVersion::V2);
+        assert_eq!(table.effective_format_version(), FormatVersion::V2);
+    }
+
+    /// A V2 table with the `e6.actual-format-version=4` opt-in returns V4
+    /// from `effective_format_version` while leaving `metadata.format_version`
+    /// unchanged (this is the Lakekeeper-friendly path: catalog still sees V2,
+    /// our writers/readers dispatch as V4).
+    #[tokio::test]
+    async fn effective_format_version_property_overrides_v2_to_v4() {
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            E6_ACTUAL_FORMAT_VERSION_KEY.to_string(),
+            "4".to_string(),
+        );
+        let table = build_v2_table_with_properties(props).await;
+        assert_eq!(table.metadata().format_version(), FormatVersion::V2);
+        assert_eq!(table.effective_format_version(), FormatVersion::V4);
+    }
+
+    /// A bogus / unsupported property value MUST NOT silently downgrade or
+    /// promote the format. We only recognise the literal string "4"; anything
+    /// else falls back to the declared version.
+    #[tokio::test]
+    async fn effective_format_version_unknown_property_value_falls_back() {
+        for bogus in &["5", "v4", " 4", "", "true", "false"] {
+            let mut props = std::collections::HashMap::new();
+            props.insert(
+                E6_ACTUAL_FORMAT_VERSION_KEY.to_string(),
+                (*bogus).to_string(),
+            );
+            let table = build_v2_table_with_properties(props).await;
+            assert_eq!(
+                table.effective_format_version(),
+                FormatVersion::V2,
+                "property value {bogus:?} should not opt the table into V4"
+            );
+        }
+    }
+
+    /// The property only OPTS IN to V4 -- a value of "3" doesn't opt a V2
+    /// table into V3 (V3 isn't gated behind this property at all).
+    #[tokio::test]
+    async fn effective_format_version_property_only_opts_into_v4() {
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            E6_ACTUAL_FORMAT_VERSION_KEY.to_string(),
+            "3".to_string(),
+        );
+        let table = build_v2_table_with_properties(props).await;
+        assert_eq!(table.effective_format_version(), FormatVersion::V2);
     }
 }

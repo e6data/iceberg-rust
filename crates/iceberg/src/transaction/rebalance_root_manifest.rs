@@ -145,12 +145,22 @@ impl Default for RebalanceRootManifestAction {
 #[async_trait]
 impl TransactionAction for RebalanceRootManifestAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        // 1. Verify V4
-        if table.metadata().format_version() != FormatVersion::V4 {
+        // 1. Verify V4. We accept both:
+        //    a) tables that declare V4 to the catalog directly (in-process
+        //       / file-system catalogs / a V4-aware REST catalog), and
+        //    b) tables that declare V3 but carry the e6 opt-in property
+        //       (`e6.actual-format-version=4`) -- the path for V3-only
+        //       catalogs like Lakekeeper pre-V4. See
+        //       `crate::table::E6_ACTUAL_FORMAT_VERSION_KEY`.
+        // The `effective_format_version` accessor is the single source of
+        // truth for behaviour dispatch.
+        if table.effective_format_version() != FormatVersion::V4 {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 format!(
-                    "rebalance_root_manifest requires format version V4, found {:?}",
+                    "rebalance_root_manifest requires format version V4 \
+                     (effective={:?}, declared={:?})",
+                    table.effective_format_version(),
                     table.metadata().format_version()
                 ),
             ));

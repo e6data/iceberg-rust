@@ -910,8 +910,12 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<ActionCommit> {
-        // V4 uses root manifest (single-file commit) instead of manifest list
-        if self.table.metadata().format_version() == FormatVersion::V4 {
+        // V4 uses root manifest (single-file commit) instead of manifest list.
+        // Dispatch goes through `effective_format_version()` so this branch
+        // also fires for tables that declare V3 to a strict catalog (e.g.
+        // Lakekeeper pre-V4) but carry the `e6.actual-format-version=4`
+        // property -- see `crate::table::E6_ACTUAL_FORMAT_VERSION_KEY`.
+        if self.table.effective_format_version() == FormatVersion::V4 {
             return self.commit_v4(snapshot_produce_operation, process).await;
         }
 

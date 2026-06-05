@@ -161,44 +161,12 @@ pub struct Table {
     object_cache: Arc<ObjectCache>,
 }
 
-/// Custom table property that opts a table into V4 behaviour even when its
-/// catalog-declared `format-version` is V1/V2/V3.
-///
-/// Background: V4 is an in-fork format extension (single-file root manifest +
-/// MDV-based compaction). REST catalogs that pre-date the extension (e.g.
-/// Lakekeeper at commit `bb70173`) validate the declared `format-version`
-/// against `{V1, V2, V3}` at `CREATE TABLE` time and reject anything outside
-/// that set. Patching the catalog isn't always practical -- but the catalog
-/// has no need to understand V4 internals: it stores `metadata.json` blobs,
-/// the snapshot's `manifest_list` field as an opaque S3 path, and table
-/// properties verbatim. The V4 mechanics live entirely inside the Parquet
-/// root-manifest file content on object storage; the catalog never reads it.
-///
-/// The pattern, end to end:
-///
-/// 1. Create the table with `format-version = "3"` (or V2/V1). The catalog
-///    accepts.
-/// 2. Set this property to `"4"` either at create time or via a
-///    `SetProperties` update. The catalog stores it verbatim.
-/// 3. ALL e6-controlled writers and readers MUST route behaviour through
-///    [`Table::effective_format_version`] rather than
-///    [`TableMetadata::format_version`]. The latter remains the source of
-///    truth for catalog wire-format serialisation; the former is what
-///    decides "do I take the V4 commit / scan path".
-/// 4. Internal V4 writes (root manifest content, MDV bitmaps, etc.) live in
-///    the manifest file's own header -- a catalog round-trip never sees or
-///    rewrites them.
-///
-/// IMPORTANT: this opt-in is invisible to non-e6 readers (Trino, Spark via
-/// upstream iceberg lib). Those readers will see `format-version = 3`, try to
-/// read the `manifest_list` as an Avro file, and fail because it is actually
-/// a Parquet root manifest. Tables using this property MUST only be served by
-/// readers that honour [`Table::effective_format_version`].
-pub const E6_ACTUAL_FORMAT_VERSION_KEY: &str = "e6.actual-format-version";
-
-/// Property value that means "treat this table as V4 even though the
-/// catalog-declared format-version is lower". Anything else is ignored.
-const E6_ACTUAL_FORMAT_VERSION_V4: &str = "4";
+// V4 opt-in property constants live in `crate::spec::table_metadata` next to
+// `TableMetadata::effective_format_version`, which is the single source of
+// truth for the dispatch rule. Re-exported from this module for the historical
+// API (`iceberg::table::E6_ACTUAL_FORMAT_VERSION_KEY` -- some downstream
+// crates already import it from here).
+pub use crate::spec::E6_ACTUAL_FORMAT_VERSION_KEY;
 
 impl Table {
     /// Sets the [`Table`] metadata and returns an updated instance with the new metadata applied.
@@ -228,36 +196,18 @@ impl Table {
     }
 
     /// Returns the format version that should drive **behaviour** dispatch for
-    /// this table (which commit path to take, whether the rebalance action is
-    /// available, which scan implementation to use, etc.). This is NOT the
-    /// version used for catalog wire-format serialisation -- use
-    /// [`TableMetadata::format_version`] for that.
+    /// this table -- thin delegate to
+    /// [`TableMetadata::effective_format_version`], which is the single
+    /// source of truth for the precedence rule (declared V4 ⇒ V4, else the
+    /// `e6.actual-format-version=4` property ⇒ V4, else declared).
     ///
-    /// Precedence:
-    ///
-    /// 1. If `metadata.format_version()` is already [`FormatVersion::V4`],
-    ///    return V4. (Lets in-process / file-system / lakekeeper-fork-aware
-    ///    setups skip the property dance.)
-    /// 2. If the table property `e6.actual-format-version` equals `"4"`,
-    ///    return V4. (The portable-with-V3-catalog path.)
-    /// 3. Otherwise return `metadata.format_version()` as-is.
-    ///
-    /// See [`E6_ACTUAL_FORMAT_VERSION_KEY`] for the property semantics.
+    /// This convenience exists so call sites that already hold a `&Table`
+    /// don't have to chain through `.metadata()`; sites that hold only a
+    /// `&TableMetadata` (e.g. `Snapshot::load_manifest_list`) call the
+    /// method on the metadata directly.
+    #[inline]
     pub fn effective_format_version(&self) -> FormatVersion {
-        let declared = self.metadata.format_version();
-        if declared == FormatVersion::V4 {
-            return FormatVersion::V4;
-        }
-        if self
-            .metadata
-            .properties()
-            .get(E6_ACTUAL_FORMAT_VERSION_KEY)
-            .map(String::as_str)
-            == Some(E6_ACTUAL_FORMAT_VERSION_V4)
-        {
-            return FormatVersion::V4;
-        }
-        declared
+        self.metadata.effective_format_version()
     }
 
     /// Returns current metadata ref.

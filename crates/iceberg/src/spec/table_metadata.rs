@@ -53,6 +53,35 @@ pub(crate) static INITIAL_SEQUENCE_NUMBER: i64 = 0;
 pub const INITIAL_ROW_ID: u64 = 0;
 /// Minimum format version that supports row lineage (v3).
 pub const MIN_FORMAT_VERSION_ROW_LINEAGE: FormatVersion = FormatVersion::V3;
+
+/// Custom table property that opts a table into V4 behaviour even when its
+/// catalog-declared `format-version` is V1/V2/V3. Read by
+/// [`TableMetadata::effective_format_version`].
+///
+/// Why this exists: REST catalogs that pre-date V4 (e.g. Lakekeeper at commit
+/// `bb70173`) validate the declared `format-version` against `{V1, V2, V3}`
+/// at `CREATE TABLE` time and reject anything outside that set. But the
+/// catalog doesn't need to understand V4 internals: it stores `metadata.json`
+/// blobs, the snapshot's `manifest_list` field as an opaque S3 path, and
+/// table properties verbatim. The V4 mechanics (single-file Parquet root
+/// manifest, MDV-based compaction) live entirely inside object storage; the
+/// catalog never reads them.
+///
+/// This property lets us declare V3 to such catalogs and route every
+/// e6-controlled writer/reader through the V4 paths via
+/// [`TableMetadata::effective_format_version`].
+///
+/// IMPORTANT: the opt-in is invisible to non-e6 readers (Trino, Spark via
+/// upstream iceberg lib). Those readers will see `format-version=3`, try to
+/// read the `manifest_list` as Avro, and fail because it is actually a
+/// Parquet root manifest. Tables using this property MUST only be served by
+/// readers that honour [`TableMetadata::effective_format_version`].
+pub const E6_ACTUAL_FORMAT_VERSION_KEY: &str = "e6.actual-format-version";
+
+/// Property value that opts a table into V4 behaviour. Anything else is
+/// ignored so a typo can never silently promote or demote a table.
+pub const E6_ACTUAL_FORMAT_VERSION_V4_VALUE: &str = "4";
+
 /// Reference to [`TableMetadata`].
 pub type TableMetadataRef = Arc<TableMetadata>;
 
@@ -167,6 +196,46 @@ impl TableMetadata {
     /// Returns format version of this metadata.
     #[inline]
     pub fn format_version(&self) -> FormatVersion {
+        self.format_version
+    }
+
+    /// Returns the format version that should drive **behaviour** dispatch
+    /// (which commit path, which read path, whether rebalance is available).
+    /// This is NOT the version used for catalog wire-format serialisation --
+    /// use [`Self::format_version`] for that.
+    ///
+    /// Precedence:
+    ///
+    /// 1. If the declared `format_version` is already
+    ///    [`FormatVersion::V4`], return V4. (Lets file-system / V4-aware
+    ///    REST catalogs skip the property dance.)
+    /// 2. If the table property [`E6_ACTUAL_FORMAT_VERSION_KEY`] equals
+    ///    [`E6_ACTUAL_FORMAT_VERSION_V4_VALUE`], return V4. (The
+    ///    portable-with-V3-catalog path -- e.g. Lakekeeper pre-V4, which
+    ///    validates `format-version` at create time but stores arbitrary
+    ///    table properties verbatim.)
+    /// 3. Otherwise return the declared `format_version` as-is.
+    ///
+    /// Bogus property values (anything other than the literal V4 value)
+    /// are ignored so a typo can never silently promote or demote a table.
+    ///
+    /// IMPORTANT: tables opted in via the property are only readable by
+    /// e6-controlled clients that honour this method. A non-e6 reader
+    /// (Trino, Spark via upstream iceberg-rust) will see V3 declared, try
+    /// to parse the V4 Parquet root manifest as Avro, and fail.
+    #[inline]
+    pub fn effective_format_version(&self) -> FormatVersion {
+        if self.format_version == FormatVersion::V4 {
+            return FormatVersion::V4;
+        }
+        if self
+            .properties
+            .get(E6_ACTUAL_FORMAT_VERSION_KEY)
+            .map(String::as_str)
+            == Some(E6_ACTUAL_FORMAT_VERSION_V4_VALUE)
+        {
+            return FormatVersion::V4;
+        }
         self.format_version
     }
 

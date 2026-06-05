@@ -212,7 +212,17 @@ impl Snapshot {
         // V4 stores a root manifest (Parquet) instead of a manifest list (Avro).
         // Separate refs (become ManifestFile entries) from inlines (injected
         // directly into the scan pipeline, bypassing ManifestFile::load_manifest).
-        if table_metadata.format_version() == FormatVersion::V4 {
+        //
+        // We dispatch on `effective_format_version()` rather than the
+        // catalog-declared `format_version()` so tables that declare V3 to
+        // a strict catalog (e.g. Lakekeeper pre-V4) but carry the
+        // `e6.actual-format-version=4` table property are read as V4 here.
+        // Without this match, a V3-declared-V4-marker table would write a
+        // Parquet root manifest on commit (the writer side already routes
+        // via `Table::effective_format_version`) and then fail on the next
+        // scan trying to parse the Parquet as Avro. See
+        // `crate::spec::table_metadata::E6_ACTUAL_FORMAT_VERSION_KEY`.
+        if table_metadata.effective_format_version() == FormatVersion::V4 {
             let (_, entries) =
                 crate::spec::root_manifest::read_root_manifest(manifest_list_content.clone())?;
 

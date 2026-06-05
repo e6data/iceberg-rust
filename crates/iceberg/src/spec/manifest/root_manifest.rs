@@ -286,11 +286,15 @@ impl RootManifest {
                         has_inline_data = true;
                         inline_data_count += 1;
                         inline_data_rows += me.data_file.record_count;
-                        // Update partition bounds
+                        // Update partition bounds — on error, fall back to no bounds
+                        // (safe: query planner scans all entries instead of pruning)
                         if let Some(ref mut stats) = data_field_stats {
                             for (literal, stat) in me.data_file.partition.iter().zip(stats.iter_mut()) {
                                 let prim = literal.and_then(|v| v.as_primitive_literal());
-                                let _ = stat.update(prim);
+                                if stat.update(prim).is_err() {
+                                    data_field_stats = None;
+                                    break;
+                                }
                             }
                         }
                     }

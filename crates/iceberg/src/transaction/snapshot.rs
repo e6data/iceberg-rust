@@ -1019,8 +1019,34 @@ impl<'a> SnapshotProducer<'a> {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
         })?;
 
-        // Load existing root manifest entries from current snapshot (or use cache)
-        let mut entries: Vec<RootManifestEntry> = if let Some(cached) = self.cached_root_entries.take() {
+        // Load existing root manifest entries from current snapshot (or use cache).
+        //
+        // Cache validation: the cached entries carry a snapshot_id from when they were
+        // built. If the table's current_snapshot_id has moved (concurrent commit won
+        // the CAS race and our retry refreshed the table metadata), the cache is stale
+        // and must be discarded. This prevents silently dropping concurrent writes.
+        let cached = self.cached_root_entries.take();
+        let current_snapshot_id = self.table.metadata().current_snapshot_id();
+        let cache_valid = cached.as_ref().map_or(false, |entries| {
+            // Cache is valid if it was built for the current snapshot. We check by
+            // looking at the snapshot_id of the most recent inline entry — it should
+            // match the snapshot that produced the cache. If there's no inline entry
+            // with a snapshot_id, the cache may be from a rebalanced state (all refs),
+            // which is still valid since refs point to immutable child manifests.
+            let cached_snapshot_id = entries.iter().rev().find_map(|e| match e {
+                RootManifestEntry::Inline(me) => me.snapshot_id,
+                _ => None,
+            });
+            match (cached_snapshot_id, current_snapshot_id) {
+                // Cache built from snapshot N, table is at snapshot N — valid
+                (Some(cached_sid), Some(current_sid)) if cached_sid == current_sid => true,
+                // Cache has no inline entries (all refs) — valid regardless
+                (None, _) => true,
+                // Cache built from snapshot N, table moved to M — stale, discard
+                _ => false,
+            }
+        });
+        let mut entries: Vec<RootManifestEntry> = if let Some(cached) = cached.filter(|_| cache_valid) {
             cached
         } else if let Some(current_snapshot) =
             self.table.metadata().current_snapshot()
@@ -1192,30 +1218,31 @@ impl<'a> SnapshotProducer<'a> {
             .count();
 
         if inline_count > inline_threshold {
-            // Extract inline entries, keep manifest refs
-            let mut inline_entries: Vec<ManifestEntry> = Vec::new();
+            // Split inline entries by content type (data vs delete)
+            let mut data_entries: Vec<ManifestEntry> = Vec::new();
+            let mut delete_entries: Vec<ManifestEntry> = Vec::new();
             entries.retain(|e| match e {
                 RootManifestEntry::Inline(me) => {
-                    inline_entries.push(me.clone());
+                    match me.data_file.content {
+                        crate::spec::DataContentType::Data => data_entries.push(me.clone()),
+                        _ => delete_entries.push(me.clone()),
+                    }
                     false // remove from entries
                 }
                 RootManifestEntry::ManifestRef { .. } => true, // keep
             });
 
-            // Write inline entries as a child manifest file
-            if !inline_entries.is_empty() {
-                let child_manifest_path = format!(
+            // Flush data entries to a child data manifest
+            if !data_entries.is_empty() {
+                let path = format!(
                     "{}/{}/{}-m{}.parquet",
                     self.table.metadata().location(),
                     META_ROOT_PATH,
                     self.commit_uuid,
                     self.manifest_counter.next().unwrap_or(0),
                 );
-
                 let mut writer = ManifestWriterBuilder::new(
-                    self.table
-                        .file_io()
-                        .new_output(&child_manifest_path)?,
+                    self.table.file_io().new_output(&path)?,
                     Some(self.snapshot_id),
                     self.key_metadata.clone(),
                     self.table.metadata().current_schema().clone(),
@@ -1223,13 +1250,38 @@ impl<'a> SnapshotProducer<'a> {
                 )
                 .build_v3_data();
 
-                for entry in &inline_entries {
+                for entry in &data_entries {
                     writer.add_entry(entry.clone())?;
                 }
-                let child_manifest_file = writer.write_manifest_file().await?;
-
                 entries.push(RootManifestEntry::ManifestRef {
-                    manifest_file: child_manifest_file,
+                    manifest_file: writer.write_manifest_file().await?,
+                    mdv: None,
+                });
+            }
+
+            // Flush delete entries to a separate child delete manifest
+            if !delete_entries.is_empty() {
+                let path = format!(
+                    "{}/{}/{}-m{}.parquet",
+                    self.table.metadata().location(),
+                    META_ROOT_PATH,
+                    self.commit_uuid,
+                    self.manifest_counter.next().unwrap_or(0),
+                );
+                let mut writer = ManifestWriterBuilder::new(
+                    self.table.file_io().new_output(&path)?,
+                    Some(self.snapshot_id),
+                    self.key_metadata.clone(),
+                    self.table.metadata().current_schema().clone(),
+                    self.table.metadata().default_partition_spec().as_ref().clone(),
+                )
+                .build_v3_deletes();
+
+                for entry in &delete_entries {
+                    writer.add_entry(entry.clone())?;
+                }
+                entries.push(RootManifestEntry::ManifestRef {
+                    manifest_file: writer.write_manifest_file().await?,
                     mdv: None,
                 });
             }

@@ -1533,4 +1533,77 @@ mod tests {
         let entries = rm.into_entries();
         assert_eq!(entries.len(), 2);
     }
+
+    #[test]
+    fn mdv_comprehensive() {
+        let mut mdv = ManifestDeleteVector::new();
+        assert!(mdv.is_empty());
+        assert_eq!(mdv.deleted_count(), 0);
+        assert_eq!(mdv.deleted_fraction(100), 0.0);
+
+        // Mark some rows
+        mdv.mark_deleted(0);
+        mdv.mark_deleted(5);
+        mdv.mark_deleted(10);
+        assert!(!mdv.is_empty());
+        assert_eq!(mdv.deleted_count(), 3);
+        assert!(mdv.is_deleted(0));
+        assert!(mdv.is_deleted(5));
+        assert!(mdv.is_deleted(10));
+        assert!(!mdv.is_deleted(1));
+        assert!(!mdv.is_deleted(99));
+        assert!((mdv.deleted_fraction(10) - 0.3).abs() < f64::EPSILON);
+
+        // Serialize round-trip
+        let bytes = mdv.serialize().unwrap();
+        let mdv2 = ManifestDeleteVector::deserialize(&bytes).unwrap();
+        assert_eq!(mdv2.deleted_count(), 3);
+        assert!(mdv2.is_deleted(0));
+        assert!(mdv2.is_deleted(5));
+        assert!(mdv2.is_deleted(10));
+
+        // Merge
+        let mut mdv3 = ManifestDeleteVector::new();
+        mdv3.mark_deleted(20);
+        mdv3.mark_deleted(30);
+        mdv3.merge(&mdv2);
+        assert_eq!(mdv3.deleted_count(), 5);
+        assert!(mdv3.is_deleted(0));
+        assert!(mdv3.is_deleted(20));
+        assert!(mdv3.is_deleted(30));
+
+        // Idempotent insert
+        mdv3.mark_deleted(0);
+        assert_eq!(mdv3.deleted_count(), 5);
+    }
+
+    #[test]
+    fn remove_inline_files() {
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let metadata = test_metadata(&schema, &partition_spec);
+
+        let entries = vec![
+            RootManifestEntry::Inline(test_inline_entry("s3://bucket/keep.parquet", 100)),
+            RootManifestEntry::Inline(test_inline_entry("s3://bucket/remove.parquet", 200)),
+            RootManifestEntry::ManifestRef {
+                manifest_file: test_manifest_file("s3://bucket/manifest-1.avro"),
+                mdv: None,
+            },
+        ];
+
+        let mut rm = RootManifest::new(metadata, entries);
+        assert_eq!(rm.inline_count(), 2);
+        assert_eq!(rm.entries().len(), 3);
+
+        let mut to_remove = std::collections::HashSet::new();
+        to_remove.insert("s3://bucket/remove.parquet".to_string());
+        rm.remove_inline_files(&to_remove);
+
+        assert_eq!(rm.inline_count(), 1);
+        assert_eq!(rm.entries().len(), 2); // 1 inline + 1 ref
+        // Verify the kept inline entry
+        let kept = rm.inline_entries().next().unwrap();
+        assert_eq!(kept.data_file.file_path, "s3://bucket/keep.parquet");
+    }
 }

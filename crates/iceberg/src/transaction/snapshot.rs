@@ -1252,8 +1252,18 @@ impl<'a> SnapshotProducer<'a> {
                 for entry in &data_entries {
                     writer.add_entry(entry.clone())?;
                 }
+                // V4 child manifests are Parquet -- the path was templated
+                // with the `.parquet` extension just above, so the underlying
+                // bytes MUST be Parquet to match. Using the Avro writer
+                // (`write_manifest_file`) here previously produced
+                // .parquet-named files with Avro magic, which any reader
+                // dispatched by extension (tessellate's live-set scan, the
+                // iceberg-rust scan path) fails on with
+                // "Invalid Parquet file. Corrupt footer".
+                // `RebalanceRootManifestAction` already takes the Parquet
+                // path; this lines commit_v4 up with that convention.
                 entries.push(RootManifestEntry::ManifestRef {
-                    manifest_file: writer.write_manifest_file().await?,
+                    manifest_file: writer.write_manifest_file_parquet().await?,
                     mdv: None,
                 });
             }
@@ -1279,8 +1289,11 @@ impl<'a> SnapshotProducer<'a> {
                 for entry in &delete_entries {
                     writer.add_entry(entry.clone())?;
                 }
+                // See the matching note on the data-entry flush above:
+                // .parquet path => Parquet bytes. Avro here silently writes
+                // bytes that fail to read.
                 entries.push(RootManifestEntry::ManifestRef {
-                    manifest_file: writer.write_manifest_file().await?,
+                    manifest_file: writer.write_manifest_file_parquet().await?,
                     mdv: None,
                 });
             }

@@ -45,6 +45,7 @@ pub struct FastAppendAction {
     /// an id the caller can also use in `StatisticsFile` entries within
     /// the same transaction.
     snapshot_id_override: Option<i64>,
+    cached_root_entries: Option<Vec<crate::spec::root_manifest::RootManifestEntry>>,
 }
 
 impl FastAppendAction {
@@ -56,6 +57,7 @@ impl FastAppendAction {
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
             snapshot_id_override: None,
+            cached_root_entries: None,
         }
     }
 
@@ -107,6 +109,13 @@ impl FastAppendAction {
         self.snapshot_id_override = Some(snapshot_id);
         self
     }
+
+    /// Pass cached root manifest entries to avoid re-reading from S3 on
+    /// consecutive commits within the same transaction.
+    pub fn with_cached_root_entries(mut self, entries: Vec<crate::spec::root_manifest::RootManifestEntry>) -> Self {
+        self.cached_root_entries = Some(entries);
+        self
+    }
 }
 
 #[async_trait]
@@ -122,6 +131,9 @@ impl TransactionAction for FastAppendAction {
         );
         if let Some(id) = self.snapshot_id_override {
             snapshot_producer = snapshot_producer.with_snapshot_id(id);
+        }
+        if let Some(ref cached) = self.cached_root_entries {
+            snapshot_producer = snapshot_producer.with_cached_root_entries(cached.clone());
         }
 
         // validate added files

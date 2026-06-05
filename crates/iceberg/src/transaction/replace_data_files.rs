@@ -58,6 +58,8 @@ pub struct ReplaceDataFilesAction {
     /// the same transaction (e.g. for compaction carry-forward of
     /// per-snapshot Puffin stats).
     snapshot_id_override: Option<i64>,
+    file_to_manifest_index: Option<HashMap<String, String>>,
+    cached_root_entries: Option<Vec<crate::spec::root_manifest::RootManifestEntry>>,
 }
 
 impl ReplaceDataFilesAction {
@@ -74,6 +76,8 @@ impl ReplaceDataFilesAction {
             added_delete_files: Vec::new(),
             cached_manifests: Arc::new(Mutex::new(None)),
             snapshot_id_override: None,
+            file_to_manifest_index: None,
+            cached_root_entries: None,
         }
     }
 
@@ -153,6 +157,20 @@ impl ReplaceDataFilesAction {
         self.snapshot_id_override = Some(snapshot_id);
         self
     }
+
+    /// Provide a mapping from data file path to manifest path for targeted MDV scanning.
+    /// When set, only manifests known to contain removed files will be loaded during V4 commit.
+    pub fn with_file_manifest_index(mut self, index: HashMap<String, String>) -> Self {
+        self.file_to_manifest_index = Some(index);
+        self
+    }
+
+    /// Pass cached root manifest entries to avoid re-reading from S3 on
+    /// consecutive commits within the same transaction.
+    pub fn with_cached_root_entries(mut self, entries: Vec<crate::spec::root_manifest::RootManifestEntry>) -> Self {
+        self.cached_root_entries = Some(entries);
+        self
+    }
 }
 
 #[async_trait]
@@ -171,6 +189,12 @@ impl TransactionAction for ReplaceDataFilesAction {
 
         if let Some(id) = self.snapshot_id_override {
             snapshot_producer = snapshot_producer.with_snapshot_id(id);
+        }
+        if let Some(ref cached) = self.cached_root_entries {
+            snapshot_producer = snapshot_producer.with_cached_root_entries(cached.clone());
+        }
+        if let Some(ref index) = self.file_to_manifest_index {
+            snapshot_producer = snapshot_producer.with_file_to_manifest_index(index.clone());
         }
 
         // Validate added data files if any

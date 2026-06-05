@@ -152,6 +152,8 @@ pub(crate) struct SnapshotProducer<'a> {
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
     manifest_counter: RangeFrom<u64>,
+    cached_root_entries: Option<Vec<RootManifestEntry>>,
+    file_to_manifest_index: Option<HashMap<String, String>>,
 }
 
 impl<'a> SnapshotProducer<'a> {
@@ -174,6 +176,8 @@ impl<'a> SnapshotProducer<'a> {
             data_sequence_number: None,
             added_delete_files,
             manifest_counter: (0..),
+            cached_root_entries: None,
+            file_to_manifest_index: None,
         }
     }
 
@@ -194,6 +198,16 @@ impl<'a> SnapshotProducer<'a> {
 
     pub(crate) fn with_data_sequence_number(mut self, seq_num: Option<i64>) -> Self {
         self.data_sequence_number = seq_num;
+        self
+    }
+
+    pub(crate) fn with_cached_root_entries(mut self, entries: Vec<RootManifestEntry>) -> Self {
+        self.cached_root_entries = Some(entries);
+        self
+    }
+
+    pub(crate) fn with_file_to_manifest_index(mut self, index: HashMap<String, String>) -> Self {
+        self.file_to_manifest_index = Some(index);
         self
     }
 
@@ -1001,12 +1015,14 @@ impl<'a> SnapshotProducer<'a> {
         let next_seq_num = self.table.metadata().next_sequence_number();
 
         // Generate summary before draining added_data_files
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
+        let mut summary = self.summary(&snapshot_produce_operation).map_err(|err| {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
         })?;
 
-        // Load existing root manifest entries from current snapshot
-        let mut entries: Vec<RootManifestEntry> = if let Some(current_snapshot) =
+        // Load existing root manifest entries from current snapshot (or use cache)
+        let mut entries: Vec<RootManifestEntry> = if let Some(cached) = self.cached_root_entries.take() {
+            cached
+        } else if let Some(current_snapshot) =
             self.table.metadata().current_snapshot()
         {
             let manifest_list_path = current_snapshot.manifest_list();
@@ -1057,12 +1073,35 @@ impl<'a> SnapshotProducer<'a> {
             // For manifest refs: build MDVs by scanning child manifests for removed paths.
             // Load each referenced manifest, find row indices of files being removed,
             // and create/merge MDV bitmaps.
+
+            // If we have an index, only scan manifests that contain removed files
+            let manifests_to_scan: HashSet<String> = if let Some(ref index) = self.file_to_manifest_index {
+                paths_to_remove.iter()
+                    .filter_map(|p| index.get(p).cloned())
+                    .collect()
+            } else {
+                // No index — scan all manifest refs (existing behavior)
+                entries.iter()
+                    .filter_map(|e| match e {
+                        RootManifestEntry::ManifestRef { manifest_file, .. } => Some(manifest_file.manifest_path.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+
+            let mut total_mdv_deleted_files: u64 = 0;
+            let mut total_mdv_deleted_rows: u64 = 0;
+
             for entry in entries.iter_mut() {
                 if let RootManifestEntry::ManifestRef {
                     manifest_file,
                     mdv,
                 } = entry
                 {
+                    if !manifests_to_scan.contains(&manifest_file.manifest_path) {
+                        continue;  // Skip manifests not in the index
+                    }
+
                     let manifest = manifest_file
                         .load_manifest(self.table.file_io())
                         .await?;
@@ -1079,10 +1118,12 @@ impl<'a> SnapshotProducer<'a> {
                     };
 
                     let mut found_any = false;
-                    for (idx, entry) in manifest.entries().iter().enumerate() {
-                        if paths_to_remove.contains(&entry.data_file.file_path) {
+                    for (idx, manifest_entry) in manifest.entries().iter().enumerate() {
+                        if paths_to_remove.contains(&manifest_entry.data_file.file_path) {
                             new_mdv.mark_deleted(idx as u32);
                             found_any = true;
+                            total_mdv_deleted_files += 1;
+                            total_mdv_deleted_rows += manifest_entry.data_file.record_count as u64;
                         }
                     }
 
@@ -1090,6 +1131,17 @@ impl<'a> SnapshotProducer<'a> {
                         *mdv = Some(new_mdv.serialize()?);
                     }
                 }
+            }
+
+            if total_mdv_deleted_files > 0 {
+                summary.additional_properties.insert(
+                    "deleted-data-files".to_string(),
+                    total_mdv_deleted_files.to_string(),
+                );
+                summary.additional_properties.insert(
+                    "deleted-records".to_string(),
+                    total_mdv_deleted_rows.to_string(),
+                );
             }
         }
 
@@ -1185,6 +1237,8 @@ impl<'a> SnapshotProducer<'a> {
             },
         ];
 
-        Ok(ActionCommit::new(updates, requirements).with_manifest_paths(vec![root_manifest_path]))
+        Ok(ActionCommit::new(updates, requirements)
+            .with_manifest_paths(vec![root_manifest_path])
+            .with_root_manifest_entries(entries))
     }
 }

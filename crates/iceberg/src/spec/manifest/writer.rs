@@ -531,7 +531,7 @@ impl ManifestWriter {
     }
 }
 
-struct PartitionFieldStats {
+pub(super) struct PartitionFieldStats {
     partition_type: PrimitiveType,
 
     contains_null: bool,

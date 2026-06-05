@@ -256,13 +256,28 @@ impl RootManifest {
             }
         }
 
-        // Group inline entries by content type
+        // Group inline entries by content type and compute partition bounds
         let mut inline_data_count: u32 = 0;
         let mut inline_data_rows: u64 = 0;
         let mut inline_delete_count: u32 = 0;
         let mut inline_delete_rows: u64 = 0;
         let mut has_inline_data = false;
         let mut has_inline_delete = false;
+
+        // Build partition field stats for data inline entries
+        let partition_type = self.metadata.partition_spec
+            .partition_type(&self.metadata.schema)
+            .ok();
+
+        let mut data_field_stats: Option<Vec<super::writer::PartitionFieldStats>> =
+            partition_type.as_ref().map(|pt| {
+                pt.fields()
+                    .iter()
+                    .filter_map(|f| f.field_type.as_primitive_type().map(|p| {
+                        super::writer::PartitionFieldStats::new(p.clone())
+                    }))
+                    .collect()
+            });
 
         for entry in &self.entries {
             if let RootManifestEntry::Inline(me) = entry {
@@ -271,6 +286,13 @@ impl RootManifest {
                         has_inline_data = true;
                         inline_data_count += 1;
                         inline_data_rows += me.data_file.record_count;
+                        // Update partition bounds
+                        if let Some(ref mut stats) = data_field_stats {
+                            for (literal, stat) in me.data_file.partition.iter().zip(stats.iter_mut()) {
+                                let prim = literal.and_then(|v| v.as_primitive_literal());
+                                let _ = stat.update(prim);
+                            }
+                        }
                     }
                     DataContentType::EqualityDeletes
                     | DataContentType::PositionDeletes => {
@@ -283,6 +305,10 @@ impl RootManifest {
         }
 
         if has_inline_data {
+            let partitions = data_field_stats.map(|stats| {
+                stats.into_iter().map(|s| s.finish()).collect()
+            });
+
             manifest_files.push(ManifestFile {
                 manifest_path: String::new(),
                 manifest_length: 0,
@@ -297,7 +323,7 @@ impl RootManifest {
                 added_rows_count: Some(inline_data_rows),
                 existing_rows_count: Some(0),
                 deleted_rows_count: Some(0),
-                partitions: None,
+                partitions,
                 key_metadata: None,
                 first_row_id: None,
             });

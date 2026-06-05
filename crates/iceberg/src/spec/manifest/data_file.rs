@@ -303,7 +303,7 @@ pub fn write_data_files_to_avro<W: Write>(
     let avro_schema = match version {
         FormatVersion::V1 => data_file_schema_v1(partition_type).unwrap(),
         FormatVersion::V2 => data_file_schema_v2(partition_type).unwrap(),
-        FormatVersion::V3 => data_file_schema_v3(partition_type).unwrap(),
+        FormatVersion::V3 | FormatVersion::V4 => data_file_schema_v3(partition_type).unwrap(),
     };
     let mut writer = AvroWriter::new(&avro_schema, writer);
 
@@ -331,7 +331,7 @@ pub fn read_data_files_from_avro<R: Read>(
     let avro_schema = match version {
         FormatVersion::V1 => data_file_schema_v1(partition_type).unwrap(),
         FormatVersion::V2 => data_file_schema_v2(partition_type).unwrap(),
-        FormatVersion::V3 => data_file_schema_v3(partition_type).unwrap(),
+        FormatVersion::V3 | FormatVersion::V4 => data_file_schema_v3(partition_type).unwrap(),
     };
 
     let reader = AvroReader::with_schema(&avro_schema, reader)?;

@@ -408,7 +408,7 @@ impl ManifestWriter {
         let avro_schema = match self.metadata.format_version {
             FormatVersion::V1 => manifest_schema_v1(&partition_type)?,
             // Manifest schema did not change between V2 and V3
-            FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type)?,
+            FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => manifest_schema_v2(&partition_type)?,
         };
         let mut avro_writer = AvroWriter::new(&avro_schema, Vec::new());
         avro_writer.add_user_metadata(
@@ -439,7 +439,7 @@ impl ManifestWriter {
         )?;
         match self.metadata.format_version {
             FormatVersion::V1 => {}
-            FormatVersion::V2 | FormatVersion::V3 => {
+            FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => {
                 avro_writer
                     .add_user_metadata("content".to_string(), self.metadata.content.to_string())?;
             }
@@ -452,7 +452,7 @@ impl ManifestWriter {
                 FormatVersion::V1 => to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?
                     .resolve(&avro_schema)?,
                 // Manifest entry format did not change between V2 and V3
-                FormatVersion::V2 | FormatVersion::V3 => {
+                FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => {
                     to_value(ManifestEntryV2::try_from(entry, &partition_type)?)?
                         .resolve(&avro_schema)?
                 }

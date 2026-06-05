@@ -872,7 +872,7 @@ pub(super) mod _serde {
         type Error = Error;
         fn try_from(value: TableMetadata) -> Result<Self, Error> {
             Ok(match value.format_version {
-                FormatVersion::V3 => TableMetadataEnum::V3(value.try_into()?),
+                FormatVersion::V4 | FormatVersion::V3 => TableMetadataEnum::V3(value.try_into()?),
                 FormatVersion::V2 => TableMetadataEnum::V2(value.into()),
                 FormatVersion::V1 => TableMetadataEnum::V1(value.try_into()?),
             })
@@ -1477,6 +1477,8 @@ pub enum FormatVersion {
     V2 = 2u8,
     /// Iceberg spec version 3
     V3 = 3u8,
+    /// Iceberg spec version 4 (root manifest, single-file commits)
+    V4 = 4u8,
 }
 
 impl PartialOrd for FormatVersion {
@@ -1497,6 +1499,7 @@ impl Display for FormatVersion {
             FormatVersion::V1 => write!(f, "v1"),
             FormatVersion::V2 => write!(f, "v2"),
             FormatVersion::V3 => write!(f, "v3"),
+            FormatVersion::V4 => write!(f, "v4"),
         }
     }
 }

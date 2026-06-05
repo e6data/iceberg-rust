@@ -487,7 +487,7 @@ impl SnapshotProduceOperation for ReplaceOperation {
             let mut writer = match snapshot_produce.table.metadata().format_version() {
                 FormatVersion::V1 => builder.build_v1(),
                 FormatVersion::V2 => builder.build_v2_data(),
-                FormatVersion::V3 => builder.build_v3_data(),
+                FormatVersion::V3 | FormatVersion::V4 => builder.build_v3_data(),
             };
 
             for entry in entries {

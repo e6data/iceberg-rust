@@ -257,7 +257,7 @@ impl RewriteManifestsAction {
                         let mut writer = match format_version {
                             FormatVersion::V1 => builder.build_v1(),
                             FormatVersion::V2 => builder.build_v2_data(),
-                            FormatVersion::V3 => builder.build_v3_data(),
+                            FormatVersion::V3 | FormatVersion::V4 => builder.build_v3_data(),
                         };
 
                         let to_flush = std::mem::take(buffer);
@@ -334,7 +334,7 @@ impl RewriteManifestsAction {
                 let mut writer = match format_version {
                     FormatVersion::V1 => builder.build_v1(),
                     FormatVersion::V2 => builder.build_v2_data(),
-                    FormatVersion::V3 => builder.build_v3_data(),
+                    FormatVersion::V3 | FormatVersion::V4 => builder.build_v3_data(),
                 };
 
                 for e in chunk {
@@ -425,7 +425,7 @@ impl RewriteManifestsAction {
                     current_table.metadata().current_snapshot_id(),
                     next_seq_num,
                 ),
-                FormatVersion::V3 => ManifestListWriter::v3(
+                FormatVersion::V3 | FormatVersion::V4 => ManifestListWriter::v3(
                     current_table
                         .file_io()
                         .new_output(manifest_list_path.clone())?,
@@ -641,7 +641,7 @@ impl TransactionAction for RewriteManifestsAction {
                 let mut writer = match format_version {
                     FormatVersion::V1 => builder.build_v1(),
                     FormatVersion::V2 => builder.build_v2_data(),
-                    FormatVersion::V3 => builder.build_v3_data(),
+                    FormatVersion::V3 | FormatVersion::V4 => builder.build_v3_data(),
                 };
 
                 for entry in chunk {
@@ -688,7 +688,7 @@ impl TransactionAction for RewriteManifestsAction {
                 table.metadata().current_snapshot_id(),
                 next_seq_num,
             ),
-            FormatVersion::V3 => ManifestListWriter::v3(
+            FormatVersion::V3 | FormatVersion::V4 => ManifestListWriter::v3(
                 table.file_io().new_output(manifest_list_path.clone())?,
                 snapshot_id,
                 table.metadata().current_snapshot_id(),

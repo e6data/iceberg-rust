@@ -348,7 +348,7 @@ impl<'a> SnapshotProducer<'a> {
                 ManifestContentType::Data => Ok(builder.build_v2_data()),
                 ManifestContentType::Deletes => Ok(builder.build_v2_deletes()),
             },
-            FormatVersion::V3 => match content {
+            FormatVersion::V3 | FormatVersion::V4 => match content {
                 ManifestContentType::Data => Ok(builder.build_v3_data()),
                 ManifestContentType::Deletes => Ok(builder.build_v3_deletes()),
             },
@@ -902,7 +902,7 @@ impl<'a> SnapshotProducer<'a> {
                 self.table.metadata().current_snapshot_id(),
                 next_seq_num,
             ),
-            FormatVersion::V3 => ManifestListWriter::v3(
+            FormatVersion::V3 | FormatVersion::V4 => ManifestListWriter::v3(
                 self.table
                     .file_io()
                     .new_output(manifest_list_path.clone())?,

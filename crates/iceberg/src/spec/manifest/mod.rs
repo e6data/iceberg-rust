@@ -73,7 +73,7 @@ impl Manifest {
                     .collect::<Result<Vec<_>>>()?
             }
             // Manifest Schema & Manifest Entry did not change between V2 and V3
-            FormatVersion::V2 | FormatVersion::V3 => {
+            FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => {
                 let schema = manifest_schema_v2(&partition_type)?;
                 let reader = AvroReader::with_schema(&schema, bs)?;
                 reader

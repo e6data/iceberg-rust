@@ -76,7 +76,7 @@ impl ManifestList {
                 let values = Value::Array(reader.collect::<std::result::Result<Vec<Value>, _>>()?);
                 from_value::<_serde::ManifestListV2>(&values)?.try_into()
             }
-            FormatVersion::V3 => {
+            FormatVersion::V3 | FormatVersion::V4 => {
                 let reader = Reader::new(bs)?;
                 let values = Value::Array(reader.collect::<std::result::Result<Vec<Value>, _>>()?);
                 from_value::<_serde::ManifestListV3>(&values)?.try_into()
@@ -217,7 +217,7 @@ impl ManifestListWriter {
         let avro_schema = match format_version {
             FormatVersion::V1 => &MANIFEST_LIST_AVRO_SCHEMA_V1,
             FormatVersion::V2 => &MANIFEST_LIST_AVRO_SCHEMA_V2,
-            FormatVersion::V3 => &MANIFEST_LIST_AVRO_SCHEMA_V3,
+            FormatVersion::V3 | FormatVersion::V4 => &MANIFEST_LIST_AVRO_SCHEMA_V3,
         };
         let mut avro_writer = Writer::new(avro_schema, Vec::new());
         for (key, value) in metadata {
@@ -248,7 +248,7 @@ impl ManifestListWriter {
                     self.avro_writer.append_ser(manifests)?;
                 }
             }
-            FormatVersion::V2 | FormatVersion::V3 => {
+            FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => {
                 for mut manifest in manifests {
                     self.assign_sequence_numbers(&mut manifest)?;
 

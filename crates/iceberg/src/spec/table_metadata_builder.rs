@@ -231,7 +231,7 @@ impl TableMetadataBuilder {
                     self.changes
                         .push(TableUpdate::UpgradeFormatVersion { format_version });
                 }
-                FormatVersion::V3 => {
+                FormatVersion::V3 | FormatVersion::V4 => {
                     self.metadata.format_version = format_version;
                     self.changes
                         .push(TableUpdate::UpgradeFormatVersion { format_version });

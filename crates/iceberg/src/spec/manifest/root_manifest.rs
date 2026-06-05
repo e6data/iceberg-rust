@@ -52,7 +52,7 @@ use super::{ManifestEntry, ManifestStatus};
 use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestFile,
-    ManifestList, PartitionSpec, SchemaRef, StructType,
+    PartitionSpec, SchemaRef, StructType,
 };
 use crate::{Error, ErrorKind};
 
@@ -240,122 +240,6 @@ impl RootManifest {
         });
     }
 
-    /// Compatibility shim: convert root manifest to a ManifestList.
-    ///
-    /// ManifestRef entries map directly to ManifestFile entries.
-    /// Inline entries are grouped by content type into synthetic ManifestFile entries
-    /// with empty manifest_path and correct counts. The scan code integration for
-    /// loading inline entries will be handled in Phase 2.
-    pub fn to_manifest_list(&self) -> ManifestList {
-        let mut manifest_files: Vec<ManifestFile> = Vec::new();
-
-        // Collect manifest refs directly
-        for entry in &self.entries {
-            if let RootManifestEntry::ManifestRef { manifest_file, .. } = entry {
-                manifest_files.push(manifest_file.clone());
-            }
-        }
-
-        // Group inline entries by content type and compute partition bounds
-        let mut inline_data_count: u32 = 0;
-        let mut inline_data_rows: u64 = 0;
-        let mut inline_delete_count: u32 = 0;
-        let mut inline_delete_rows: u64 = 0;
-        let mut has_inline_data = false;
-        let mut has_inline_delete = false;
-
-        // Build partition field stats for data inline entries
-        let partition_type = self.metadata.partition_spec
-            .partition_type(&self.metadata.schema)
-            .ok();
-
-        let mut data_field_stats: Option<Vec<super::writer::PartitionFieldStats>> =
-            partition_type.as_ref().map(|pt| {
-                pt.fields()
-                    .iter()
-                    .filter_map(|f| f.field_type.as_primitive_type().map(|p| {
-                        super::writer::PartitionFieldStats::new(p.clone())
-                    }))
-                    .collect()
-            });
-
-        for entry in &self.entries {
-            if let RootManifestEntry::Inline(me) = entry {
-                match me.data_file.content {
-                    DataContentType::Data => {
-                        has_inline_data = true;
-                        inline_data_count += 1;
-                        inline_data_rows += me.data_file.record_count;
-                        // Update partition bounds — on error, fall back to no bounds
-                        // (safe: query planner scans all entries instead of pruning)
-                        if let Some(ref mut stats) = data_field_stats {
-                            for (literal, stat) in me.data_file.partition.iter().zip(stats.iter_mut()) {
-                                let prim = literal.and_then(|v| v.as_primitive_literal());
-                                if stat.update(prim).is_err() {
-                                    data_field_stats = None;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    DataContentType::EqualityDeletes
-                    | DataContentType::PositionDeletes => {
-                        has_inline_delete = true;
-                        inline_delete_count += 1;
-                        inline_delete_rows += me.data_file.record_count;
-                    }
-                }
-            }
-        }
-
-        if has_inline_data {
-            let partitions = data_field_stats.map(|stats| {
-                stats.into_iter().map(|s| s.finish()).collect()
-            });
-
-            manifest_files.push(ManifestFile {
-                manifest_path: String::new(),
-                manifest_length: 0,
-                partition_spec_id: self.metadata.partition_spec.spec_id(),
-                content: ManifestContentType::Data,
-                sequence_number: self.metadata.sequence_number,
-                min_sequence_number: self.metadata.sequence_number,
-                added_snapshot_id: self.metadata.snapshot_id,
-                added_files_count: Some(inline_data_count),
-                existing_files_count: Some(0),
-                deleted_files_count: Some(0),
-                added_rows_count: Some(inline_data_rows),
-                existing_rows_count: Some(0),
-                deleted_rows_count: Some(0),
-                partitions,
-                key_metadata: None,
-                first_row_id: None,
-            });
-        }
-
-        if has_inline_delete {
-            manifest_files.push(ManifestFile {
-                manifest_path: String::new(),
-                manifest_length: 0,
-                partition_spec_id: self.metadata.partition_spec.spec_id(),
-                content: ManifestContentType::Deletes,
-                sequence_number: self.metadata.sequence_number,
-                min_sequence_number: self.metadata.sequence_number,
-                added_snapshot_id: self.metadata.snapshot_id,
-                added_files_count: Some(inline_delete_count),
-                existing_files_count: Some(0),
-                deleted_files_count: Some(0),
-                added_rows_count: Some(inline_delete_rows),
-                existing_rows_count: Some(0),
-                deleted_rows_count: Some(0),
-                partitions: None,
-                key_metadata: None,
-                first_row_id: None,
-            });
-        }
-
-        ManifestList::new(manifest_files)
-    }
 }
 
 // ============================================================================
@@ -576,8 +460,6 @@ pub fn write_root_manifest(
         }
     }
 
-    let inline_entries: Vec<ManifestEntry> = inlines.iter().map(|e| (*e).clone()).collect();
-
     // Build the combined (superset) schema. Parquet requires all row groups to
     // share the same schema, so we use a union of ref + inline columns (all
     // nullable). Row group 0 populates only ref columns; row group 1 populates
@@ -587,7 +469,7 @@ pub fn write_root_manifest(
     // counts in file-level metadata so the reader knows the layout.
     let mut kv_metadata = encode_root_manifest_metadata(metadata);
     kv_metadata.insert("refs-count".to_string(), refs.len().to_string());
-    kv_metadata.insert("inlines-count".to_string(), inline_entries.len().to_string());
+    kv_metadata.insert("inlines-count".to_string(), inlines.len().to_string());
 
     let refs_schema = Arc::new(manifest_ref_arrow_schema().with_metadata(kv_metadata));
     let combined_schema = build_combined_schema(&refs_schema);
@@ -613,7 +495,7 @@ pub fn write_root_manifest(
                 format!("Failed to write refs batch: {e}"),
             )
         })?;
-        if !inline_entries.is_empty() {
+        if !inlines.is_empty() {
             // Flush to force a new row group boundary before inlines
             writer.flush().map_err(|e| {
                 Error::new(
@@ -625,8 +507,8 @@ pub fn write_root_manifest(
     }
 
     // Row group 1 (or 0 if no refs): inline entries (only written if non-empty)
-    if !inline_entries.is_empty() {
-        let rg1_batch = build_combined_batch_for_inlines(&inline_entries, &combined_schema, partition_type, metadata)?;
+    if !inlines.is_empty() {
+        let rg1_batch = build_combined_batch_for_inlines(&inlines, &combined_schema, partition_type, metadata)?;
         writer.write(&rg1_batch).map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -794,8 +676,8 @@ fn build_combined_batch_for_refs(
 /// Build a combined RecordBatch for row group 1 (inline entries).
 ///
 /// Inline columns are populated, ref columns are all null.
-fn build_combined_batch_for_inlines(
-    entries: &[ManifestEntry],
+fn build_combined_batch_for_inlines<E: std::borrow::Borrow<ManifestEntry>>(
+    entries: &[E],
     schema: &Arc<ArrowSchema>,
     partition_type: &StructType,
     metadata: &RootManifestMetadata,
@@ -898,9 +780,9 @@ fn make_null_array(data_type: &DataType, n: usize) -> ArrayRef {
 ///
 /// The layout is identified by `root-manifest-layout=two-section` in file metadata.
 pub fn read_root_manifest(
-    bytes: &[u8],
+    bytes: Bytes,
 ) -> Result<(RootManifestMetadata, Vec<RootManifestEntry>)> {
-    let reader_builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+    let reader_builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
         .map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -959,7 +841,7 @@ pub fn read_root_manifest(
 
     // Read manifest refs from their row group
     if let Some(rg_idx) = refs_rg {
-        let rg_reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+        let rg_reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
             .map_err(|e| {
                 Error::new(
                     ErrorKind::DataInvalid,
@@ -989,7 +871,7 @@ pub fn read_root_manifest(
 
     // Read inline entries from their row group
     if let Some(rg_idx) = inlines_rg {
-        let rg_reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+        let rg_reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
             .map_err(|e| {
                 Error::new(
                     ErrorKind::DataInvalid,
@@ -1455,7 +1337,7 @@ mod tests {
         let bytes = write_root_manifest(&entries, &metadata, &partition_type).unwrap();
         assert!(!bytes.is_empty());
 
-        let (read_meta, read_entries) = read_root_manifest(&bytes).unwrap();
+        let (read_meta, read_entries) = read_root_manifest(Bytes::from(bytes)).unwrap();
 
         // Verify metadata
         assert_eq!(read_meta.snapshot_id, 100);
@@ -1521,7 +1403,7 @@ mod tests {
         ];
 
         let bytes = write_root_manifest(&entries, &metadata, &partition_type).unwrap();
-        let (_, read_entries) = read_root_manifest(&bytes).unwrap();
+        let (_, read_entries) = read_root_manifest(Bytes::from(bytes)).unwrap();
 
         assert_eq!(read_entries.len(), 2);
         for e in &read_entries {
@@ -1548,7 +1430,7 @@ mod tests {
         ];
 
         let bytes = write_root_manifest(&entries, &metadata, &partition_type).unwrap();
-        let (_, read_entries) = read_root_manifest(&bytes).unwrap();
+        let (_, read_entries) = read_root_manifest(Bytes::from(bytes)).unwrap();
 
         assert_eq!(read_entries.len(), 2);
         for e in &read_entries {
@@ -1565,7 +1447,7 @@ mod tests {
 
         let entries: Vec<RootManifestEntry> = vec![];
         let bytes = write_root_manifest(&entries, &metadata, &partition_type).unwrap();
-        let (read_meta, read_entries) = read_root_manifest(&bytes).unwrap();
+        let (read_meta, read_entries) = read_root_manifest(Bytes::from(bytes)).unwrap();
 
         assert_eq!(read_entries.len(), 0);
         assert_eq!(read_meta.snapshot_id, 100);
@@ -1594,7 +1476,7 @@ mod tests {
         }];
 
         let bytes = write_root_manifest(&entries, &metadata, &partition_type).unwrap();
-        let (_, read_entries) = read_root_manifest(&bytes).unwrap();
+        let (_, read_entries) = read_root_manifest(Bytes::from(bytes)).unwrap();
 
         assert_eq!(read_entries.len(), 1);
         match &read_entries[0] {
@@ -1610,43 +1492,6 @@ mod tests {
             }
             _ => panic!("Expected ManifestRef"),
         }
-    }
-
-    #[test]
-    fn to_manifest_list_counts() {
-        let schema = test_schema();
-        let partition_spec = test_partition_spec(&schema);
-        let metadata = test_metadata(&schema, &partition_spec);
-
-        let entries = vec![
-            RootManifestEntry::ManifestRef {
-                manifest_file: test_manifest_file("s3://bucket/metadata/m0.avro"),
-                mdv: None,
-            },
-            RootManifestEntry::Inline(test_inline_entry("s3://bucket/data/a.parquet", 100)),
-            RootManifestEntry::Inline(test_inline_entry("s3://bucket/data/b.parquet", 200)),
-        ];
-
-        let rm = RootManifest::new(metadata, entries);
-
-        // Verify inline_count
-        assert_eq!(rm.inline_count(), 2);
-        assert_eq!(rm.manifest_refs().count(), 1);
-
-        let ml = rm.to_manifest_list();
-        let ml_entries = ml.entries();
-
-        // Should have 1 real manifest ref + 1 synthetic for inline data
-        assert_eq!(ml_entries.len(), 2);
-
-        // First is the real manifest ref
-        assert_eq!(ml_entries[0].manifest_path, "s3://bucket/metadata/m0.avro");
-
-        // Second is synthetic for inline data entries
-        assert_eq!(ml_entries[1].manifest_path, "");
-        assert_eq!(ml_entries[1].content, ManifestContentType::Data);
-        assert_eq!(ml_entries[1].added_files_count, Some(2));
-        assert_eq!(ml_entries[1].added_rows_count, Some(300));
     }
 
     #[test]
@@ -1673,6 +1518,54 @@ mod tests {
 
         let entries = rm.into_entries();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn round_trip_preserves_mdv() {
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+        let metadata = test_metadata(&schema, &partition_spec);
+
+        let mut mdv = ManifestDeleteVector::new();
+        mdv.mark_deleted(0);
+        mdv.mark_deleted(3);
+        let mdv_bytes = mdv.serialize().unwrap();
+
+        let entries = vec![
+            RootManifestEntry::ManifestRef {
+                manifest_file: test_manifest_file("s3://bucket/metadata/m0.avro"),
+                mdv: Some(mdv_bytes),
+            },
+            RootManifestEntry::ManifestRef {
+                manifest_file: test_manifest_file("s3://bucket/metadata/m1.avro"),
+                mdv: None,
+            },
+        ];
+
+        let bytes = write_root_manifest(&entries, &metadata, &partition_type).unwrap();
+        let (_, read_entries) = read_root_manifest(Bytes::from(bytes)).unwrap();
+
+        assert_eq!(read_entries.len(), 2);
+
+        match &read_entries[0] {
+            RootManifestEntry::ManifestRef {
+                mdv: Some(bytes), ..
+            } => {
+                let read_mdv = ManifestDeleteVector::deserialize(bytes).unwrap();
+                assert!(read_mdv.is_deleted(0));
+                assert!(!read_mdv.is_deleted(1));
+                assert!(!read_mdv.is_deleted(2));
+                assert!(read_mdv.is_deleted(3));
+                assert_eq!(read_mdv.deleted_count(), 2);
+            }
+            _ => panic!("Expected ManifestRef with MDV"),
+        }
+
+        match &read_entries[1] {
+            RootManifestEntry::ManifestRef { mdv: None, .. } => {}
+            _ => panic!("Expected ManifestRef without MDV"),
+        }
     }
 
     #[test]

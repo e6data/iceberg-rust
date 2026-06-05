@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::mem::size_of_val;
+
 use std::sync::Arc;
 
 use crate::io::FileIO;
@@ -62,8 +62,8 @@ impl ObjectCache {
             Self {
                 cache: moka::future::Cache::builder()
                     .weigher(|_, val: &CachedItem| match val {
-                        CachedItem::ManifestList(item) => size_of_val(item.as_ref()),
-                        CachedItem::Manifest(item) => size_of_val(item.as_ref()),
+                        CachedItem::ManifestList(item) => item.estimated_size(),
+                        CachedItem::Manifest(item) => item.estimated_size(),
                     } as u32)
                     .max_capacity(cache_size_bytes)
                     .build(),

@@ -152,7 +152,8 @@ pub(crate) struct SnapshotProducer<'a> {
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
     manifest_counter: RangeFrom<u64>,
-    cached_root_entries: Option<Vec<RootManifestEntry>>,
+    /// Cached root manifest entries with the snapshot_id they were built for.
+    cached_root_entries: Option<(Option<i64>, Vec<RootManifestEntry>)>,
     file_to_manifest_index: Option<HashMap<String, String>>,
 }
 
@@ -201,8 +202,8 @@ impl<'a> SnapshotProducer<'a> {
         self
     }
 
-    pub(crate) fn with_cached_root_entries(mut self, entries: Vec<RootManifestEntry>) -> Self {
-        self.cached_root_entries = Some(entries);
+    pub(crate) fn with_cached_root_entries(mut self, snapshot_id: Option<i64>, entries: Vec<RootManifestEntry>) -> Self {
+        self.cached_root_entries = Some((snapshot_id, entries));
         self
     }
 
@@ -265,6 +266,13 @@ impl<'a> SnapshotProducer<'a> {
                     if new_files.contains(file_path) && entry.is_alive() {
                         referenced_files.push(file_path.to_string());
                     }
+                }
+            }
+            // Also check V4 inline entries (not backed by manifest files)
+            for entry in manifest_list.inline_entries() {
+                let file_path = entry.file_path();
+                if new_files.contains(file_path) && entry.is_alive() {
+                    referenced_files.push(file_path.to_string());
                 }
             }
         }
@@ -1027,28 +1035,13 @@ impl<'a> SnapshotProducer<'a> {
         // and must be discarded. This prevents silently dropping concurrent writes.
         let cached = self.cached_root_entries.take();
         let current_snapshot_id = self.table.metadata().current_snapshot_id();
-        let cache_valid = cached.as_ref().map_or(false, |entries| {
-            // Cache is valid if it was built for the current snapshot. We check by
-            // looking at the snapshot_id of the most recent inline entry — it should
-            // match the snapshot that produced the cache. If there's no inline entry
-            // with a snapshot_id, the cache may be from a rebalanced state (all refs),
-            // which is still valid since refs point to immutable child manifests.
-            let cached_snapshot_id = entries.iter().rev().find_map(|e| match e {
-                RootManifestEntry::Inline(me) => me.snapshot_id,
-                _ => None,
-            });
-            match (cached_snapshot_id, current_snapshot_id) {
-                // Cache built from snapshot N, table is at snapshot N — valid
-                (Some(cached_sid), Some(current_sid)) if cached_sid == current_sid => true,
-                // Cache has no inlines, table has a snapshot — valid (all-refs cache)
-                (None, Some(_)) => true,
-                // First commit on new table — no cache should exist
-                (None, None) => false,
-                // Cache built from snapshot N, table moved to M — stale, discard
-                _ => false,
-            }
+        let cache_valid = cached.as_ref().map_or(false, |(cached_sid, _)| {
+            // Cache carries the snapshot_id it was built for. If the table has
+            // moved to a different snapshot (concurrent commit won CAS race),
+            // the cache is stale and must be discarded.
+            *cached_sid == current_snapshot_id
         });
-        let mut entries: Vec<RootManifestEntry> = if let Some(cached) = cached.filter(|_| cache_valid) {
+        let mut entries: Vec<RootManifestEntry> = if let Some((_, cached)) = cached.filter(|_| cache_valid) {
             cached
         } else if let Some(current_snapshot) =
             self.table.metadata().current_snapshot()
@@ -1062,7 +1055,7 @@ impl<'a> SnapshotProducer<'a> {
                 .await?;
 
             // Try reading as root manifest; fall back to manifest list for upgrade path
-            match read_root_manifest(&bytes) {
+            match read_root_manifest(bytes.clone()) {
                 Ok((_, existing_entries)) => existing_entries,
                 Err(_) => {
                     // Upgrading from V3: convert manifest list entries to manifest refs
@@ -1212,7 +1205,7 @@ impl<'a> SnapshotProducer<'a> {
             .properties()
             .get("root-manifest.inline-threshold")
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(500);
+            .unwrap_or(100);
 
         let inline_count = entries
             .iter()
@@ -1350,7 +1343,9 @@ impl<'a> SnapshotProducer<'a> {
         let added_rows: u64 = entries
             .iter()
             .filter_map(|e| match e {
-                RootManifestEntry::Inline(me) => Some(me.data_file.record_count),
+                RootManifestEntry::Inline(me) if me.snapshot_id == Some(self.snapshot_id) => {
+                    Some(me.data_file.record_count)
+                }
                 _ => None,
             })
             .sum();
@@ -1393,7 +1388,7 @@ impl<'a> SnapshotProducer<'a> {
 
         Ok(ActionCommit::new(updates, requirements)
             .with_manifest_paths(vec![root_manifest_path])
-            .with_root_manifest_entries(entries))
+            .with_root_manifest_entries(Some(self.snapshot_id), entries))
     }
 }
 
@@ -1407,7 +1402,8 @@ mod test_v4_commit {
     };
     use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
-    use std::collections::HashMap;
+    use futures::TryStreamExt;
+    use std::collections::{HashMap, HashSet};
 
     fn test_schema() -> Schema {
         Schema::builder()
@@ -1490,7 +1486,6 @@ mod test_v4_commit {
     }
 
     #[tokio::test]
-    #[ignore = "requires fix: read_root_manifest needs to handle memory FileIO round-trip"]
     async fn test_v4_second_append_accumulates_inlines() {
         let catalog = new_memory_catalog().await;
         let ns = NamespaceIdent::new("test_ns2".into());
@@ -1520,6 +1515,10 @@ mod test_v4_commit {
             .unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
+        // Verify table is still V4 after first commit
+        assert_eq!(table.metadata().format_version(), FormatVersion::V4,
+            "table format version should be V4 after first commit");
+
         let snap1 = table.metadata().current_snapshot().unwrap();
         let snap1_id = snap1.snapshot_id();
 
@@ -1535,5 +1534,56 @@ mod test_v4_commit {
         let snap2 = table.metadata().current_snapshot().unwrap();
         assert_ne!(snap1_id, snap2.snapshot_id());
         assert!(snap2.manifest_list().contains("root-"));
+    }
+
+    #[tokio::test]
+    async fn test_v4_scan_returns_inline_entries() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_scan".into());
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .unwrap();
+
+        let table = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("v4scan".to_string())
+                    .schema(test_schema())
+                    .format_version(FormatVersion::V4)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(vec![
+                test_data_file("s3://bucket/data/a.parquet"),
+                test_data_file("s3://bucket/data/b.parquet"),
+            ])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // plan_files should return 2 tasks from inline entries
+        let tasks: Vec<_> = table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(tasks.len(), 2);
+        let paths: HashSet<&str> = tasks.iter().map(|t| t.data_file_path.as_str()).collect();
+        assert!(paths.contains("s3://bucket/data/a.parquet"));
+        assert!(paths.contains("s3://bucket/data/b.parquet"));
     }
 }

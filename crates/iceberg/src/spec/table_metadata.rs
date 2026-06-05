@@ -719,6 +719,7 @@ pub(super) mod _serde {
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(untagged)]
     pub(super) enum TableMetadataEnum {
+        V4(TableMetadataV4),
         V3(TableMetadataV3),
         V2(TableMetadataV2),
         V1(TableMetadataV1),
@@ -727,6 +728,20 @@ pub(super) mod _serde {
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "kebab-case")]
     /// Defines the structure of a v2 table metadata for serialization/deserialization
+    /// V4 metadata — structurally identical to V3 but serializes format-version as 4.
+    pub(super) struct TableMetadataV4 {
+        pub format_version: VersionNumber<4>,
+        #[serde(flatten)]
+        pub shared: TableMetadataV2V3Shared,
+        pub next_row_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub encryption_keys: Option<Vec<EncryptedKey>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub snapshots: Option<Vec<SnapshotV3>>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
     pub(super) struct TableMetadataV3 {
         pub format_version: VersionNumber<3>,
         #[serde(flatten)]
@@ -861,6 +876,18 @@ pub(super) mod _serde {
         type Error = Error;
         fn try_from(value: TableMetadataEnum) -> Result<Self, Error> {
             match value {
+                TableMetadataEnum::V4(value) => {
+                    let v3 = TableMetadataV3 {
+                        format_version: VersionNumber::<3>,
+                        shared: value.shared,
+                        next_row_id: value.next_row_id,
+                        encryption_keys: value.encryption_keys,
+                        snapshots: value.snapshots,
+                    };
+                    let mut meta: TableMetadata = v3.try_into()?;
+                    meta.format_version = FormatVersion::V4;
+                    Ok(meta)
+                }
                 TableMetadataEnum::V3(value) => value.try_into(),
                 TableMetadataEnum::V2(value) => value.try_into(),
                 TableMetadataEnum::V1(value) => value.try_into(),
@@ -872,7 +899,8 @@ pub(super) mod _serde {
         type Error = Error;
         fn try_from(value: TableMetadata) -> Result<Self, Error> {
             Ok(match value.format_version {
-                FormatVersion::V4 | FormatVersion::V3 => TableMetadataEnum::V3(value.try_into()?),
+                FormatVersion::V4 => TableMetadataEnum::V4(value.try_into()?),
+                FormatVersion::V3 => TableMetadataEnum::V3(value.try_into()?),
                 FormatVersion::V2 => TableMetadataEnum::V2(value.into()),
                 FormatVersion::V1 => TableMetadataEnum::V1(value.try_into()?),
             })
@@ -1258,6 +1286,38 @@ pub(super) mod _serde {
 
             metadata.borrow_mut().try_normalize()?;
             Ok(metadata)
+        }
+    }
+
+    impl TryFrom<TableMetadata> for TableMetadataV4 {
+        type Error = Error;
+
+        fn try_from(mut v: TableMetadata) -> Result<Self, Self::Error> {
+            let next_row_id = v.next_row_id;
+            let encryption_keys = std::mem::take(&mut v.encryption_keys);
+            let snapshots = std::mem::take(&mut v.snapshots);
+            let shared = v.into();
+
+            Ok(TableMetadataV4 {
+                format_version: VersionNumber::<4>,
+                shared,
+                next_row_id,
+                encryption_keys: if encryption_keys.is_empty() {
+                    None
+                } else {
+                    Some(encryption_keys.into_values().collect())
+                },
+                snapshots: if snapshots.is_empty() {
+                    None
+                } else {
+                    Some(
+                        snapshots
+                            .into_values()
+                            .map(|s| SnapshotV3::try_from(Arc::unwrap_or_clone(s)))
+                            .collect::<Result<_, _>>()?,
+                    )
+                },
+            })
         }
     }
 

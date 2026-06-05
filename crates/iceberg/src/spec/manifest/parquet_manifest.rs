@@ -135,8 +135,8 @@ pub fn write_parquet_manifest(
 }
 
 /// Convert ManifestEntry slice to Arrow RecordBatch.
-pub(super) fn manifest_entries_to_record_batch(
-    entries: &[ManifestEntry],
+pub(super) fn manifest_entries_to_record_batch<E: std::borrow::Borrow<ManifestEntry>>(
+    entries: &[E],
     schema: &Arc<ArrowSchema>,
     partition_type: &StructType,
     format_version: FormatVersion,
@@ -165,7 +165,8 @@ pub(super) fn manifest_entries_to_record_batch(
     let mut sort_order_id = Int32Builder::with_capacity(n);
     let mut part_spec_id = Int32Builder::with_capacity(n);
 
-    for entry in entries {
+    for entry_ref in entries {
+        let entry = std::borrow::Borrow::<ManifestEntry>::borrow(entry_ref);
         let df = &entry.data_file;
 
         status.append_value(entry.status as i32);

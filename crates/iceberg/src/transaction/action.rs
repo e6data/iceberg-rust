@@ -82,7 +82,8 @@ pub struct ActionCommit {
     updates: Vec<TableUpdate>,
     requirements: Vec<TableRequirement>,
     created_manifest_paths: Vec<String>,
-    root_manifest_entries: Option<Vec<crate::spec::root_manifest::RootManifestEntry>>,
+    /// Cached root manifest entries with the snapshot_id they were built for.
+    root_manifest_entries: Option<(Option<i64>, Vec<crate::spec::root_manifest::RootManifestEntry>)>,
 }
 
 impl ActionCommit {
@@ -117,14 +118,15 @@ impl ActionCommit {
         take(&mut self.created_manifest_paths)
     }
 
-    /// Sets the cached root manifest entries produced during this action.
-    pub fn with_root_manifest_entries(mut self, entries: Vec<crate::spec::root_manifest::RootManifestEntry>) -> Self {
-        self.root_manifest_entries = Some(entries);
+    /// Sets the cached root manifest entries produced during this action,
+    /// alongside the snapshot_id they were built for (used for cache validation).
+    pub fn with_root_manifest_entries(mut self, snapshot_id: Option<i64>, entries: Vec<crate::spec::root_manifest::RootManifestEntry>) -> Self {
+        self.root_manifest_entries = Some((snapshot_id, entries));
         self
     }
 
-    /// Consumes and returns the cached root manifest entries.
-    pub fn take_root_manifest_entries(&mut self) -> Option<Vec<crate::spec::root_manifest::RootManifestEntry>> {
+    /// Consumes and returns the cached root manifest entries with their snapshot_id.
+    pub fn take_root_manifest_entries(&mut self) -> Option<(Option<i64>, Vec<crate::spec::root_manifest::RootManifestEntry>)> {
         self.root_manifest_entries.take()
     }
 }

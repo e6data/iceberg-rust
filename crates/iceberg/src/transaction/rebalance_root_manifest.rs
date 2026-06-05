@@ -172,7 +172,7 @@ impl TransactionAction for RebalanceRootManifestAction {
             .read()
             .await?;
 
-        let (rm_metadata, entries) = read_root_manifest(&bytes)?;
+        let (rm_metadata, entries) = read_root_manifest(bytes)?;
         let root_manifest = RootManifest::new(rm_metadata.clone(), entries);
 
         // 3. Check if rebalance is needed
@@ -265,8 +265,6 @@ impl TransactionAction for RebalanceRootManifestAction {
                         }
                     };
 
-                    let mut _kept_count: u32 = 0;
-                    let mut _kept_rows: u64 = 0;
                     for (idx, entry) in manifest.entries().iter().enumerate() {
                         if !mdv_obj.is_deleted(idx as u32) && entry.is_alive() {
                             let existing = ManifestEntry::builder()
@@ -281,8 +279,6 @@ impl TransactionAction for RebalanceRootManifestAction {
                                 .data_file(entry.data_file().clone())
                                 .build();
                             writer.add_entry(existing)?;
-                            _kept_count += 1;
-                            _kept_rows += entry.data_file().record_count;
                         }
                     }
 
@@ -500,6 +496,7 @@ impl TransactionAction for RebalanceRootManifestAction {
         };
 
         let commit_ts = chrono::Utc::now().timestamp_millis();
+        let first_row_id = table.metadata().next_row_id();
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(new_root_manifest_path.clone())
             .with_snapshot_id(snapshot_id)
@@ -508,6 +505,7 @@ impl TransactionAction for RebalanceRootManifestAction {
             .with_summary(summary)
             .with_schema_id(table.metadata().current_schema_id())
             .with_timestamp_ms(commit_ts)
+            .with_row_range(first_row_id, 0)
             .build();
 
         let updates = vec![

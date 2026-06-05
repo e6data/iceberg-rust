@@ -114,6 +114,11 @@ impl Manifest {
         (entries, metadata)
     }
 
+    /// Estimated heap size in bytes for cache weighing.
+    pub fn estimated_size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.entries.len() * 1024
+    }
+
     /// Constructor from [`ManifestMetadata`] and [`ManifestEntry`]s.
     pub fn new(metadata: ManifestMetadata, entries: Vec<ManifestEntry>) -> Self {
         Self {

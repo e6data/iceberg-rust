@@ -59,7 +59,7 @@ pub struct ReplaceDataFilesAction {
     /// per-snapshot Puffin stats).
     snapshot_id_override: Option<i64>,
     file_to_manifest_index: Option<HashMap<String, String>>,
-    cached_root_entries: Option<Vec<crate::spec::root_manifest::RootManifestEntry>>,
+    cached_root_entries: Option<(Option<i64>, Vec<crate::spec::root_manifest::RootManifestEntry>)>,
 }
 
 impl ReplaceDataFilesAction {
@@ -167,8 +167,8 @@ impl ReplaceDataFilesAction {
 
     /// Pass cached root manifest entries to avoid re-reading from S3 on
     /// consecutive commits within the same transaction.
-    pub fn with_cached_root_entries(mut self, entries: Vec<crate::spec::root_manifest::RootManifestEntry>) -> Self {
-        self.cached_root_entries = Some(entries);
+    pub fn with_cached_root_entries(mut self, snapshot_id: Option<i64>, entries: Vec<crate::spec::root_manifest::RootManifestEntry>) -> Self {
+        self.cached_root_entries = Some((snapshot_id, entries));
         self
     }
 }
@@ -190,8 +190,8 @@ impl TransactionAction for ReplaceDataFilesAction {
         if let Some(id) = self.snapshot_id_override {
             snapshot_producer = snapshot_producer.with_snapshot_id(id);
         }
-        if let Some(ref cached) = self.cached_root_entries {
-            snapshot_producer = snapshot_producer.with_cached_root_entries(cached.clone());
+        if let Some((snapshot_id, ref cached)) = self.cached_root_entries {
+            snapshot_producer = snapshot_producer.with_cached_root_entries(snapshot_id, cached.clone());
         }
         if let Some(ref index) = self.file_to_manifest_index {
             snapshot_producer = snapshot_producer.with_file_to_manifest_index(index.clone());

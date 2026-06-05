@@ -359,14 +359,38 @@ impl TableScan {
         // get the [`ManifestFile`]s from the [`ManifestList`], filtering out any
         // whose partitions cannot match this
         // scan's filter
-        let manifest_file_contexts = plan_context.build_manifest_file_contexts(
-            manifest_list,
-            manifest_entry_data_ctx_tx,
-            delete_file_idx.clone(),
-            manifest_entry_delete_ctx_tx,
-        )?;
+        let (manifest_file_contexts, inline_data_contexts, inline_delete_contexts) =
+            plan_context.build_manifest_file_contexts(
+                manifest_list,
+                manifest_entry_data_ctx_tx.clone(),
+                delete_file_idx.clone(),
+                manifest_entry_delete_ctx_tx.clone(),
+            )?;
 
         let mut channel_for_manifest_error = file_scan_task_tx.clone();
+
+        // Send V4 inline entries directly into the pipeline before starting
+        // manifest loading (they don't need a ManifestFile::load_manifest() call).
+        //
+        // Sender lifecycle: the tx clones passed to build_manifest_file_contexts
+        // live inside each ManifestFileContext and drop after streaming entries.
+        // These original tx handles are moved into this inline task and drop when
+        // it completes. The channels close when both tasks finish.
+        let mut inline_data_tx = manifest_entry_data_ctx_tx;
+        let mut inline_delete_tx = manifest_entry_delete_ctx_tx;
+        spawn(async move {
+            // Send inline delete entries first (same ordering as manifest files)
+            for ctx in inline_delete_contexts {
+                if inline_delete_tx.send(ctx).await.is_err() {
+                    break;
+                }
+            }
+            for ctx in inline_data_contexts {
+                if inline_data_tx.send(ctx).await.is_err() {
+                    break;
+                }
+            }
+        });
 
         // Concurrently load all [`Manifest`]s and stream their [`ManifestEntry`]s
         spawn(async move {

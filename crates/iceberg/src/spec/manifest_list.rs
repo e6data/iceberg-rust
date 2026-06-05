@@ -58,6 +58,11 @@ pub struct ManifestList {
 }
 
 impl ManifestList {
+    /// Construct a ManifestList from a vec of ManifestFile entries.
+    pub fn new(entries: Vec<ManifestFile>) -> Self {
+        Self { entries }
+    }
+
     /// Parse manifest list from bytes.
     pub fn parse_with_version(bs: &[u8], version: FormatVersion) -> Result<ManifestList> {
         match version {

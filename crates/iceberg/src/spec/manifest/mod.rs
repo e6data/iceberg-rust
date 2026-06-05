@@ -24,6 +24,7 @@ pub use entry::*;
 mod metadata;
 pub use metadata::*;
 pub mod parquet_manifest;
+pub mod root_manifest;
 mod writer;
 use std::sync::Arc;
 

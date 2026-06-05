@@ -243,7 +243,7 @@ fn manifest_entries_to_record_batch(
         .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to build RecordBatch: {e}")))
 }
 
-fn serialize_partition_json(partition: &Struct, partition_type: &StructType) -> String {
+pub(super) fn serialize_partition_json(partition: &Struct, partition_type: &StructType) -> String {
     // Use RawLiteral for proper Iceberg partition value serialization.
     // RawLiteral handles all type conversions (timestamps, decimals, etc.) correctly.
     match RawLiteral::try_from(Literal::Struct(partition.clone()), &Type::Struct(partition_type.clone())) {
@@ -252,7 +252,7 @@ fn serialize_partition_json(partition: &Struct, partition_type: &StructType) -> 
     }
 }
 
-fn serialize_i64_map(m: &HashMap<i32, u64>) -> String {
+pub(super) fn serialize_i64_map(m: &HashMap<i32, u64>) -> String {
     if m.is_empty() {
         return String::new();
     }
@@ -261,7 +261,7 @@ fn serialize_i64_map(m: &HashMap<i32, u64>) -> String {
     serde_json::to_string(&map).unwrap_or_default()
 }
 
-fn serialize_bounds_map(m: &HashMap<i32, Datum>) -> String {
+pub(super) fn serialize_bounds_map(m: &HashMap<i32, Datum>) -> String {
     if m.is_empty() {
         return String::new();
     }
@@ -278,7 +278,7 @@ fn serialize_bounds_map(m: &HashMap<i32, Datum>) -> String {
     serde_json::to_string(&map).unwrap_or_default()
 }
 
-fn append_map_json(builder: &mut BinaryBuilder, json: &str) {
+pub(super) fn append_map_json(builder: &mut BinaryBuilder, json: &str) {
     if json.is_empty() {
         builder.append_null();
     } else {
@@ -286,7 +286,7 @@ fn append_map_json(builder: &mut BinaryBuilder, json: &str) {
     }
 }
 
-fn append_opt_json<T: serde::Serialize>(builder: &mut BinaryBuilder, val: &Option<T>) {
+pub(super) fn append_opt_json<T: serde::Serialize>(builder: &mut BinaryBuilder, val: &Option<T>) {
     match val {
         Some(v) => {
             let json = serde_json::to_string(v).unwrap_or_default();
@@ -531,7 +531,7 @@ fn record_batch_to_manifest_entries(
 // JSON deserialization helpers
 // ============================================================================
 
-fn parse_partition_json(json: Option<&str>, partition_type: &StructType) -> Struct {
+pub(super) fn parse_partition_json(json: Option<&str>, partition_type: &StructType) -> Struct {
     let Some(json_str) = json else { return Struct::empty() };
     if json_str == "null" || json_str.is_empty() {
         return Struct::empty();
@@ -549,7 +549,7 @@ fn parse_partition_json(json: Option<&str>, partition_type: &StructType) -> Stru
     }
 }
 
-fn parse_i64_map_json(bytes: Option<&[u8]>) -> HashMap<i32, u64> {
+pub(super) fn parse_i64_map_json(bytes: Option<&[u8]>) -> HashMap<i32, u64> {
     let Some(b) = bytes else { return HashMap::new() };
     let Ok(map) = serde_json::from_slice::<HashMap<String, u64>>(b) else {
         return HashMap::new();
@@ -559,7 +559,7 @@ fn parse_i64_map_json(bytes: Option<&[u8]>) -> HashMap<i32, u64> {
         .collect()
 }
 
-fn parse_bounds_map_json(bytes: Option<&[u8]>, schema: &Schema) -> HashMap<i32, Datum> {
+pub(super) fn parse_bounds_map_json(bytes: Option<&[u8]>, schema: &Schema) -> HashMap<i32, Datum> {
     let Some(b) = bytes else { return HashMap::new() };
     let Ok(map) = serde_json::from_slice::<HashMap<String, String>>(b) else {
         return HashMap::new();
@@ -585,45 +585,45 @@ fn parse_bounds_map_json(bytes: Option<&[u8]>, schema: &Schema) -> HashMap<i32, 
 // Arrow column access helpers
 // ============================================================================
 
-fn col_i32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
+pub(super) fn col_i32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
     batch.column_by_name(name)
         .and_then(|a| a.as_any().downcast_ref::<Int32Array>())
         .ok_or_else(|| Error::new(ErrorKind::DataInvalid, format!("missing column: {name}")))
 }
 
-fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+pub(super) fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
     batch.column_by_name(name)
         .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
         .ok_or_else(|| Error::new(ErrorKind::DataInvalid, format!("missing column: {name}")))
 }
 
-fn col_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+pub(super) fn col_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
     batch.column_by_name(name)
         .and_then(|a| a.as_any().downcast_ref::<StringArray>())
         .ok_or_else(|| Error::new(ErrorKind::DataInvalid, format!("missing column: {name}")))
 }
 
-fn col_i32_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int32Array> {
+pub(super) fn col_i32_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int32Array> {
     batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<Int32Array>())
 }
 
-fn col_i64_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
+pub(super) fn col_i64_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
     batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<Int64Array>())
 }
 
-fn col_str_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
+pub(super) fn col_str_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
     batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<StringArray>())
 }
 
-fn col_binary_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a BinaryArray> {
+pub(super) fn col_binary_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a BinaryArray> {
     batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<BinaryArray>())
 }
 
-fn nullable_i64(arr: Option<&Int64Array>, i: usize) -> Option<i64> {
+pub(super) fn nullable_i64(arr: Option<&Int64Array>, i: usize) -> Option<i64> {
     arr.and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) })
 }
 
-fn read_binary_opt<'a>(arr: Option<&'a BinaryArray>, i: usize) -> Option<&'a [u8]> {
+pub(super) fn read_binary_opt<'a>(arr: Option<&'a BinaryArray>, i: usize) -> Option<&'a [u8]> {
     arr.and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) })
 }
 

@@ -55,8 +55,10 @@ mod action;
 pub use action::*;
 mod append;
 mod replace_data_files;
+mod rebalance_root_manifest;
 mod rewrite_manifests;
 mod snapshot;
+pub use rebalance_root_manifest::RebalanceRootManifestAction;
 pub use snapshot::generate_unique_snapshot_id;
 mod sort_order;
 mod update_location;
@@ -178,6 +180,12 @@ impl Transaction {
     /// into fewer large ones. This is a metadata-only operation.
     pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
         RewriteManifestsAction::new()
+    }
+
+    /// Creates a rebalance action for V4 root manifests. Flushes inline
+    /// entries into child manifest files and compacts MDV-heavy manifest refs.
+    pub fn rebalance_root_manifest(&self) -> RebalanceRootManifestAction {
+        RebalanceRootManifestAction::new()
     }
 
     /// Creates a schema-evolution action limited to additive changes

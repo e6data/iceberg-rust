@@ -408,7 +408,25 @@ impl TableScan {
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
-        // Process the delete file [`ManifestEntry`] stream in parallel
+        // Process the delete file [`ManifestEntry`] stream in parallel.
+        //
+        // NOTE: This spawn is intentionally NOT `.await`ed. The sibling
+        // data-process spawn below uses the same fire-and-forget shape on
+        // purpose -- awaiting either spawn here deadlocks when the V4
+        // inline-entries spawn (above, lines ~381) holds BOTH
+        // `inline_delete_tx` and `inline_data_tx` until it finishes
+        // sending every inline data entry. With bounded channels sized
+        // to `concurrency_limit_manifest_files`, the inline spawn blocks
+        // on `inline_data_tx.send().await` once the data channel fills;
+        // the data-process consumer can't run because we're still
+        // waiting here; `inline_delete_tx` stays alive; `delete_rx`
+        // never closes; this spawn never returns. Live-confirmed on
+        // sri-olly's observability.logs (V4 root manifest, 68 inline
+        // entries, concurrency_limit=4, plan_files hung 10+ min with
+        // no progress and no error). Letting this spawn run in
+        // parallel lets the data consumer drain the inline-data
+        // channel; the inline spawn then completes and `delete_rx`
+        // closes naturally, terminating this task on its own.
         spawn(async move {
             let result = manifest_entry_delete_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
@@ -428,8 +446,7 @@ impl TableScan {
                     .send(Err(error))
                     .await;
             }
-        })
-        .await;
+        });
 
         // Process the data file [`ManifestEntry`] stream in parallel
         spawn(async move {

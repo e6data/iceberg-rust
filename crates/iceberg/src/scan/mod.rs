@@ -385,6 +385,41 @@ impl TableScan {
                     break;
                 }
             }
+            // Drop the inline-delete tx BEFORE starting the inline-data sends.
+            // Otherwise we deadlock past a critical inline-entry count:
+            //
+            //   - `process_data_manifest_entry` calls
+            //     `into_file_scan_task().await` which awaits
+            //     `DeleteFileIndex::get_deletes_for_data_file`, which itself
+            //     blocks on `notifier.notified().await` until the delete
+            //     index transitions to `Populated`.
+            //   - That transition happens when the delete-process spawn
+            //     drains its rx, which closes only when every
+            //     `manifest_entry_delete_ctx_tx` clone drops.
+            //   - One of those clones is `inline_delete_tx`, held here.
+            //   - Meanwhile this spawn is mid-loop sending inline DATA
+            //     entries; `inline_data_tx.send().await` blocks once the
+            //     data channel (size = concurrency_limit_manifest_files)
+            //     fills, AND the data-process consumer can't drain because
+            //     all its in-flight tasks (concurrency_limit_manifest_entries
+            //     of them) are blocked on the delete-index notifier above.
+            //
+            // Threshold for deadlock: inline_data_contexts.len() >
+            //   concurrency_limit_manifest_files + concurrency_limit_manifest_entries.
+            // Live-confirmed on sri-olly's attribute_index_logs at 66 inline
+            // entries (> 16+16=32) -- 3h probe queries hit the 10s
+            // INDEX_PROBE_TIMEOUT ceiling 100% of the time while 1h probes
+            // (~23 entries, under threshold) completed in 115ms.
+            //
+            // The fix is structural, not a knob: dropping inline_delete_tx
+            // here lets the delete channel close immediately when there are
+            // no child-manifest delete entries (always true on append-only
+            // tables like attribute_index_*, and the dominant case in
+            // V4-on-low-volume), so the DeleteFileIndex populates with an
+            // empty set and `get_deletes_for_data_file` returns Vec::new
+            // instead of blocking forever.
+            drop(inline_delete_tx);
+
             for ctx in inline_data_contexts {
                 if inline_data_tx.send(ctx).await.is_err() {
                     break;

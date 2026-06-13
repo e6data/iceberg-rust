@@ -25,45 +25,50 @@ use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Result, TableUpdate};
 
-/// A transactional action for updating statistics files in a table
+/// A transactional action for updating statistics files in a table.
+///
+/// Per the Iceberg spec, multiple `StatisticsFile` entries may share
+/// the same `snapshot_id` as long as their `statistics_path` differs.
+/// Storage is keyed on `(snapshot_id, statistics_path)` for
+/// `set_statistics`; for `remove_statistics` the caller still removes
+/// every entry for a snapshot id (matching the catalog protocol's
+/// `RemoveStatistics` semantics).
 pub struct UpdateStatisticsAction {
-    statistics_to_set: HashMap<i64, Option<StatisticsFile>>,
+    statistics_to_set: HashMap<(i64, String), StatisticsFile>,
+    statistics_to_remove: Vec<i64>,
 }
 
 impl UpdateStatisticsAction {
     pub fn new() -> Self {
         Self {
             statistics_to_set: HashMap::default(),
+            statistics_to_remove: Vec::new(),
         }
     }
 
-    /// Set the table's statistics file for given snapshot, replacing the previous statistics file for
-    /// the snapshot if any exists. The snapshot id of the statistics file will be used.
+    /// Add a statistics file entry for its snapshot.
     ///
-    /// # Arguments
-    ///
-    /// * `statistics_file` - The [`StatisticsFile`] to associate with its corresponding snapshot ID.
-    ///
-    /// # Returns
-    ///
-    /// An updated [`UpdateStatisticsAction`] with the new statistics file applied.
+    /// Keyed on `(snapshot_id, statistics_path)`. Calling N times with
+    /// the same snapshot_id but distinct paths adds N entries (this is
+    /// the multi-stats-per-snapshot path); a second call with the same
+    /// `(snapshot_id, path)` pair overwrites the prior entry, which is
+    /// a true in-place update.
     pub fn set_statistics(mut self, statistics_file: StatisticsFile) -> Self {
-        self.statistics_to_set
-            .insert(statistics_file.snapshot_id, Some(statistics_file));
+        let key = (
+            statistics_file.snapshot_id,
+            statistics_file.statistics_path.clone(),
+        );
+        self.statistics_to_set.insert(key, statistics_file);
         self
     }
 
-    /// Remove the table's statistics file for given snapshot.
+    /// Remove every statistics file entry for the given snapshot id.
     ///
-    /// # Arguments
-    ///
-    /// * `snapshot_id` - The ID of the snapshot whose statistics file should be removed.
-    ///
-    /// # Returns
-    ///
-    /// An updated [`UpdateStatisticsAction`] with the removal operation recorded.
+    /// Matches the catalog protocol — `RemoveStatistics` is keyed by
+    /// snapshot id, not by `(snapshot_id, path)`, so callers can't
+    /// selectively drop just one of several entries.
     pub fn remove_statistics(mut self, snapshot_id: i64) -> Self {
-        self.statistics_to_set.insert(snapshot_id, None);
+        self.statistics_to_remove.push(snapshot_id);
         self
     }
 }
@@ -79,19 +84,18 @@ impl TransactionAction for UpdateStatisticsAction {
     async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
         let mut updates: Vec<TableUpdate> = vec![];
 
-        self.statistics_to_set
-            .iter()
-            .for_each(|(snapshot_id, statistic_file)| {
-                if let Some(statistics) = statistic_file {
-                    updates.push(TableUpdate::SetStatistics {
-                        statistics: statistics.clone(),
-                    })
-                } else {
-                    updates.push(TableUpdate::RemoveStatistics {
-                        snapshot_id: *snapshot_id,
-                    })
-                }
+        // Emit removes first so a set on the same snapshot id in the
+        // same action lands AFTER the remove and survives.
+        for snapshot_id in &self.statistics_to_remove {
+            updates.push(TableUpdate::RemoveStatistics {
+                snapshot_id: *snapshot_id,
             });
+        }
+        for statistics in self.statistics_to_set.values() {
+            updates.push(TableUpdate::SetStatistics {
+                statistics: statistics.clone(),
+            });
+        }
 
         Ok(ActionCommit::new(updates, vec![]))
     }
@@ -155,20 +159,66 @@ mod tests {
         let action = (*tx.actions[0])
             .downcast_ref::<UpdateStatisticsAction>()
             .unwrap();
-        assert!(
-            action
-                .statistics_to_set
-                .get(&statistics_file_1.snapshot_id)
-                .unwrap()
-                .is_none()
-        ); // stats1 should have been removed
+        // stats1 should still be present in the set map (composite key
+        // doesn't collide with remove), and the remove enqueues a
+        // snapshot-id-scoped RemoveStatistics that hits both.
+        assert!(action.statistics_to_remove.contains(&3055729675574597004i64));
         assert_eq!(
             action
                 .statistics_to_set
-                .get(&statistics_file_2.snapshot_id)
+                .get(&(
+                    statistics_file_2.snapshot_id,
+                    statistics_file_2.statistics_path.clone()
+                ))
                 .unwrap()
                 .clone(),
-            Some(statistics_file_2)
+            statistics_file_2
+        );
+    }
+
+    #[test]
+    fn test_multi_stats_per_snapshot() {
+        // Two StatisticsFile entries sharing the same snapshot_id but
+        // distinct statistics_path values must both survive — this is
+        // the B2 multi-stats-per-snapshot path.
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+        let snap_id = 9999i64;
+        let s1 = StatisticsFile {
+            snapshot_id: snap_id,
+            statistics_path: "s3://b/p1.puffin".to_string(),
+            file_size_in_bytes: 100,
+            file_footer_size_in_bytes: 10,
+            key_metadata: None,
+            blob_metadata: vec![],
+        };
+        let s2 = StatisticsFile {
+            snapshot_id: snap_id,
+            statistics_path: "s3://b/p2.puffin".to_string(),
+            file_size_in_bytes: 200,
+            file_footer_size_in_bytes: 20,
+            key_metadata: None,
+            blob_metadata: vec![],
+        };
+        let tx = tx
+            .update_statistics()
+            .set_statistics(s1.clone())
+            .set_statistics(s2.clone())
+            .apply(tx)
+            .unwrap();
+        let action = (*tx.actions[0])
+            .downcast_ref::<UpdateStatisticsAction>()
+            .unwrap();
+        assert_eq!(action.statistics_to_set.len(), 2);
+        assert!(
+            action
+                .statistics_to_set
+                .contains_key(&(snap_id, s1.statistics_path))
+        );
+        assert!(
+            action
+                .statistics_to_set
+                .contains_key(&(snap_id, s2.statistics_path))
         );
     }
 
@@ -201,10 +251,13 @@ mod tests {
         assert_eq!(
             action
                 .statistics_to_set
-                .get(&statistics_file.snapshot_id)
+                .get(&(
+                    statistics_file.snapshot_id,
+                    statistics_file.statistics_path.clone()
+                ))
                 .unwrap()
                 .clone(),
-            Some(statistics_file)
+            statistics_file
         );
     }
 

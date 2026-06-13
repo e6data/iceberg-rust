@@ -583,21 +583,41 @@ impl TableMetadataBuilder {
         self
     }
 
-    /// Set statistics for a snapshot
+    /// Add a statistics file for a snapshot.
+    ///
+    /// Per the Iceberg spec, multiple `StatisticsFile` entries may
+    /// share the same `snapshot_id` as long as their `statistics_path`
+    /// differs — each is keyed on `(snapshot_id, statistics_path)`.
+    /// Calling this method N times with the same snapshot_id but
+    /// distinct paths adds N entries; previous behaviour was a silent
+    /// last-write-wins overwrite via the prior `HashMap<i64, _>`
+    /// storage. A second call with the SAME `(snapshot_id, path)`
+    /// pair still overwrites the prior entry — that's a true update.
     pub fn set_statistics(mut self, statistics: StatisticsFile) -> Self {
-        self.metadata
-            .statistics
-            .insert(statistics.snapshot_id, statistics.clone());
+        self.metadata.statistics.insert(
+            (statistics.snapshot_id, statistics.statistics_path.clone()),
+            statistics.clone(),
+        );
         self.changes.push(TableUpdate::SetStatistics {
             statistics: statistics.clone(),
         });
         self
     }
 
-    /// Remove statistics for a snapshot
+    /// Remove **all** statistics file entries for a snapshot id,
+    /// regardless of how many distinct `statistics_path` entries
+    /// exist. Mirrors the prior behaviour (one TableUpdate emitted
+    /// per snapshot id, not per file) so existing catalog clients
+    /// keep working: `TableUpdate::RemoveStatistics` is snapshot-id-
+    /// keyed in the catalog protocol. The TableUpdate is emitted iff
+    /// at least one entry was actually removed.
     pub fn remove_statistics(mut self, snapshot_id: i64) -> Self {
-        let previous = self.metadata.statistics.remove(&snapshot_id);
-        if previous.is_some() {
+        let before = self.metadata.statistics.len();
+        self.metadata
+            .statistics
+            .retain(|(sid, _), _| *sid != snapshot_id);
+        let removed_any = self.metadata.statistics.len() < before;
+        if removed_any {
             self.changes
                 .push(TableUpdate::RemoveStatistics { snapshot_id });
         }
@@ -2549,7 +2569,10 @@ mod tests {
 
         assert_eq!(
             build_result.metadata.statistics,
-            HashMap::from_iter(vec![(3055729675574597004, statistics.clone())])
+            HashMap::from_iter(vec![(
+                (3055729675574597004, "s3://a/b/stats.puffin".to_string()),
+                statistics.clone()
+            )])
         );
         assert_eq!(build_result.changes, vec![TableUpdate::SetStatistics {
             statistics: statistics.clone()
@@ -2575,6 +2598,93 @@ mod tests {
             .unwrap();
         assert_eq!(build_result.metadata.statistics.len(), 0);
         assert_eq!(build_result.changes.len(), 0);
+    }
+
+    /// Regression: per-spec, multiple `StatisticsFile` entries may
+    /// share the same `snapshot_id` so long as their
+    /// `statistics_path` differs. Tessellate compaction commits and
+    /// laminar's per-output merge-sidecar registration both rely on
+    /// this. The prior storage (`HashMap<i64, _>`) silently
+    /// collapsed each second-and-later call to last-write-wins,
+    /// dropping blobs at commit time without any error surface.
+    /// Three calls with the same snapshot_id but distinct paths must
+    /// yield three distinct entries; `statistics_for_snapshot`
+    /// returns one (back-compat) and `all_statistics_for_snapshot`
+    /// returns the full set.
+    #[test]
+    fn test_set_multiple_statistics_same_snapshot_different_paths() {
+        let make_stats = |path: &str| StatisticsFile {
+            snapshot_id: 3055729675574597004,
+            statistics_path: path.to_string(),
+            file_size_in_bytes: 100,
+            file_footer_size_in_bytes: 10,
+            key_metadata: None,
+            blob_metadata: vec![],
+        };
+        let s1 = make_stats("s3://a/b/stats-1.puffin");
+        let s2 = make_stats("s3://a/b/stats-2.puffin");
+        let s3 = make_stats("s3://a/b/stats-3.puffin");
+
+        let builder = builder_without_changes(FormatVersion::V2);
+        let build_result = builder
+            .set_statistics(s1.clone())
+            .set_statistics(s2.clone())
+            .set_statistics(s3.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            build_result.metadata.statistics.len(),
+            3,
+            "all three entries must persist — composite key on (snapshot_id, path)"
+        );
+
+        let mut all = build_result
+            .metadata
+            .all_statistics_for_snapshot(3055729675574597004);
+        all.sort_by_key(|s| s.statistics_path.clone());
+        let paths: Vec<&str> = all.iter().map(|s| s.statistics_path.as_str()).collect();
+        assert_eq!(paths, vec![
+            "s3://a/b/stats-1.puffin",
+            "s3://a/b/stats-2.puffin",
+            "s3://a/b/stats-3.puffin",
+        ]);
+
+        // Back-compat: statistics_for_snapshot returns Some(_) (any
+        // single entry — HashMap iteration order is unspecified).
+        assert!(
+            build_result
+                .metadata
+                .statistics_for_snapshot(3055729675574597004)
+                .is_some()
+        );
+
+        // Three TableUpdate::SetStatistics emitted, one per call.
+        assert_eq!(
+            build_result
+                .changes
+                .iter()
+                .filter(|c| matches!(c, TableUpdate::SetStatistics { .. }))
+                .count(),
+            3
+        );
+
+        // remove_statistics(snapshot_id) drops ALL three (mirrors the
+        // catalog's snapshot-id-keyed RemoveStatistics).
+        let builder = build_result.metadata.into_builder(None);
+        let remove_result = builder
+            .remove_statistics(3055729675574597004)
+            .build()
+            .unwrap();
+        assert_eq!(remove_result.metadata.statistics.len(), 0);
+        assert_eq!(
+            remove_result
+                .changes
+                .iter()
+                .filter(|c| matches!(c, TableUpdate::RemoveStatistics { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]

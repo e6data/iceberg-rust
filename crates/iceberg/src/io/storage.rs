@@ -32,13 +32,12 @@ use opendal::services::GcsConfig;
 use opendal::services::OssConfig;
 #[cfg(feature = "storage-s3")]
 use opendal::services::S3Config;
-use opendal::{Operator, Scheme};
+use opendal::Operator;
 
 #[cfg(feature = "storage-azdls")]
 use super::AzureStorageScheme;
 use super::FileIOBuilder;
 #[cfg(feature = "storage-s3")]
-use crate::io::CustomAwsCredentialLoader;
 use crate::{Error, ErrorKind};
 
 /// The storage carries all supported storage services in iceberg
@@ -49,13 +48,18 @@ pub(crate) enum Storage {
     #[cfg(feature = "storage-fs")]
     LocalFs,
     /// Expects paths of the form `s3[a]://<bucket>/<path>`.
+    ///
+    /// In opendal 0.55 we used to inject a `CustomAwsCredentialLoader` here
+    /// to drive EKS Pod Identity token refresh. opendal 0.57 ships a
+    /// `credential_provider_chain` natively (IRSA, EKS Pod Identity, EC2
+    /// instance metadata, env vars — all auto-refreshing), so this struct
+    /// no longer needs the loader field.
     #[cfg(feature = "storage-s3")]
     S3 {
         /// s3 storage could have `s3://` and `s3a://`.
         /// Storing the scheme string here to return the correct path.
         configured_scheme: String,
         config: Arc<S3Config>,
-        customized_credential_load: Option<CustomAwsCredentialLoader>,
     },
     #[cfg(feature = "storage-gcs")]
     Gcs { config: Arc<GcsConfig> },
@@ -78,31 +82,31 @@ impl Storage {
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
         let (scheme_str, props, extensions) = file_io_builder.into_parts();
         let _ = (&props, &extensions);
-        let scheme = Self::parse_scheme(&scheme_str)?;
+        // opendal 0.57 dropped the top-level `Scheme` enum; we now dispatch
+        // directly on the scheme string. Aliases (`s3`/`s3a`,
+        // `abfs[s]`/`wasb[s]`) are recognised in the match arms.
+        let normalized = Self::normalize_scheme(&scheme_str)?;
 
-        match scheme {
+        match normalized.as_str() {
             #[cfg(feature = "storage-memory")]
-            Scheme::Memory => Ok(Self::Memory(super::memory_config_build()?)),
+            "memory" => Ok(Self::Memory(super::memory_config_build()?)),
             #[cfg(feature = "storage-fs")]
-            Scheme::Fs => Ok(Self::LocalFs),
+            "fs" => Ok(Self::LocalFs),
             #[cfg(feature = "storage-s3")]
-            Scheme::S3 => Ok(Self::S3 {
+            "s3" => Ok(Self::S3 {
                 configured_scheme: scheme_str,
                 config: super::s3_config_parse(props)?.into(),
-                customized_credential_load: extensions
-                    .get::<CustomAwsCredentialLoader>()
-                    .map(Arc::unwrap_or_clone),
             }),
             #[cfg(feature = "storage-gcs")]
-            Scheme::Gcs => Ok(Self::Gcs {
+            "gcs" => Ok(Self::Gcs {
                 config: super::gcs_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-oss")]
-            Scheme::Oss => Ok(Self::Oss {
+            "oss" => Ok(Self::Oss {
                 config: super::oss_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-azdls")]
-            Scheme::Azdls => {
+            "azdls" => {
                 let scheme = scheme_str.parse::<AzureStorageScheme>()?;
                 Ok(Self::Azdls {
                     config: super::azdls_config_parse(props)?.into(),
@@ -112,7 +116,7 @@ impl Storage {
             // Update doc on [`FileIO`] when adding new schemes.
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
-                format!("Constructing file io from scheme: {scheme} not supported now",),
+                format!("Constructing file io from scheme: {normalized} not supported now",),
             )),
         }
     }
@@ -158,9 +162,8 @@ impl Storage {
             Storage::S3 {
                 configured_scheme,
                 config,
-                customized_credential_load,
             } => {
-                let op = super::s3_config_build(config, customized_credential_load, path)?;
+                let op = super::s3_config_build(config, path)?;
                 let op_info = op.info();
 
                 // Check prefix of s3 path.
@@ -227,16 +230,20 @@ impl Storage {
         Ok((operator, relative_path))
     }
 
-    /// Parse scheme.
-    fn parse_scheme(scheme: &str) -> crate::Result<Scheme> {
-        match scheme {
-            "memory" => Ok(Scheme::Memory),
-            "file" | "" => Ok(Scheme::Fs),
-            "s3" | "s3a" => Ok(Scheme::S3),
-            "gs" | "gcs" => Ok(Scheme::Gcs),
-            "oss" => Ok(Scheme::Oss),
-            "abfss" | "abfs" | "wasbs" | "wasb" => Ok(Scheme::Azdls),
-            s => Ok(s.parse::<Scheme>()?),
-        }
+    /// Normalize a user-facing scheme string (e.g. `s3a`, `abfss`) into the
+    /// canonical opendal-service identifier (`s3`, `azdls`, ...). Returns
+    /// the canonical name on success; an unknown scheme is surfaced as
+    /// `FeatureUnsupported` via the caller's match.
+    fn normalize_scheme(scheme: &str) -> crate::Result<String> {
+        let canon = match scheme {
+            "memory" => "memory",
+            "file" | "" => "fs",
+            "s3" | "s3a" => "s3",
+            "gs" | "gcs" => "gcs",
+            "oss" => "oss",
+            "abfss" | "abfs" | "wasbs" | "wasb" => "azdls",
+            other => other,
+        };
+        Ok(canon.to_string())
     }
 }

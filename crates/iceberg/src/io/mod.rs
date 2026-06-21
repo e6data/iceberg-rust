@@ -73,6 +73,8 @@ pub use file_io::*;
 pub(crate) mod object_cache;
 
 #[cfg(feature = "storage-azdls")]
+mod azdls_wi_layer;
+#[cfg(feature = "storage-azdls")]
 mod storage_azdls;
 #[cfg(feature = "storage-fs")]
 mod storage_fs;

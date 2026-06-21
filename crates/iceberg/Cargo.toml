@@ -65,6 +65,7 @@ expect-test = { workspace = true }
 flate2 = { workspace = true }
 fnv = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
 itertools = { workspace = true }
 moka = { version = "0.12.10", features = ["future"] }
 murmur3 = { workspace = true }

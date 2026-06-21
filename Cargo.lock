@@ -3505,6 +3505,7 @@ dependencies = [
  "flate2",
  "fnv",
  "futures",
+ "http 1.4.0",
  "iceberg_test_utils",
  "itertools 0.13.0",
  "log",

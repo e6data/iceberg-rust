@@ -242,6 +242,12 @@ fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<o
     if config.client_secret.is_none() && config.account_key.is_none() && config.sas_token.is_none()
     {
         if let Some(env) = read_wi_env() {
+            log::info!(
+                "azdls: enabling WI bearer-token http-client wrap (client_id={}, tenant_id={}, federated_token_file={})",
+                env.client_id,
+                env.tenant_id,
+                env.federated_token_file
+            );
             let fetcher = Arc::new(WiTokenFetcher::new(env));
             opendal::raw::AccessDyn::info_dyn(&**op.inner())
                 .update_http_client(|c| wrap_http_client(c, fetcher));

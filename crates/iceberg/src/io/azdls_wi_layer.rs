@@ -197,20 +197,23 @@ impl WiHttpFetch {
 
 impl HttpFetch for WiHttpFetch {
     async fn fetch(&self, mut req: Request<Buffer>) -> ODResult<Response<HttpBody>> {
-        if !req.headers().contains_key(AUTHORIZATION) {
-            let token = self.fetcher.get_token().await.map_err(|e| {
-                ODError::new(ODErrorKind::Unexpected, "WI: fetch bearer token failed")
-                    .set_source(e)
-            })?;
-            let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| {
-                ODError::new(
-                    ODErrorKind::Unexpected,
-                    "WI: bearer token has invalid header bytes",
-                )
-                .set_source(e)
-            })?;
-            req.headers_mut().insert(AUTHORIZATION, value);
-        }
+        // Always overwrite. reqsign's default chain runs an IMDS provider
+        // (the AKS node-VM identity) before our wrap sees the request; if
+        // we only inserted when AUTHORIZATION was absent, we would forward
+        // that wrong-principal token to ADLS and get 403
+        // AuthorizationPermissionMismatch. Replacing the header guarantees
+        // every ADLS call carries the federated UAMI we want.
+        let token = self.fetcher.get_token().await.map_err(|e| {
+            ODError::new(ODErrorKind::Unexpected, "WI: fetch bearer token failed").set_source(e)
+        })?;
+        let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| {
+            ODError::new(
+                ODErrorKind::Unexpected,
+                "WI: bearer token has invalid header bytes",
+            )
+            .set_source(e)
+        })?;
+        req.headers_mut().insert(AUTHORIZATION, value);
         self.inner.fetch(req).await
     }
 }

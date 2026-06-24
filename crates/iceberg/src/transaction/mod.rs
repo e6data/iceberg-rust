@@ -96,6 +96,10 @@ pub struct Transaction {
     actions: Vec<BoxedTransactionAction>,
     first_attempt: bool,
     created_manifest_paths: Vec<String>,
+    /// When true, OCC commit failures are not retried. Set automatically
+    /// when the transaction contains ReplaceDataFiles — retry with a stale
+    /// delete-file list produces duplicate data.
+    disable_retry: bool,
 }
 
 impl Transaction {
@@ -106,6 +110,7 @@ impl Transaction {
             actions: vec![],
             first_attempt: true,
             created_manifest_paths: Vec::new(),
+            disable_retry: false,
         }
     }
 
@@ -231,6 +236,7 @@ impl Transaction {
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
 
+        let disable_retry = tx.disable_retry;
         let (tx, result) = (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
             (tx, result)
@@ -238,7 +244,7 @@ impl Transaction {
         .retry(backoff)
         .sleep(tokio::time::sleep)
         .context(tx)
-        .when(|e| e.retryable())
+        .when(|e| e.retryable() && !disable_retry)
         .await;
 
         let table = result?;

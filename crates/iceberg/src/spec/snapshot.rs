@@ -223,7 +223,7 @@ impl Snapshot {
         // scan trying to parse the Parquet as Avro. See
         // `crate::spec::table_metadata::E6_ACTUAL_FORMAT_VERSION_KEY`.
         if table_metadata.effective_format_version() == FormatVersion::V4 {
-            let (_, entries) =
+            let (rm_meta, entries) =
                 crate::spec::root_manifest::read_root_manifest(manifest_list_content.clone())?;
 
             let mut manifest_files = Vec::new();
@@ -246,6 +246,18 @@ impl Snapshot {
                     }
                 }
             }
+
+            // Tiered layout (root → bucket-index → leaf): flatten the cold
+            // bucket-index's leaf refs into the manifest list so the planner
+            // prunes them by partition summary exactly like the live refs. The
+            // hot path never touches the bucket-index; this is the only place
+            // the read side recurses into the cold tier.
+            if let Some(bucket_index) =
+                crate::spec::bucket_index::load_bucket_index_for_root(file_io, &rm_meta).await?
+            {
+                manifest_files.extend(bucket_index.leaves().iter().cloned());
+            }
+
             return Ok(ManifestList::with_inline_entries(
                 manifest_files,
                 inlines,

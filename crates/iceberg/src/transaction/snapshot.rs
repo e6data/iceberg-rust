@@ -1044,41 +1044,60 @@ impl<'a> SnapshotProducer<'a> {
             // the cache is stale and must be discarded.
             *cached_sid == current_snapshot_id
         });
-        let mut entries: Vec<RootManifestEntry> = if let Some((_, cached)) = cached.filter(|_| cache_valid) {
-            cached
-        } else if let Some(current_snapshot) =
-            self.table.metadata().current_snapshot()
-        {
-            let manifest_list_path = current_snapshot.manifest_list();
-            let bytes = self
-                .table
-                .file_io()
-                .new_input(manifest_list_path)?
-                .read()
-                .await?;
+        // Load the previous entries AND the previous bucket-index pointer. The
+        // pointer MUST be carried forward: the hot commit only rewrites the live
+        // tier, so dropping it here would orphan the cold bucket-index (tiered
+        // layout). Tuple: (entries, carried bucket_index_path).
+        let (mut entries, carried_bucket_index_path): (Vec<RootManifestEntry>, Option<String>) =
+            if let Some((_, cached)) = cached.filter(|_| cache_valid) {
+                // Cache path (laminar never populates the cache). The cache does
+                // not carry the pointer, so recover it from the current
+                // snapshot's root metadata rather than risk orphaning the cold
+                // tier.
+                let path = match self.table.metadata().current_snapshot() {
+                    Some(s) => {
+                        let b = self.table.file_io().new_input(s.manifest_list())?.read().await?;
+                        read_root_manifest(b).ok().and_then(|(m, _)| m.bucket_index_path)
+                    }
+                    None => None,
+                };
+                (cached, path)
+            } else if let Some(current_snapshot) =
+                self.table.metadata().current_snapshot()
+            {
+                let manifest_list_path = current_snapshot.manifest_list();
+                let bytes = self
+                    .table
+                    .file_io()
+                    .new_input(manifest_list_path)?
+                    .read()
+                    .await?;
 
-            // Try reading as root manifest; fall back to manifest list for upgrade path
-            match read_root_manifest(bytes.clone()) {
-                Ok((_, existing_entries)) => existing_entries,
-                Err(_) => {
-                    // Upgrading from V3: convert manifest list entries to manifest refs
-                    let manifest_list = crate::spec::ManifestList::parse_with_version(
-                        &bytes,
-                        FormatVersion::V3,
-                    )?;
-                    manifest_list
-                        .entries()
-                        .iter()
-                        .map(|mf| RootManifestEntry::ManifestRef {
-                            manifest_file: mf.clone(),
-                            mdv: None,
-                        })
-                        .collect()
+                // Try reading as root manifest; fall back to manifest list for upgrade path
+                match read_root_manifest(bytes.clone()) {
+                    Ok((prev_meta, existing_entries)) => {
+                        (existing_entries, prev_meta.bucket_index_path)
+                    }
+                    Err(_) => {
+                        // Upgrading from V3: convert manifest list entries to manifest refs
+                        let manifest_list = crate::spec::ManifestList::parse_with_version(
+                            &bytes,
+                            FormatVersion::V3,
+                        )?;
+                        let entries = manifest_list
+                            .entries()
+                            .iter()
+                            .map(|mf| RootManifestEntry::ManifestRef {
+                                manifest_file: mf.clone(),
+                                mdv: None,
+                            })
+                            .collect();
+                        (entries, None)
+                    }
                 }
-            }
-        } else {
-            vec![]
-        };
+            } else {
+                (vec![], None)
+            };
 
         // Handle file removals (compaction / overwrite operations)
         let removed_data_files = std::mem::take(&mut self.removed_data_files);
@@ -1215,7 +1234,21 @@ impl<'a> SnapshotProducer<'a> {
             .filter(|e| matches!(e, RootManifestEntry::Inline(_)))
             .count();
 
-        if inline_count > inline_threshold {
+        // Tiered layout: keep the live tier inline-only. The bucket-close
+        // (`graduate_buckets`) operation is the sole producer of child/leaf
+        // manifests — it materializes closed inline blocks into cold leaves. So
+        // when tiering is enabled we skip the hot inline→child flush entirely;
+        // the live inline set is bounded by the bucket window (tune the close
+        // cadence under heavy traffic), not by this threshold.
+        let tiered = self
+            .table
+            .metadata()
+            .properties()
+            .get("tiered-metadata.enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if !tiered && inline_count > inline_threshold {
             // Split inline entries by content type (data vs delete)
             let mut data_entries: Vec<ManifestEntry> = Vec::new();
             let mut delete_entries: Vec<ManifestEntry> = Vec::new();
@@ -1336,12 +1369,11 @@ impl<'a> SnapshotProducer<'a> {
             snapshot_id: self.snapshot_id,
             sequence_number: next_seq_num,
             parent_snapshot_id: self.table.metadata().current_snapshot_id(),
-            // Tiered layout not yet active on the hot path. INCREMENT 3 must
-            // carry the previous root's bucket_index_path forward here (through
-            // both the cached and read_root_manifest paths) once the bucket-close
-            // operation can set it — otherwise a hot commit would orphan the
-            // cold bucket-index.
-            bucket_index_path: None,
+            // Carry the cold bucket-index pointer forward unchanged — the hot
+            // commit only rewrites the live tier (see entry-load above). Without
+            // this, the first commit after a bucket-close would orphan the cold
+            // tier.
+            bucket_index_path: carried_bucket_index_path,
         };
 
         // Write root manifest as single Parquet file

@@ -59,7 +59,7 @@ mod replace_data_files;
 mod rebalance_root_manifest;
 mod rewrite_manifests;
 mod snapshot;
-pub use graduate_buckets::{ClosedPredicate, GraduateBucketsAction};
+pub use graduate_buckets::{closed_before, ClosedPredicate, GraduateBucketsAction};
 pub use rebalance_root_manifest::RebalanceRootManifestAction;
 pub use snapshot::generate_unique_snapshot_id;
 mod sort_order;

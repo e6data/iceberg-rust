@@ -50,7 +50,8 @@ use crate::spec::root_manifest::{
 };
 use crate::spec::{
     DataContentType, DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus,
-    Operation, Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary, MAIN_BRANCH,
+    Operation, PrimitiveLiteral, Snapshot, SnapshotReference, SnapshotRetention, Summary,
+    MAIN_BRANCH,
 };
 use crate::table::Table;
 use crate::transaction::action::TransactionAction;
@@ -60,8 +61,26 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
 
-/// Predicate deciding whether a partition value belongs to a *closed* bucket.
-pub type ClosedPredicate = Arc<dyn Fn(&Struct) -> bool + Send + Sync>;
+/// Predicate deciding whether a data file belongs to a *closed* bucket — i.e.
+/// it should graduate to cold storage. Evaluated per file so the close policy
+/// can key on the file's own statistics (typically its timestamp max), which
+/// makes it independent of the partition spec. See [`closed_before`].
+pub type ClosedPredicate = Arc<dyn Fn(&DataFile) -> bool + Send + Sync>;
+
+/// Build a time-cutoff close predicate: a file is closed when its **max value**
+/// for `timestamp_field_id` is strictly below `cutoff_micros`. Files lacking
+/// that statistic stay live (conservative — never graduate data we can't
+/// time-bound). This is the partition-agnostic close policy the scheduler uses;
+/// the caller computes `cutoff_micros = now − bucket_window` and resolves the
+/// timestamp field id from the schema.
+pub fn closed_before(timestamp_field_id: i32, cutoff_micros: i64) -> ClosedPredicate {
+    Arc::new(move |df: &DataFile| {
+        df.upper_bounds()
+            .get(&timestamp_field_id)
+            .map(|d| matches!(d.literal(), PrimitiveLiteral::Long(v) if *v < cutoff_micros))
+            .unwrap_or(false)
+    })
+}
 
 /// Action that graduates closed live blocks into the cold bucket-index.
 ///
@@ -89,7 +108,7 @@ impl GraduateBucketsAction {
 /// Pure — no I/O — so the close decision is unit testable.
 fn split_for_graduation(
     entries: &[RootManifestEntry],
-    is_closed: &(dyn Fn(&Struct) -> bool + Send + Sync),
+    is_closed: &(dyn Fn(&DataFile) -> bool + Send + Sync),
 ) -> (Vec<DataFile>, Vec<RootManifestEntry>) {
     let mut graduate = Vec::new();
     let mut stay = Vec::new();
@@ -97,7 +116,7 @@ fn split_for_graduation(
         match entry {
             RootManifestEntry::Inline(me)
                 if me.data_file.content == DataContentType::Data
-                    && is_closed(&me.data_file.partition) =>
+                    && is_closed(&me.data_file) =>
             {
                 graduate.push(me.data_file.clone());
             }
@@ -295,21 +314,26 @@ mod tests {
 
     use super::*;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestContentType,
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, ManifestContentType,
         ManifestFile, Struct,
     };
 
-    fn inline(partition: Struct, path: &str) -> RootManifestEntry {
-        let df = DataFileBuilder::default()
+    /// Build an inline data entry. `ts_max` optionally sets an upper-bound
+    /// statistic (field_id, micros) so `closed_before` can be exercised.
+    fn inline_with(path: &str, ts_max: Option<(i32, i64)>) -> RootManifestEntry {
+        let mut builder = DataFileBuilder::default();
+        builder
             .content(DataContentType::Data)
             .file_path(path.to_string())
             .file_format(DataFileFormat::Parquet)
             .file_size_in_bytes(100)
             .record_count(1)
             .partition_spec_id(0)
-            .partition(partition)
-            .build()
-            .unwrap();
+            .partition(Struct::empty());
+        if let Some((fid, micros)) = ts_max {
+            builder.upper_bounds(HashMap::from([(fid, Datum::timestamp_micros(micros))]));
+        }
+        let df = builder.build().unwrap();
         RootManifestEntry::Inline(
             ManifestEntry::builder()
                 .status(ManifestStatus::Added)
@@ -344,49 +368,45 @@ mod tests {
 
     #[test]
     fn graduates_only_closed_inline_data() {
-        let closed = Struct::from_iter([Some(Literal::long(1))]);
-        let open = Struct::from_iter([Some(Literal::long(9))]);
-
         let entries = vec![
-            inline(closed.clone(), "s3://b/data/closed-a.parquet"),
-            inline(open.clone(), "s3://b/data/open.parquet"),
-            inline(closed.clone(), "s3://b/data/closed-b.parquet"),
+            inline_with("s3://b/data/closed-a.parquet", None),
+            inline_with("s3://b/data/open.parquet", None),
+            inline_with("s3://b/data/closed-b.parquet", None),
             a_ref(), // refs always stay
         ];
 
-        let closed_key = closed.clone();
+        // Close decision can key on anything in the DataFile.
         let (grad, stay) =
-            split_for_graduation(&entries, &move |s: &Struct| *s == closed_key);
+            split_for_graduation(&entries, &|df: &DataFile| df.file_path.contains("closed"));
 
-        // Two closed inline data files graduate.
         assert_eq!(grad.len(), 2);
         let paths: Vec<&str> = grad.iter().map(|d| d.file_path.as_str()).collect();
         assert!(paths.contains(&"s3://b/data/closed-a.parquet"));
         assert!(paths.contains(&"s3://b/data/closed-b.parquet"));
-
-        // Open inline + the ref stay.
         assert_eq!(stay.len(), 2);
     }
 
     #[test]
-    fn no_closed_partitions_is_noop_split() {
-        let open = Struct::from_iter([Some(Literal::long(9))]);
-        let entries = vec![inline(open.clone(), "s3://b/data/open.parquet"), a_ref()];
+    fn closed_before_uses_timestamp_max() {
+        let fid = 5;
+        let entries = vec![
+            inline_with("closed.parquet", Some((fid, 1_000))), // max ts < cutoff
+            inline_with("open.parquet", Some((fid, 9_000))),   // max ts >= cutoff
+            inline_with("nostat.parquet", None),               // no ts -> stays live
+        ];
 
-        let (grad, stay) = split_for_graduation(&entries, &|_s: &Struct| false);
-        assert!(grad.is_empty());
+        let pred = closed_before(fid, 5_000);
+        let (grad, stay) = split_for_graduation(&entries, pred.as_ref());
+
+        assert_eq!(grad.len(), 1);
+        assert_eq!(grad[0].file_path, "closed.parquet");
         assert_eq!(stay.len(), 2);
     }
 
     #[test]
     fn refs_never_graduate_even_if_predicate_true() {
-        // A predicate that says "everything is closed" must still leave refs and
-        // delete entries in the root — only inline DATA graduates.
-        let entries = vec![a_ref()];
-        let (grad, stay) = split_for_graduation(&entries, &|_s: &Struct| true);
+        let (grad, stay) = split_for_graduation(&[a_ref()], &|_df: &DataFile| true);
         assert!(grad.is_empty());
         assert_eq!(stay.len(), 1);
-        // silence unused import in this fn's scope
-        let _ = HashMap::<String, String>::new();
     }
 }

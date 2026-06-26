@@ -1336,6 +1336,12 @@ impl<'a> SnapshotProducer<'a> {
             snapshot_id: self.snapshot_id,
             sequence_number: next_seq_num,
             parent_snapshot_id: self.table.metadata().current_snapshot_id(),
+            // Tiered layout not yet active on the hot path. INCREMENT 3 must
+            // carry the previous root's bucket_index_path forward here (through
+            // both the cached and read_root_manifest paths) once the bucket-close
+            // operation can set it — otherwise a hot commit would orphan the
+            // cold bucket-index.
+            bucket_index_path: None,
         };
 
         // Write root manifest as single Parquet file

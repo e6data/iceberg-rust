@@ -166,6 +166,13 @@ pub struct RootManifestMetadata {
     pub sequence_number: i64,
     /// Parent snapshot ID, if any.
     pub parent_snapshot_id: Option<i64>,
+    /// Tiered-metadata pointer: path to the cold **bucket-index** (super-manifest)
+    /// listing closed leaf manifests, if this table uses the tiered layout.
+    /// `None` for the flat layout. The hot commit path carries this forward
+    /// unchanged; only the bucket-close (cold) path updates it. Encoded as the
+    /// `bucket-index-path` file-level key; absent key decodes to `None`, so the
+    /// change is backward-compatible with pre-tiering root manifests.
+    pub bucket_index_path: Option<String>,
 }
 
 /// The root manifest: replaces ManifestList in v4.
@@ -302,6 +309,9 @@ fn encode_root_manifest_metadata(metadata: &RootManifestMetadata) -> HashMap<Str
     if let Some(parent) = metadata.parent_snapshot_id {
         kv.insert("parent-snapshot-id".to_string(), parent.to_string());
     }
+    if let Some(path) = &metadata.bucket_index_path {
+        kv.insert("bucket-index-path".to_string(), path.clone());
+    }
     kv.insert("root-manifest".to_string(), "true".to_string());
     kv.insert(
         "root-manifest-layout".to_string(),
@@ -418,6 +428,10 @@ fn decode_root_manifest_metadata(
         })
         .transpose()?;
 
+    // Absent key => flat (non-tiered) layout. Backward-compatible with
+    // root manifests written before the tiered-metadata change.
+    let bucket_index_path: Option<String> = meta.get("bucket-index-path").cloned();
+
     Ok(RootManifestMetadata {
         schema,
         schema_id,
@@ -426,6 +440,7 @@ fn decode_root_manifest_metadata(
         snapshot_id,
         sequence_number,
         parent_snapshot_id,
+        bucket_index_path,
     })
 }
 
@@ -1258,6 +1273,7 @@ mod tests {
             snapshot_id: 100,
             sequence_number: 5,
             parent_snapshot_id: Some(99),
+            bucket_index_path: None,
         }
     }
 

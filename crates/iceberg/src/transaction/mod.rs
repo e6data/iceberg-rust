@@ -54,10 +54,12 @@ mod action;
 
 pub use action::*;
 mod append;
+mod graduate_buckets;
 mod replace_data_files;
 mod rebalance_root_manifest;
 mod rewrite_manifests;
 mod snapshot;
+pub use graduate_buckets::{ClosedPredicate, GraduateBucketsAction};
 pub use rebalance_root_manifest::RebalanceRootManifestAction;
 pub use snapshot::generate_unique_snapshot_id;
 mod sort_order;
@@ -191,6 +193,14 @@ impl Transaction {
     /// entries into child manifest files and compacts MDV-heavy manifest refs.
     pub fn rebalance_root_manifest(&self) -> RebalanceRootManifestAction {
         RebalanceRootManifestAction::new()
+    }
+
+    /// Creates an action that graduates closed live blocks (inline entries whose
+    /// partition `is_closed`) out of the hot root manifest into immutable cold
+    /// leaf manifests referenced by the bucket-index. The caller's close policy
+    /// (every N hours, …) is expressed entirely through the predicate.
+    pub fn graduate_buckets(&self, is_closed: ClosedPredicate) -> GraduateBucketsAction {
+        GraduateBucketsAction::new(is_closed)
     }
 
     /// Creates a schema-evolution action limited to additive changes

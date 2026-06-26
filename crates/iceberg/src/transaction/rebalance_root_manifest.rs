@@ -75,7 +75,7 @@ fn manifest_file_is_wide(mf: &ManifestFile) -> bool {
 /// partition tuple — producing tight (single-partition) summaries the planner
 /// can skip on. Otherwise a single manifest is written (legacy behavior).
 #[allow(clippy::too_many_arguments)]
-async fn write_entries_clustered(
+pub(crate) async fn write_entries_clustered(
     table: &Table,
     schema: &SchemaRef,
     spec: &PartitionSpec,
@@ -496,6 +496,9 @@ impl TransactionAction for RebalanceRootManifestAction {
             snapshot_id,
             sequence_number: next_seq_num,
             parent_snapshot_id: table.metadata().current_snapshot_id(),
+            // Carry the cold bucket-index pointer forward unchanged — rebalance
+            // only rewrites live refs/MDV, never the tiered cold layer.
+            bucket_index_path: rm_metadata.bucket_index_path.clone(),
         };
 
         let new_root_manifest_path = format!(

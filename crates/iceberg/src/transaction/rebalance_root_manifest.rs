@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::spec::root_manifest::{
     ManifestDeleteVector, RootManifest, RootManifestEntry, RootManifestMetadata,
-    read_root_manifest, write_root_manifest,
+    reconstruct_root, write_root_manifest,
 };
 use crate::spec::{
     DataContentType, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
@@ -286,13 +286,8 @@ impl TransactionAction for RebalanceRootManifestAction {
         };
 
         let root_manifest_path = current_snapshot.manifest_list();
-        let bytes = table
-            .file_io()
-            .new_input(root_manifest_path)?
-            .read()
-            .await?;
-
-        let (rm_metadata, entries) = read_root_manifest(bytes)?;
+        let (rm_metadata, entries) =
+            reconstruct_root(table.file_io(), root_manifest_path).await?;
         let root_manifest = RootManifest::new(rm_metadata.clone(), entries);
 
         // 3. Check if rebalance is needed
@@ -499,6 +494,8 @@ impl TransactionAction for RebalanceRootManifestAction {
             // Carry the cold bucket-index pointer forward unchanged — rebalance
             // only rewrites live refs/MDV, never the tiered cold layer.
             bucket_index_path: rm_metadata.bucket_index_path.clone(),
+            prev_root_path: None,
+            chain_depth: 0,
         };
 
         let new_root_manifest_path = format!(

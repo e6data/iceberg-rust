@@ -31,7 +31,8 @@ use crate::spec::{
     StructType, Summary, TableProperties, update_snapshot_summaries,
 };
 use crate::spec::root_manifest::{
-    RootManifestEntry, RootManifestMetadata, read_root_manifest, write_root_manifest,
+    RootManifestEntry, RootManifestMetadata, read_root_manifest, reconstruct_root,
+    write_root_manifest,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -1048,20 +1049,26 @@ impl<'a> SnapshotProducer<'a> {
         // pointer MUST be carried forward: the hot commit only rewrites the live
         // tier, so dropping it here would orphan the cold bucket-index (tiered
         // layout). Tuple: (entries, carried bucket_index_path).
-        let (mut entries, carried_bucket_index_path): (Vec<RootManifestEntry>, Option<String>) =
-            if let Some((_, cached)) = cached.filter(|_| cache_valid) {
+        let (mut entries, carried_bucket_index_path, current_chain_depth): (
+            Vec<RootManifestEntry>,
+            Option<String>,
+            u32,
+        ) = if let Some((_, cached)) = cached.filter(|_| cache_valid) {
                 // Cache path (laminar never populates the cache). The cache does
                 // not carry the pointer, so recover it from the current
                 // snapshot's root metadata rather than risk orphaning the cold
                 // tier.
-                let path = match self.table.metadata().current_snapshot() {
+                let (path, depth) = match self.table.metadata().current_snapshot() {
                     Some(s) => {
                         let b = self.table.file_io().new_input(s.manifest_list())?.read().await?;
-                        read_root_manifest(b).ok().and_then(|(m, _)| m.bucket_index_path)
+                        read_root_manifest(b)
+                            .ok()
+                            .map(|(m, _)| (m.bucket_index_path, m.chain_depth))
+                            .unwrap_or((None, 0))
                     }
-                    None => None,
+                    None => (None, 0),
                 };
-                (cached, path)
+                (cached, path, depth)
             } else if let Some(current_snapshot) =
                 self.table.metadata().current_snapshot()
             {
@@ -1076,7 +1083,7 @@ impl<'a> SnapshotProducer<'a> {
                 // Try reading as root manifest; fall back to manifest list for upgrade path
                 match read_root_manifest(bytes.clone()) {
                     Ok((prev_meta, existing_entries)) => {
-                        (existing_entries, prev_meta.bucket_index_path)
+                        (existing_entries, prev_meta.bucket_index_path, prev_meta.chain_depth)
                     }
                     Err(_) => {
                         // Upgrading from V3: convert manifest list entries to manifest refs
@@ -1092,12 +1099,49 @@ impl<'a> SnapshotProducer<'a> {
                                 mdv: None,
                             })
                             .collect();
-                        (entries, None)
+                        (entries, None, 0)
                     }
                 }
             } else {
-                (vec![], None)
+                (vec![], None, 0)
             };
+
+        // --- Incremental (log-structured) root ---------------------------------
+        // When enabled, a plain append commit writes a DELTA: a root carrying only
+        // THIS commit's new refs plus a `prev_root_path` pointer back to the prior
+        // root. The full live set is reconstructed by walking the chain on read, so
+        // the per-commit root write is O(this commit), not O(#live refs). The chain
+        // is collapsed back to a base when it gets too deep, when there are removals
+        // (which must rewrite carried refs), or by any lifecycle op. Gated → default
+        // off, so flat/tiered behavior is unchanged.
+        let incremental = self
+            .table
+            .metadata()
+            .properties()
+            .get("root-manifest.incremental")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        const MAX_CHAIN: u32 = 64;
+        let current_root_path: Option<String> = self
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.manifest_list().to_string());
+        let do_delta = incremental
+            && current_root_path.is_some()
+            && self.removed_data_files.is_empty()
+            && current_chain_depth < MAX_CHAIN;
+        if do_delta {
+            // Delta carries only this commit's new refs; discard the carried head.
+            entries.clear();
+        } else if incremental && current_chain_depth > 0 {
+            // Collapse to a base: the head read above gave only the head delta's
+            // entries, so reconstruct the full live set from the chain.
+            if let Some(p) = &current_root_path {
+                let (_, full) = reconstruct_root(self.table.file_io(), p).await?;
+                entries = full;
+            }
+        }
 
         // Handle file removals (compaction / overwrite operations)
         let removed_data_files = std::mem::take(&mut self.removed_data_files);
@@ -1336,7 +1380,9 @@ impl<'a> SnapshotProducer<'a> {
         // Merge small manifest refs to keep ref count bounded.
         // Only merge refs without MDVs — MDV bitmaps reference row indices
         // in the original manifest, so merging would invalidate them.
-        {
+        // Skipped on a delta write: a delta holds only this commit's new ref(s);
+        // merging carried refs is a base/collapse concern.
+        if !do_delta {
             let mergeable_refs: Vec<ManifestFile> = entries
                 .iter()
                 .filter_map(|e| match e {
@@ -1376,6 +1422,10 @@ impl<'a> SnapshotProducer<'a> {
             // this, the first commit after a bucket-close would orphan the cold
             // tier.
             bucket_index_path: carried_bucket_index_path,
+            // Delta → point back at the prior root and bump chain depth; base →
+            // None / 0. The reader walks `prev_root_path` to reconstruct.
+            prev_root_path: if do_delta { current_root_path.clone() } else { None },
+            chain_depth: if do_delta { current_chain_depth + 1 } else { 0 },
         };
 
         // Write root manifest as single Parquet file

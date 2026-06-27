@@ -205,6 +205,8 @@ mod tests {
             sequence_number: 5,
             parent_snapshot_id: Some(99),
             bucket_index_path: None,
+            prev_root_path: None,
+            chain_depth: 0,
         }
     }
 

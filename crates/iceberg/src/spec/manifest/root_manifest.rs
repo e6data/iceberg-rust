@@ -173,6 +173,16 @@ pub struct RootManifestMetadata {
     /// `bucket-index-path` file-level key; absent key decodes to `None`, so the
     /// change is backward-compatible with pre-tiering root manifests.
     pub bucket_index_path: Option<String>,
+    /// Incremental (log-structured) root: pointer to the PREVIOUS root in the
+    /// delta chain. `None` ⇒ this root is a **base** (a full entry list);
+    /// `Some` ⇒ this root is a **delta** whose `entries` are only the refs ADDED
+    /// by its commit, and the full live set is reconstructed by walking
+    /// `prev_root_path` back to the base. Encoded as `prev-root-path`; absent
+    /// decodes to `None` (a flat/base root) — backward compatible.
+    pub prev_root_path: Option<String>,
+    /// Number of deltas since the last base (0 for a base). Lets the writer cap
+    /// chain length without walking it. Encoded as `chain-depth`.
+    pub chain_depth: u32,
 }
 
 /// The root manifest: replaces ManifestList in v4.
@@ -312,6 +322,12 @@ fn encode_root_manifest_metadata(metadata: &RootManifestMetadata) -> HashMap<Str
     if let Some(path) = &metadata.bucket_index_path {
         kv.insert("bucket-index-path".to_string(), path.clone());
     }
+    if let Some(path) = &metadata.prev_root_path {
+        kv.insert("prev-root-path".to_string(), path.clone());
+    }
+    if metadata.chain_depth > 0 {
+        kv.insert("chain-depth".to_string(), metadata.chain_depth.to_string());
+    }
     kv.insert("root-manifest".to_string(), "true".to_string());
     kv.insert(
         "root-manifest-layout".to_string(),
@@ -431,6 +447,12 @@ fn decode_root_manifest_metadata(
     // Absent key => flat (non-tiered) layout. Backward-compatible with
     // root manifests written before the tiered-metadata change.
     let bucket_index_path: Option<String> = meta.get("bucket-index-path").cloned();
+    // Absent => base/flat root (not part of a delta chain).
+    let prev_root_path: Option<String> = meta.get("prev-root-path").cloned();
+    let chain_depth: u32 = meta
+        .get("chain-depth")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     Ok(RootManifestMetadata {
         schema,
@@ -441,6 +463,8 @@ fn decode_root_manifest_metadata(
         sequence_number,
         parent_snapshot_id,
         bucket_index_path,
+        prev_root_path,
+        chain_depth,
     })
 }
 
@@ -917,6 +941,45 @@ pub fn read_root_manifest(
     Ok((metadata, entries))
 }
 
+/// Reconstruct the full entry set of an incremental (chained) root by walking
+/// `prev_root_path` from `head_path` back to the base, unioning each delta's
+/// entries. Returns the entries plus the HEAD metadata (its `bucket_index_path`
+/// etc. are authoritative — carried on the most recent root).
+///
+/// The live tier is append-only: a delta's entries are only the refs ADDED by
+/// its commit, and refs leave the root only via lifecycle ops that write a fresh
+/// base. So the live set is simply the union down the chain — no removal
+/// bookkeeping. For a base/flat root (`prev_root_path == None`) this is one read.
+///
+/// `MAX_CHAIN_WALK` bounds the walk defensively against a corrupt/cyclic chain.
+pub async fn reconstruct_root(
+    file_io: &crate::io::FileIO,
+    head_path: &str,
+) -> Result<(RootManifestMetadata, Vec<RootManifestEntry>)> {
+    const MAX_CHAIN_WALK: usize = 100_000;
+    let mut entries: Vec<RootManifestEntry> = Vec::new();
+    let mut head_meta: Option<RootManifestMetadata> = None;
+    let mut path = head_path.to_string();
+    for _ in 0..MAX_CHAIN_WALK {
+        let bytes = file_io.new_input(&path)?.read().await?;
+        let (meta, mut these) = read_root_manifest(bytes)?;
+        if head_meta.is_none() {
+            head_meta = Some(meta.clone());
+        }
+        entries.append(&mut these);
+        match &meta.prev_root_path {
+            Some(prev) => path = prev.clone(),
+            None => {
+                return Ok((head_meta.expect("read at least one root"), entries));
+            }
+        }
+    }
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        "reconstruct_root: chain exceeded MAX_CHAIN_WALK (corrupt/cyclic prev-root-path?)",
+    ))
+}
+
 /// Parse manifest ref entries from a RecordBatch (row group 0).
 fn record_batch_to_manifest_refs(
     batch: &RecordBatch,
@@ -1274,6 +1337,8 @@ mod tests {
             sequence_number: 5,
             parent_snapshot_id: Some(99),
             bucket_index_path: None,
+            prev_root_path: None,
+            chain_depth: 0,
         }
     }
 
@@ -1328,6 +1393,32 @@ mod tests {
                 content_size_in_bytes: None,
             },
         }
+    }
+
+    #[test]
+    fn chain_metadata_round_trips() {
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        // Base root: absent prev/chain decode to None / 0.
+        let base = test_metadata(&schema, &partition_spec);
+        let bytes = write_root_manifest(&[], &base, &partition_type).unwrap();
+        let (read, _) = read_root_manifest(Bytes::from(bytes)).unwrap();
+        assert_eq!(read.prev_root_path, None);
+        assert_eq!(read.chain_depth, 0);
+
+        // Delta root: prev pointer + chain depth survive the round trip.
+        let mut delta = test_metadata(&schema, &partition_spec);
+        delta.prev_root_path = Some("s3://bucket/metadata/root-prev.parquet".to_string());
+        delta.chain_depth = 7;
+        let bytes = write_root_manifest(&[], &delta, &partition_type).unwrap();
+        let (read, _) = read_root_manifest(Bytes::from(bytes)).unwrap();
+        assert_eq!(
+            read.prev_root_path.as_deref(),
+            Some("s3://bucket/metadata/root-prev.parquet")
+        );
+        assert_eq!(read.chain_depth, 7);
     }
 
     #[test]

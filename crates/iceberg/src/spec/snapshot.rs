@@ -223,8 +223,20 @@ impl Snapshot {
         // scan trying to parse the Parquet as Avro. See
         // `crate::spec::table_metadata::E6_ACTUAL_FORMAT_VERSION_KEY`.
         if table_metadata.effective_format_version() == FormatVersion::V4 {
-            let (rm_meta, entries) =
-                crate::spec::root_manifest::read_root_manifest(manifest_list_content.clone())?;
+            // Incremental (log-structured) root: if the head is a delta
+            // (`prev_root_path` set), walk the chain to reconstruct the full live
+            // set; otherwise it's a base/flat root and one read suffices. The head
+            // metadata (its `bucket_index_path`) is authoritative either way.
+            let (rm_meta, entries) = {
+                let (head_meta, head_entries) =
+                    crate::spec::root_manifest::read_root_manifest(manifest_list_content.clone())?;
+                if head_meta.prev_root_path.is_some() {
+                    crate::spec::root_manifest::reconstruct_root(file_io, &self.manifest_list)
+                        .await?
+                } else {
+                    (head_meta, head_entries)
+                }
+            };
 
             let mut manifest_files = Vec::new();
             let mut inlines = Vec::new();

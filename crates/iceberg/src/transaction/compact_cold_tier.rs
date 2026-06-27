@@ -53,7 +53,7 @@ use super::rebalance_root_manifest::write_entries_clustered;
 use crate::error::Result;
 use crate::spec::bucket_index::{read_bucket_index, write_bucket_index};
 use crate::spec::root_manifest::{
-    read_root_manifest, write_root_manifest, RootManifestEntry, RootManifestMetadata,
+    reconstruct_root, write_root_manifest, RootManifestEntry, RootManifestMetadata,
 };
 use crate::spec::{
     DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus, Operation, Snapshot,
@@ -151,8 +151,7 @@ impl TransactionAction for CompactColdTierAction {
 
         // Load the root and the cold bucket-index it points to.
         let root_path = current_snapshot.manifest_list();
-        let bytes = table.file_io().new_input(root_path)?.read().await?;
-        let (rm_metadata, root_entries) = read_root_manifest(bytes)?;
+        let (rm_metadata, root_entries) = reconstruct_root(table.file_io(), root_path).await?;
 
         let leaves: Vec<ManifestFile> = match &rm_metadata.bucket_index_path {
             Some(path) => {
@@ -251,6 +250,8 @@ impl TransactionAction for CompactColdTierAction {
                 sequence_number: next_seq_num,
                 parent_snapshot_id: table.metadata().current_snapshot_id(),
                 bucket_index_path: None,
+                prev_root_path: None,
+                chain_depth: 0,
             };
             let bi_bytes = write_bucket_index(&all_leaves, &bi_metadata, &partition_type)?;
             table
@@ -271,6 +272,8 @@ impl TransactionAction for CompactColdTierAction {
             sequence_number: next_seq_num,
             parent_snapshot_id: table.metadata().current_snapshot_id(),
             bucket_index_path: new_bucket_index_path.clone(),
+            prev_root_path: None,
+            chain_depth: 0,
         };
         let new_root_path = format!(
             "{}/{}/root-{}-{}.parquet",

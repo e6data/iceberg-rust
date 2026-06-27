@@ -54,11 +54,13 @@ mod action;
 
 pub use action::*;
 mod append;
+mod compact_cold_tier;
 mod graduate_buckets;
 mod replace_data_files;
 mod rebalance_root_manifest;
 mod rewrite_manifests;
 mod snapshot;
+pub use compact_cold_tier::CompactColdTierAction;
 pub use graduate_buckets::{closed_before, ClosedPredicate, GraduateBucketsAction};
 pub use rebalance_root_manifest::RebalanceRootManifestAction;
 pub use snapshot::generate_unique_snapshot_id;
@@ -201,6 +203,14 @@ impl Transaction {
     /// (every N hours, …) is expressed entirely through the predicate.
     pub fn graduate_buckets(&self, is_closed: ClosedPredicate) -> GraduateBucketsAction {
         GraduateBucketsAction::new(is_closed)
+    }
+
+    /// Creates an action that compacts the cold tier: within the bucket-index's
+    /// leaf manifests, replaces the given `removed` data files (already merged
+    /// into the `added` files by the caller, e.g. tessellate's streaming concat)
+    /// and re-clusters the affected leaves. Off the hot commit path.
+    pub fn compact_cold_tier(&self) -> CompactColdTierAction {
+        CompactColdTierAction::new()
     }
 
     /// Creates a schema-evolution action limited to additive changes

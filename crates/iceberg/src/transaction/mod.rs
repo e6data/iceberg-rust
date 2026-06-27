@@ -55,12 +55,14 @@ mod action;
 pub use action::*;
 mod append;
 mod compact_cold_tier;
+mod drop_cold_buckets;
 mod graduate_buckets;
 mod replace_data_files;
 mod rebalance_root_manifest;
 mod rewrite_manifests;
 mod snapshot;
 pub use compact_cold_tier::CompactColdTierAction;
+pub use drop_cold_buckets::{DropColdBucketsAction, KeepLeafPredicate};
 pub use graduate_buckets::{closed_before, ClosedPredicate, GraduateBucketsAction};
 pub use rebalance_root_manifest::RebalanceRootManifestAction;
 pub use snapshot::generate_unique_snapshot_id;
@@ -211,6 +213,15 @@ impl Transaction {
     /// and re-clusters the affected leaves. Off the hot commit path.
     pub fn compact_cold_tier(&self) -> CompactColdTierAction {
         CompactColdTierAction::new()
+    }
+
+    /// Creates a retention action that drops cold leaves failing the
+    /// `keep` predicate (`true` ⇒ retain) from the bucket-index and repoints the
+    /// root. Metadata-only, off the hot path; dropped leaves/data files are
+    /// reclaimed by orphan GC. The caller builds `keep` from each leaf's
+    /// partition/time summary and the retention cutoff.
+    pub fn drop_cold_buckets(&self, keep: KeepLeafPredicate) -> DropColdBucketsAction {
+        DropColdBucketsAction::new(keep)
     }
 
     /// Creates a schema-evolution action limited to additive changes

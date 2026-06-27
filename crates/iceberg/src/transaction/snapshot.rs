@@ -1692,4 +1692,160 @@ mod test_v4_commit {
         assert!(paths.contains("s3://bucket/data/a.parquet"));
         assert!(paths.contains("s3://bucket/data/b.parquet"));
     }
+
+    /// Read the head root manifest's metadata + entries for assertions.
+    async fn read_head_root(
+        table: &crate::table::Table,
+    ) -> (
+        crate::spec::root_manifest::RootManifestMetadata,
+        Vec<crate::spec::root_manifest::RootManifestEntry>,
+    ) {
+        let snap = table.metadata().current_snapshot().unwrap();
+        let bytes = table
+            .file_io()
+            .new_input(snap.manifest_list())
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        crate::spec::root_manifest::read_root_manifest(bytes).unwrap()
+    }
+
+    async fn visible_paths(table: &crate::table::Table) -> HashSet<String> {
+        let tasks: Vec<_> = table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        tasks.iter().map(|t| t.data_file_path.clone()).collect()
+    }
+
+    fn incremental_table_creation(name: &str) -> TableCreation {
+        TableCreation::builder()
+            .name(name.to_string())
+            .schema(test_schema())
+            .format_version(FormatVersion::V4)
+            .properties(HashMap::from([(
+                "root-manifest.incremental".to_string(),
+                "true".to_string(),
+            )]))
+            .build()
+    }
+
+    /// e2e: an incremental (log-structured) root must reconstruct to exactly the
+    /// flat-root result, and each append must write an O(1) delta — the head
+    /// carries ONLY its own commit's entry, with a `prev_root_path` chain back.
+    #[tokio::test]
+    async fn test_v4_incremental_chain_reconstruct() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_inc".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let mut table = catalog
+            .create_table(&ns, incremental_table_creation("v4inc"))
+            .await
+            .unwrap();
+
+        const N: usize = 5;
+        for i in 0..N {
+            let path = format!("s3://bucket/data/f{i}.parquet");
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&path)])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+
+        // Reconstruct correctness: the scan sees every file across the chain.
+        let paths = visible_paths(&table).await;
+        assert_eq!(paths.len(), N, "all {N} files visible across the delta chain");
+        for i in 0..N {
+            assert!(paths.contains(&format!("s3://bucket/data/f{i}.parquet")));
+        }
+
+        // The head is a DELTA: first commit was the base (depth 0); each later
+        // commit bumps depth and points back. After N commits, depth == N-1.
+        let (meta, head_entries) = read_head_root(&table).await;
+        assert!(meta.prev_root_path.is_some(), "head must be a delta");
+        assert_eq!(meta.chain_depth, (N - 1) as u32);
+        // The O(1) proof: a delta re-lists NOTHING — only this commit's one file.
+        assert_eq!(
+            head_entries.len(),
+            1,
+            "delta must carry only its own commit's entry, not the live set"
+        );
+
+        // Parity: the same appends on a FLAT (non-incremental) table yield the
+        // identical visible set — incremental never loses or duplicates a file.
+        let mut flat = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("v4flat".to_string())
+                    .schema(test_schema())
+                    .format_version(FormatVersion::V4)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        for i in 0..N {
+            let tx = Transaction::new(&flat);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://bucket/data/f{i}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            flat = tx.commit(&catalog).await.unwrap();
+        }
+        assert_eq!(visible_paths(&flat).await, paths, "incremental == flat result");
+        // The flat head is a base that re-lists the whole set.
+        let (flat_meta, _) = read_head_root(&flat).await;
+        assert!(flat_meta.prev_root_path.is_none());
+        assert_eq!(flat_meta.chain_depth, 0);
+    }
+
+    /// e2e: once the chain reaches the depth cap (MAX_CHAIN = 64), the next commit
+    /// collapses it back to a single base — depth resets to 0, `prev_root_path`
+    /// clears, the base re-lists the full live set, and every file stays visible.
+    #[tokio::test]
+    async fn test_v4_incremental_chain_collapses_at_cap() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_inc_collapse".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let mut table = catalog
+            .create_table(&ns, incremental_table_creation("v4collapse"))
+            .await
+            .unwrap();
+
+        // 66 commits > MAX_CHAIN(64): commit 66 finds depth 64 and collapses.
+        const N: usize = 66;
+        for i in 0..N {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://bucket/data/c{i}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+
+        // Every file still visible after the collapse — reconstruction is lossless.
+        let paths = visible_paths(&table).await;
+        assert_eq!(paths.len(), N, "all {N} files visible after collapse");
+
+        // Head collapsed to a base: depth 0, no prev pointer, full set re-listed.
+        let (meta, head_entries) = read_head_root(&table).await;
+        assert_eq!(meta.chain_depth, 0, "chain should have collapsed to a base");
+        assert!(meta.prev_root_path.is_none(), "collapsed base has no prev");
+        assert_eq!(head_entries.len(), N, "base re-lists the full live set");
+    }
 }

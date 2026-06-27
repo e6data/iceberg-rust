@@ -234,6 +234,7 @@ impl TransactionAction for GraduateBucketsAction {
             bucket_index_path: None,
             prev_root_path: None,
             chain_depth: 0,
+            node_level: 0,
         };
         let bi_bytes = write_bucket_index(&cold_leaves, &bi_metadata, &partition_type)?;
         table
@@ -253,6 +254,7 @@ impl TransactionAction for GraduateBucketsAction {
             bucket_index_path: Some(bucket_index_path.clone()),
             prev_root_path: None,
             chain_depth: 0,
+            node_level: 0,
         };
         let new_root_path = format!(
             "{}/{}/root-{}-{}.parquet",

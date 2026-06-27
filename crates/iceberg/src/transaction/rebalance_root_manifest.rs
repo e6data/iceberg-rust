@@ -496,6 +496,7 @@ impl TransactionAction for RebalanceRootManifestAction {
             bucket_index_path: rm_metadata.bucket_index_path.clone(),
             prev_root_path: None,
             chain_depth: 0,
+            node_level: 0,
         };
 
         let new_root_manifest_path = format!(

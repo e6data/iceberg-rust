@@ -31,8 +31,8 @@ use crate::spec::{
     StructType, Summary, TableProperties, update_snapshot_summaries,
 };
 use crate::spec::root_manifest::{
-    RootManifestEntry, RootManifestMetadata, read_root_manifest, reconstruct_root,
-    write_root_manifest,
+    RootManifestEntry, RootManifestMetadata, build_balanced_tree, read_root_manifest,
+    reconstruct_root, write_root_manifest,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -1426,23 +1426,43 @@ impl<'a> SnapshotProducer<'a> {
             // None / 0. The reader walks `prev_root_path` to reconstruct.
             prev_root_path: if do_delta { current_root_path.clone() } else { None },
             chain_depth: if do_delta { current_chain_depth + 1 } else { 0 },
+            node_level: 0,
         };
 
-        // Write root manifest as single Parquet file
-        let root_manifest_path = format!(
-            "{}/{}/root-{}-{}.parquet",
-            self.table.metadata().location(),
-            META_ROOT_PATH,
-            self.snapshot_id,
-            self.commit_uuid,
-        );
-
-        let bytes = write_root_manifest(&entries, &rm_metadata, &partition_type)?;
-        self.table
-            .file_io()
-            .new_output(&root_manifest_path)?
-            .write(bytes.into())
-            .await?;
+        // Write the root. On an incremental COLLAPSE of a large live set (not a
+        // delta), build a balanced fan-out tree (LSM merge step) instead of one
+        // flat base, so the collapsed bulk stays a shallow prunable tree rather
+        // than an ever-growing single node. Small collapses (≤ fan-out) and the
+        // O(1) delta path both still write a single flat node, so the hot path
+        // and small tables are unchanged.
+        const TREE_FANOUT: usize = 64;
+        let root_manifest_path = if incremental && !do_delta && entries.len() > TREE_FANOUT {
+            build_balanced_tree(
+                self.table.file_io(),
+                self.table.metadata().location(),
+                &rm_metadata,
+                &partition_type,
+                self.commit_uuid,
+                entries.clone(),
+                TREE_FANOUT,
+            )
+            .await?
+        } else {
+            let path = format!(
+                "{}/{}/root-{}-{}.parquet",
+                self.table.metadata().location(),
+                META_ROOT_PATH,
+                self.snapshot_id,
+                self.commit_uuid,
+            );
+            let bytes = write_root_manifest(&entries, &rm_metadata, &partition_type)?;
+            self.table
+                .file_io()
+                .new_output(&path)?
+                .write(bytes.into())
+                .await?;
+            path
+        };
 
         // Compute row lineage for V4 (same as V3 path)
         let first_row_id = self.table.metadata().next_row_id();
@@ -1838,14 +1858,23 @@ mod test_v4_commit {
             table = tx.commit(&catalog).await.unwrap();
         }
 
-        // Every file still visible after the collapse — reconstruction is lossless.
+        // Every file still visible after the collapse — reconstruction is lossless
+        // even though the base is now a balanced TREE (66 > TREE_FANOUT=64), so
+        // the scan path must traverse interior nodes to reach every leaf.
         let paths = visible_paths(&table).await;
-        assert_eq!(paths.len(), N, "all {N} files visible after collapse");
+        assert_eq!(paths.len(), N, "all {N} files visible after tree collapse");
 
-        // Head collapsed to a base: depth 0, no prev pointer, full set re-listed.
+        // Head collapsed to a balanced-tree base: depth 0, no prev pointer, and
+        // node_level > 0 with the head holding only child-node refs (NOT the full
+        // set) — the leaves live one level down.
         let (meta, head_entries) = read_head_root(&table).await;
-        assert_eq!(meta.chain_depth, 0, "chain should have collapsed to a base");
+        assert_eq!(meta.chain_depth, 0, "chain should have collapsed");
         assert!(meta.prev_root_path.is_none(), "collapsed base has no prev");
-        assert_eq!(head_entries.len(), N, "base re-lists the full live set");
+        assert!(meta.node_level > 0, "collapse of >fanout entries builds a tree");
+        assert!(
+            head_entries.len() < N,
+            "tree root holds child-node refs ({}), not the full {N} entries",
+            head_entries.len()
+        );
     }
 }

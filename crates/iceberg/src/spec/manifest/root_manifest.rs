@@ -183,6 +183,14 @@ pub struct RootManifestMetadata {
     /// Number of deltas since the last base (0 for a base). Lets the writer cap
     /// chain length without walking it. Encoded as `chain-depth`.
     pub chain_depth: u32,
+    /// Balanced-tree level of this node. `0` = a leaf/flat node whose
+    /// `ManifestRef` entries point at real leaf manifests (or are inline data).
+    /// `>0` = an INTERIOR node whose `ManifestRef` entries point at child *nodes*
+    /// (other root-manifest files) one level down — the reader recurses on them.
+    /// The collapse builds a balanced fan-out tree (root level L → … → leaves at
+    /// 0) when the live set exceeds the fan-out; small sets stay a single level-0
+    /// node (a flat base). Encoded as `node-level`; absent ⇒ 0 (backward compat).
+    pub node_level: u32,
 }
 
 /// The root manifest: replaces ManifestList in v4.
@@ -328,6 +336,9 @@ fn encode_root_manifest_metadata(metadata: &RootManifestMetadata) -> HashMap<Str
     if metadata.chain_depth > 0 {
         kv.insert("chain-depth".to_string(), metadata.chain_depth.to_string());
     }
+    if metadata.node_level > 0 {
+        kv.insert("node-level".to_string(), metadata.node_level.to_string());
+    }
     kv.insert("root-manifest".to_string(), "true".to_string());
     kv.insert(
         "root-manifest-layout".to_string(),
@@ -453,6 +464,10 @@ fn decode_root_manifest_metadata(
         .get("chain-depth")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let node_level: u32 = meta
+        .get("node-level")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     Ok(RootManifestMetadata {
         schema,
@@ -465,6 +480,7 @@ fn decode_root_manifest_metadata(
         bucket_index_path,
         prev_root_path,
         chain_depth,
+        node_level,
     })
 }
 
@@ -966,6 +982,13 @@ pub async fn reconstruct_root(
         if head_meta.is_none() {
             head_meta = Some(meta.clone());
         }
+        if meta.node_level > 0 {
+            // Reached a balanced-tree base (the bottom of the L0 chain): its
+            // entries are child-node refs, not data. Traverse the subtree to
+            // gather the real leaf entries, then stop (a tree base has no prev).
+            collect_subtree_entries(file_io, these, &mut entries).await?;
+            return Ok((head_meta.expect("read at least one root"), entries));
+        }
         entries.append(&mut these);
         match &meta.prev_root_path {
             Some(prev) => path = prev.clone(),
@@ -978,6 +1001,155 @@ pub async fn reconstruct_root(
         ErrorKind::DataInvalid,
         "reconstruct_root: chain exceeded MAX_CHAIN_WALK (corrupt/cyclic prev-root-path?)",
     ))
+}
+
+/// Recursively gather the leaf-level entries under a set of interior-node refs.
+/// Each ref's `manifest_path` is a child node; a child at `node_level == 0` is a
+/// leaf (its entries are real manifest refs / inline data → collected), a child
+/// at `node_level > 0` is interior (recurse).
+fn collect_subtree_entries<'a>(
+    file_io: &'a crate::io::FileIO,
+    interior_entries: Vec<RootManifestEntry>,
+    out: &'a mut Vec<RootManifestEntry>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        for entry in interior_entries {
+            let RootManifestEntry::ManifestRef { manifest_file, .. } = entry else {
+                // Interior nodes hold only node refs; ignore stray inline defensively.
+                continue;
+            };
+            let bytes = file_io.new_input(&manifest_file.manifest_path)?.read().await?;
+            let (child_meta, child_entries) = read_root_manifest(bytes)?;
+            if child_meta.node_level == 0 {
+                out.extend(child_entries);
+            } else {
+                collect_subtree_entries(file_io, child_entries, out).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Build a balanced fan-out tree over `entries` and return the path of its root
+/// node (already written, along with every interior/leaf node). The root carries
+/// the template's `bucket_index_path`, `node_level = tree height`, and
+/// `prev_root_path = None` (it is a collapse base, the bottom of the L0 chain).
+///
+/// When `entries.len() <= fanout` this writes a single level-0 node (a flat base
+/// — identical to the pre-tree collapse), so small live sets pay nothing. Above
+/// the fan-out it chunks bottom-up: level-0 leaf nodes, then interior levels of
+/// node refs, until one root remains.
+///
+/// Interior node refs carry `partitions: None` (conservative) for now — the
+/// bounds aggregation that lets the reader PRUNE subtrees is the paired read-side
+/// increment; today `reconstruct_root` still visits every leaf.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_balanced_tree(
+    file_io: &crate::io::FileIO,
+    location: &str,
+    template: &RootManifestMetadata,
+    partition_type: &crate::spec::StructType,
+    commit_uuid: uuid::Uuid,
+    entries: Vec<RootManifestEntry>,
+    fanout: usize,
+) -> Result<String> {
+    let fanout = fanout.max(2);
+    let root_path = format!(
+        "{}/metadata/root-{}-{}.parquet",
+        location, template.snapshot_id, commit_uuid
+    );
+
+    // Small set → a single flat level-0 base (no tree). Carries the pointer.
+    if entries.len() <= fanout {
+        let meta = RootManifestMetadata {
+            node_level: 0,
+            prev_root_path: None,
+            chain_depth: 0,
+            ..template.clone()
+        };
+        let bytes = write_root_manifest(&entries, &meta, partition_type)?;
+        file_io.new_output(&root_path)?.write(bytes.into()).await?;
+        return Ok(root_path);
+    }
+
+    let mut counter: u64 = 0;
+    let node_ref = |path: &str| RootManifestEntry::ManifestRef {
+        manifest_file: ManifestFile {
+            manifest_path: path.to_string(),
+            manifest_length: 0,
+            partition_spec_id: template.partition_spec.spec_id(),
+            content: ManifestContentType::Data,
+            sequence_number: template.sequence_number,
+            min_sequence_number: template.sequence_number,
+            added_snapshot_id: template.snapshot_id,
+            added_files_count: None,
+            existing_files_count: None,
+            deleted_files_count: None,
+            added_rows_count: None,
+            existing_rows_count: None,
+            deleted_rows_count: None,
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        },
+        mdv: None,
+    };
+
+    // Level 0: pack the real entries into leaf nodes.
+    let mut child_refs: Vec<RootManifestEntry> = Vec::new();
+    for chunk in entries.chunks(fanout) {
+        let path = format!(
+            "{}/metadata/tree-{}-{}-n{}.parquet",
+            location, template.snapshot_id, commit_uuid, counter
+        );
+        counter += 1;
+        let meta = RootManifestMetadata {
+            node_level: 0,
+            prev_root_path: None,
+            chain_depth: 0,
+            bucket_index_path: None,
+            ..template.clone()
+        };
+        let bytes = write_root_manifest(chunk, &meta, partition_type)?;
+        file_io.new_output(&path)?.write(bytes.into()).await?;
+        child_refs.push(node_ref(&path));
+    }
+
+    // Interior levels until a single node remains.
+    let mut level: u32 = 1;
+    while child_refs.len() > fanout {
+        let mut parents: Vec<RootManifestEntry> = Vec::new();
+        for chunk in child_refs.chunks(fanout) {
+            let path = format!(
+                "{}/metadata/tree-{}-{}-n{}.parquet",
+                location, template.snapshot_id, commit_uuid, counter
+            );
+            counter += 1;
+            let meta = RootManifestMetadata {
+                node_level: level,
+                prev_root_path: None,
+                chain_depth: 0,
+                bucket_index_path: None,
+                ..template.clone()
+            };
+            let bytes = write_root_manifest(chunk, &meta, partition_type)?;
+            file_io.new_output(&path)?.write(bytes.into()).await?;
+            parents.push(node_ref(&path));
+        }
+        child_refs = parents;
+        level += 1;
+    }
+
+    // Root node: the remaining ≤fanout child refs; carries the pointer + height.
+    let root_meta = RootManifestMetadata {
+        node_level: level,
+        prev_root_path: None,
+        chain_depth: 0,
+        ..template.clone()
+    };
+    let bytes = write_root_manifest(&child_refs, &root_meta, partition_type)?;
+    file_io.new_output(&root_path)?.write(bytes.into()).await?;
+    Ok(root_path)
 }
 
 /// Parse manifest ref entries from a RecordBatch (row group 0).
@@ -1339,6 +1511,7 @@ mod tests {
             bucket_index_path: None,
             prev_root_path: None,
             chain_depth: 0,
+            node_level: 0,
         }
     }
 
@@ -1419,6 +1592,72 @@ mod tests {
             Some("s3://bucket/metadata/root-prev.parquet")
         );
         assert_eq!(read.chain_depth, 7);
+    }
+
+    #[tokio::test]
+    async fn balanced_tree_round_trips_multilevel() {
+        use std::collections::HashSet;
+
+        use crate::io::FileIOBuilder;
+
+        let schema = test_schema();
+        let spec = test_partition_spec(&schema);
+        let partition_type = spec.partition_type(&schema).unwrap();
+        let template = test_metadata(&schema, &spec);
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let location = "memory:///tbl";
+
+        // 50 entries at fan-out 4 → 13 leaf nodes → 4 interior → 1 root = 3 levels,
+        // so the collector must recurse two interior levels to reach the leaves.
+        let n = 50usize;
+        let entries: Vec<RootManifestEntry> = (0..n)
+            .map(|i| {
+                RootManifestEntry::Inline(test_inline_entry(
+                    &format!("memory:///tbl/data/f{i}.parquet"),
+                    1,
+                ))
+            })
+            .collect();
+        let want: HashSet<String> = (0..n)
+            .map(|i| format!("memory:///tbl/data/f{i}.parquet"))
+            .collect();
+
+        let root_path = build_balanced_tree(
+            &file_io,
+            location,
+            &template,
+            &partition_type,
+            uuid::Uuid::nil(),
+            entries,
+            4,
+        )
+        .await
+        .unwrap();
+
+        // The root is a multi-level interior node.
+        let bytes = file_io.new_input(&root_path).unwrap().read().await.unwrap();
+        let (root_meta, _) = read_root_manifest(bytes).unwrap();
+        assert!(
+            root_meta.node_level >= 2,
+            "fan-out 4 over 50 entries → ≥3 levels, got node_level {}",
+            root_meta.node_level
+        );
+
+        // reconstruct_root traverses the whole tree and returns exactly the leaves.
+        let (_, got) = reconstruct_root(&file_io, &root_path).await.unwrap();
+        let got_paths: HashSet<String> = got
+            .iter()
+            .map(|e| match e {
+                RootManifestEntry::Inline(me) => me.data_file.file_path.clone(),
+                RootManifestEntry::ManifestRef { manifest_file, .. } => {
+                    manifest_file.manifest_path.clone()
+                }
+            })
+            .collect();
+        assert_eq!(
+            got_paths, want,
+            "tree reconstruct must return every leaf exactly once"
+        );
     }
 
     #[test]

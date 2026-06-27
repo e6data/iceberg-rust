@@ -207,6 +207,7 @@ mod tests {
             bucket_index_path: None,
             prev_root_path: None,
             chain_depth: 0,
+            node_level: 0,
         }
     }
 

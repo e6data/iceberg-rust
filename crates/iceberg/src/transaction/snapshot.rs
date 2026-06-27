@@ -1234,12 +1234,14 @@ impl<'a> SnapshotProducer<'a> {
             .filter(|e| matches!(e, RootManifestEntry::Inline(_)))
             .count();
 
-        // Tiered layout: keep the live tier inline-only. The bucket-close
-        // (`graduate_buckets`) operation is the sole producer of child/leaf
-        // manifests — it materializes closed inline blocks into cold leaves. So
-        // when tiering is enabled we skip the hot inline→child flush entirely;
-        // the live inline set is bounded by the bucket window (tune the close
-        // cadence under heavy traffic), not by this threshold.
+        // Tiered layout: APPEND-ONLY live nodes (V4 "one-file commit" principle).
+        // Each commit flushes its just-added inline files into a fresh child
+        // manifest ("node") and keeps only the node *reference* in the root, so
+        // the per-commit root rewrite is O(#live nodes), never O(#live files) —
+        // metadata growth proportional to the operation, not the table. Closed
+        // live nodes are relocated to the cold bucket-index by `graduate_buckets`;
+        // small live nodes are merged by compaction. (Non-tiered tables keep the
+        // legacy threshold-based flush.)
         let tiered = self
             .table
             .metadata()
@@ -1248,7 +1250,7 @@ impl<'a> SnapshotProducer<'a> {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        if !tiered && inline_count > inline_threshold {
+        if (tiered && inline_count > 0) || (!tiered && inline_count > inline_threshold) {
             // Split inline entries by content type (data vs delete)
             let mut data_entries: Vec<ManifestEntry> = Vec::new();
             let mut delete_entries: Vec<ManifestEntry> = Vec::new();

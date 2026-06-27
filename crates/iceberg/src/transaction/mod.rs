@@ -63,7 +63,7 @@ mod rewrite_manifests;
 mod snapshot;
 pub use compact_cold_tier::CompactColdTierAction;
 pub use drop_cold_buckets::DropColdBucketsAction;
-pub use graduate_buckets::{closed_before, ClosedPredicate, GraduateBucketsAction};
+pub use graduate_buckets::GraduateBucketsAction;
 pub use rebalance_root_manifest::RebalanceRootManifestAction;
 pub use snapshot::generate_unique_snapshot_id;
 mod sort_order;
@@ -199,12 +199,17 @@ impl Transaction {
         RebalanceRootManifestAction::new()
     }
 
-    /// Creates an action that graduates closed live blocks (inline entries whose
-    /// partition `is_closed`) out of the hot root manifest into immutable cold
-    /// leaf manifests referenced by the bucket-index. The caller's close policy
-    /// (every N hours, …) is expressed entirely through the predicate.
-    pub fn graduate_buckets(&self, is_closed: ClosedPredicate) -> GraduateBucketsAction {
-        GraduateBucketsAction::new(is_closed)
+    /// Creates an action that graduates closed live nodes (and any closed inline
+    /// files) out of the hot root manifest into the cold bucket-index. A node
+    /// graduates when its newest event time (max of `ts_field_id`) is below
+    /// `cutoff_micros`. Partition-spec-agnostic; the caller computes
+    /// `cutoff_micros = now − bucket_window`.
+    pub fn graduate_buckets(
+        &self,
+        ts_field_id: i32,
+        cutoff_micros: i64,
+    ) -> GraduateBucketsAction {
+        GraduateBucketsAction::new(ts_field_id, cutoff_micros)
     }
 
     /// Creates an action that compacts the cold tier: within the bucket-index's

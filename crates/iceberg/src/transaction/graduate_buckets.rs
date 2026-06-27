@@ -15,26 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Graduate closed live blocks into the cold bucket-index (tiered V4 metadata).
+//! Graduate closed live nodes into the cold bucket-index (tiered V4 metadata).
 //!
-//! The hot commit path keeps the current bucket's data as inline entries in the
-//! root manifest. When a bucket *closes* (a policy the caller owns — every N
-//! hours, every M commits, …), this action moves the closed data out of the
-//! hot root and into immutable, partition-tight **leaf manifests** referenced by
-//! the cold **bucket-index**:
+//! With append-only live nodes (the V4 "one-file commit" model), each commit
+//! writes its new files into a fresh child manifest ("node") and keeps only the
+//! node *reference* in the root. This action relocates the **closed** live nodes
+//! — those whose newest event time has fallen behind the cutoff — out of the hot
+//! root and into the cold bucket-index. The move is reference-only: a closed
+//! node is immutable, so graduating it just moves its `ManifestFile` ref from
+//! the root into the bucket-index (no data read, no re-write).
 //!
-//! ```text
-//!   before:  root = [ inline(closed) … , inline(open) … ]   (+ maybe a bucket-index)
-//!   after:   root = [ inline(open) … ]  ──bucket_index_ptr──► bucket-index
-//!                                                               + new closed leaves
-//! ```
+//! For robustness it also handles any residual **inline** entries (the older
+//! "live = inline" shape): closed inline files are materialized into new
+//! partition-tight cold leaves.
 //!
-//! This is what keeps per-commit cost bounded by the *live* window: the bucket-
-//! index (O(total closed leaves)) is rewritten only here, at bucket-close
-//! cadence — never on the hot commit path.
-//!
-//! The action is cadence- and partition-agnostic: the caller supplies an
-//! `is_closed(&Struct) -> bool` predicate over partition values.
+//! The close decision keys on **time** — the max value of `ts_field_id` across a
+//! node's data files — so it is fully partition-spec-agnostic. The caller
+//! computes `cutoff_micros = now − bucket_window`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,9 +46,8 @@ use crate::spec::root_manifest::{
     read_root_manifest, write_root_manifest, RootManifestEntry, RootManifestMetadata,
 };
 use crate::spec::{
-    DataContentType, DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus,
-    Operation, PrimitiveLiteral, Snapshot, SnapshotReference, SnapshotRetention, Summary,
-    MAIN_BRANCH,
+    DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus, Operation,
+    PrimitiveLiteral, Snapshot, SnapshotReference, SnapshotRetention, Summary, MAIN_BRANCH,
 };
 use crate::table::Table;
 use crate::transaction::action::TransactionAction;
@@ -61,69 +57,48 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
 
-/// Predicate deciding whether a data file belongs to a *closed* bucket — i.e.
-/// it should graduate to cold storage. Evaluated per file so the close policy
-/// can key on the file's own statistics (typically its timestamp max), which
-/// makes it independent of the partition spec. See [`closed_before`].
-pub type ClosedPredicate = Arc<dyn Fn(&DataFile) -> bool + Send + Sync>;
-
-/// Build a time-cutoff close predicate: a file is closed when its **max value**
-/// for `timestamp_field_id` is strictly below `cutoff_micros`. Files lacking
-/// that statistic stay live (conservative — never graduate data we can't
-/// time-bound). This is the partition-agnostic close policy the scheduler uses;
-/// the caller computes `cutoff_micros = now − bucket_window` and resolves the
-/// timestamp field id from the schema.
-pub fn closed_before(timestamp_field_id: i32, cutoff_micros: i64) -> ClosedPredicate {
-    Arc::new(move |df: &DataFile| {
-        df.upper_bounds()
-            .get(&timestamp_field_id)
-            .map(|d| matches!(d.literal(), PrimitiveLiteral::Long(v) if *v < cutoff_micros))
-            .unwrap_or(false)
-    })
-}
-
-/// Action that graduates closed live blocks into the cold bucket-index.
-///
-/// Use via `Transaction::graduate_buckets(is_closed)`.
+/// Action that relocates closed live nodes (and any closed inline files) into
+/// the cold bucket-index. Use via `Transaction::graduate_buckets(ts_field_id,
+/// cutoff_micros)`.
 pub struct GraduateBucketsAction {
-    is_closed: ClosedPredicate,
+    ts_field_id: i32,
+    cutoff_micros: i64,
     commit_uuid: Uuid,
 }
 
 impl GraduateBucketsAction {
-    /// Create with the close predicate. `is_closed(partition)` returns true for
-    /// partition values whose bucket has closed and should move to cold storage.
-    pub fn new(is_closed: ClosedPredicate) -> Self {
+    /// Create with the event-time field id and the close cutoff (micros). A node
+    /// (or inline file) graduates when its max value for `ts_field_id` is below
+    /// `cutoff_micros`.
+    pub fn new(ts_field_id: i32, cutoff_micros: i64) -> Self {
         Self {
-            is_closed,
+            ts_field_id,
+            cutoff_micros,
             commit_uuid: Uuid::now_v7(),
         }
     }
 }
 
-/// Split root entries into (data files to graduate to cold leaves, entries that
-/// stay live in the root). Only **inline data** entries with a closed partition
-/// graduate; manifest refs, delete entries, and open inline entries stay.
-///
-/// Pure — no I/O — so the close decision is unit testable.
-fn split_for_graduation(
-    entries: &[RootManifestEntry],
-    is_closed: &(dyn Fn(&DataFile) -> bool + Send + Sync),
-) -> (Vec<DataFile>, Vec<RootManifestEntry>) {
-    let mut graduate = Vec::new();
-    let mut stay = Vec::new();
-    for entry in entries {
-        match entry {
-            RootManifestEntry::Inline(me)
-                if me.data_file.content == DataContentType::Data
-                    && is_closed(&me.data_file) =>
-            {
-                graduate.push(me.data_file.clone());
-            }
-            other => stay.push(other.clone()),
-        }
+/// Max value of the `ts_field_id` upper-bound statistic across `files` (newest
+/// event time). `None` if no file carries the stat. Pure.
+fn max_ts_of(files: &[DataFile], ts_field_id: i32) -> Option<i64> {
+    files
+        .iter()
+        .filter_map(
+            |f| match f.upper_bounds().get(&ts_field_id).map(|d| d.literal()) {
+                Some(PrimitiveLiteral::Long(v)) => Some(*v),
+                _ => None,
+            },
+        )
+        .max()
+}
+
+/// Max event time of a single data file for `ts_field_id`, if present. Pure.
+fn file_max_ts(df: &DataFile, ts_field_id: i32) -> Option<i64> {
+    match df.upper_bounds().get(&ts_field_id).map(|d| d.literal()) {
+        Some(PrimitiveLiteral::Long(v)) => Some(*v),
+        _ => None,
     }
-    (graduate, stay)
 }
 
 #[async_trait]
@@ -144,19 +119,63 @@ impl TransactionAction for GraduateBucketsAction {
             None => return Ok(ActionCommit::new(vec![], vec![])),
         };
 
-        // Load current root.
         let root_path = current_snapshot.manifest_list();
         let bytes = table.file_io().new_input(root_path)?.read().await?;
         let (rm_metadata, entries) = read_root_manifest(bytes)?;
 
-        // Decide what graduates (pure).
-        let (graduate_files, stay_entries) =
-            split_for_graduation(&entries, self.is_closed.as_ref());
-        if graduate_files.is_empty() {
-            // Nothing closed this round.
+        // Existing cold leaves (graduated nodes get appended to these).
+        let mut cold_leaves: Vec<ManifestFile> = match &rm_metadata.bucket_index_path {
+            Some(path) => {
+                let b = table.file_io().new_input(path)?.read().await?;
+                read_bucket_index(b)?.leaves().to_vec()
+            }
+            None => Vec::new(),
+        };
+
+        // Partition root entries into: closed live nodes (→ cold by reference),
+        // closed inline files (→ materialize as cold leaves), and kept (live).
+        let mut kept: Vec<RootManifestEntry> = Vec::new();
+        let mut graduated_nodes: Vec<ManifestFile> = Vec::new();
+        let mut closed_inline_files: Vec<DataFile> = Vec::new();
+
+        for entry in entries {
+            match entry {
+                RootManifestEntry::ManifestRef { manifest_file, mdv } => {
+                    let manifest = manifest_file.load_manifest(table.file_io()).await?;
+                    let files: Vec<DataFile> = manifest
+                        .entries()
+                        .iter()
+                        .filter(|e| e.is_alive())
+                        .map(|e| e.data_file().clone())
+                        .collect();
+                    let closed = max_ts_of(&files, self.ts_field_id)
+                        .map(|mx| mx < self.cutoff_micros)
+                        .unwrap_or(false);
+                    // Only graduate clean nodes; an MDV-carrying node has pending
+                    // deletes and is left for the rebalance/compaction path.
+                    if closed && mdv.is_none() {
+                        graduated_nodes.push(manifest_file);
+                    } else {
+                        kept.push(RootManifestEntry::ManifestRef { manifest_file, mdv });
+                    }
+                }
+                RootManifestEntry::Inline(me) => {
+                    let closed = file_max_ts(&me.data_file, self.ts_field_id)
+                        .map(|mx| mx < self.cutoff_micros)
+                        .unwrap_or(false);
+                    if closed {
+                        closed_inline_files.push(me.data_file.clone());
+                    } else {
+                        kept.push(RootManifestEntry::Inline(me));
+                    }
+                }
+            }
+        }
+
+        if graduated_nodes.is_empty() && closed_inline_files.is_empty() {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
-        let graduated_file_count = graduate_files.len();
+        let graduated_node_count = graduated_nodes.len();
 
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
         let next_seq_num = table.metadata().next_sequence_number();
@@ -167,40 +186,36 @@ impl TransactionAction for GraduateBucketsAction {
         let partition_type = spec.partition_type(table.metadata().current_schema())?;
         let mut manifest_counter: u64 = 0;
 
-        // 1. Write graduating data files as cold, partition-tight leaf manifests.
-        let grad_entries: Vec<ManifestEntry> = graduate_files
-            .into_iter()
-            .map(|df| {
-                ManifestEntry::builder()
-                    .status(ManifestStatus::Existing)
-                    .data_file(df)
-                    .build()
-            })
-            .collect();
-        let new_leaves = write_entries_clustered(
-            table,
-            &schema,
-            spec.as_ref(),
-            format_version,
-            snapshot_id,
-            commit_uuid,
-            &mut manifest_counter,
-            false, // data, not deletes
-            grad_entries,
-            true, // partition_scoped: cold leaves are one-per-partition (tight summaries)
-        )
-        .await?;
-        let new_leaf_count = new_leaves.len();
-
-        // 2. Append the new leaves to the bucket-index (read existing if present).
-        let mut leaves: Vec<ManifestFile> = match &rm_metadata.bucket_index_path {
-            Some(path) => {
-                let b = table.file_io().new_input(path)?.read().await?;
-                read_bucket_index(b)?.leaves().to_vec()
-            }
-            None => Vec::new(),
-        };
-        leaves.extend(new_leaves);
+        // Materialize any closed inline files into new partition-tight cold leaves.
+        let mut inline_leaf_count = 0usize;
+        if !closed_inline_files.is_empty() {
+            let grad_entries: Vec<ManifestEntry> = closed_inline_files
+                .into_iter()
+                .map(|df| {
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Existing)
+                        .data_file(df)
+                        .build()
+                })
+                .collect();
+            let new_leaves = write_entries_clustered(
+                table,
+                &schema,
+                spec.as_ref(),
+                format_version,
+                snapshot_id,
+                commit_uuid,
+                &mut manifest_counter,
+                false,
+                grad_entries,
+                true,
+            )
+            .await?;
+            inline_leaf_count = new_leaves.len();
+            cold_leaves.extend(new_leaves);
+        }
+        // Move graduated live nodes into cold by reference (immutable, no rewrite).
+        cold_leaves.extend(graduated_nodes);
 
         let bucket_index_path = format!(
             "{}/{}/bucket-index-{}-{}.parquet",
@@ -217,17 +232,15 @@ impl TransactionAction for GraduateBucketsAction {
             snapshot_id,
             sequence_number: next_seq_num,
             parent_snapshot_id: table.metadata().current_snapshot_id(),
-            // The bucket-index is itself a single tier today (no nested pointer).
             bucket_index_path: None,
         };
-        let bi_bytes = write_bucket_index(&leaves, &bi_metadata, &partition_type)?;
+        let bi_bytes = write_bucket_index(&cold_leaves, &bi_metadata, &partition_type)?;
         table
             .file_io()
             .new_output(&bucket_index_path)?
             .write(bi_bytes.into())
             .await?;
 
-        // 3. New root = the entries that stayed live + the new bucket-index pointer.
         let new_rm_metadata = RootManifestMetadata {
             schema: schema.clone(),
             schema_id: table.metadata().current_schema_id(),
@@ -245,25 +258,27 @@ impl TransactionAction for GraduateBucketsAction {
             snapshot_id,
             commit_uuid,
         );
-        let root_bytes = write_root_manifest(&stay_entries, &new_rm_metadata, &partition_type)?;
+        let root_bytes = write_root_manifest(&kept, &new_rm_metadata, &partition_type)?;
         table
             .file_io()
             .new_output(&new_root_path)?
             .write(root_bytes.into())
             .await?;
 
-        // 4. Build snapshot + ActionCommit.
         let summary = Summary {
             operation: Operation::Replace,
             additional_properties: HashMap::from([
                 (
-                    "graduate-files".to_string(),
-                    graduated_file_count.to_string(),
+                    "graduate-nodes-moved".to_string(),
+                    graduated_node_count.to_string(),
                 ),
-                ("graduate-leaves-added".to_string(), new_leaf_count.to_string()),
                 (
-                    "graduate-leaves-total".to_string(),
-                    leaves.len().to_string(),
+                    "graduate-inline-leaves".to_string(),
+                    inline_leaf_count.to_string(),
+                ),
+                (
+                    "graduate-cold-leaves-total".to_string(),
+                    cold_leaves.len().to_string(),
                 ),
             ]),
         };
@@ -313,17 +328,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Datum, ManifestContentType,
-        ManifestFile, Struct,
-    };
+    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Datum, Struct};
 
-    /// Build an inline data entry. `ts_max` optionally sets an upper-bound
-    /// statistic (field_id, micros) so `closed_before` can be exercised.
-    fn inline_with(path: &str, ts_max: Option<(i32, i64)>) -> RootManifestEntry {
-        let mut builder = DataFileBuilder::default();
-        builder
-            .content(DataContentType::Data)
+    fn df(path: &str, ts_max: Option<(i32, i64)>) -> DataFile {
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
             .file_path(path.to_string())
             .file_format(DataFileFormat::Parquet)
             .file_size_in_bytes(100)
@@ -331,82 +340,30 @@ mod tests {
             .partition_spec_id(0)
             .partition(Struct::empty());
         if let Some((fid, micros)) = ts_max {
-            builder.upper_bounds(HashMap::from([(fid, Datum::timestamp_micros(micros))]));
+            b.upper_bounds(HashMap::from([(fid, Datum::timestamp_micros(micros))]));
         }
-        let df = builder.build().unwrap();
-        RootManifestEntry::Inline(
-            ManifestEntry::builder()
-                .status(ManifestStatus::Added)
-                .data_file(df)
-                .build(),
-        )
-    }
-
-    fn a_ref() -> RootManifestEntry {
-        RootManifestEntry::ManifestRef {
-            manifest_file: ManifestFile {
-                manifest_path: "s3://b/leaf.parquet".to_string(),
-                manifest_length: 1,
-                partition_spec_id: 0,
-                content: ManifestContentType::Data,
-                sequence_number: 1,
-                min_sequence_number: 1,
-                added_snapshot_id: 1,
-                added_files_count: Some(1),
-                existing_files_count: Some(0),
-                deleted_files_count: Some(0),
-                added_rows_count: Some(1),
-                existing_rows_count: Some(0),
-                deleted_rows_count: Some(0),
-                partitions: None,
-                key_metadata: None,
-                first_row_id: None,
-            },
-            mdv: None,
-        }
+        b.build().unwrap()
     }
 
     #[test]
-    fn graduates_only_closed_inline_data() {
-        let entries = vec![
-            inline_with("s3://b/data/closed-a.parquet", None),
-            inline_with("s3://b/data/open.parquet", None),
-            inline_with("s3://b/data/closed-b.parquet", None),
-            a_ref(), // refs always stay
-        ];
-
-        // Close decision can key on anything in the DataFile.
-        let (grad, stay) =
-            split_for_graduation(&entries, &|df: &DataFile| df.file_path.contains("closed"));
-
-        assert_eq!(grad.len(), 2);
-        let paths: Vec<&str> = grad.iter().map(|d| d.file_path.as_str()).collect();
-        assert!(paths.contains(&"s3://b/data/closed-a.parquet"));
-        assert!(paths.contains(&"s3://b/data/closed-b.parquet"));
-        assert_eq!(stay.len(), 2);
-    }
-
-    #[test]
-    fn closed_before_uses_timestamp_max() {
+    fn max_ts_takes_newest() {
         let fid = 5;
-        let entries = vec![
-            inline_with("closed.parquet", Some((fid, 1_000))), // max ts < cutoff
-            inline_with("open.parquet", Some((fid, 9_000))),   // max ts >= cutoff
-            inline_with("nostat.parquet", None),               // no ts -> stays live
+        let files = vec![
+            df("a", Some((fid, 100))),
+            df("b", Some((fid, 900))),
+            df("c", Some((fid, 500))),
         ];
-
-        let pred = closed_before(fid, 5_000);
-        let (grad, stay) = split_for_graduation(&entries, pred.as_ref());
-
-        assert_eq!(grad.len(), 1);
-        assert_eq!(grad[0].file_path, "closed.parquet");
-        assert_eq!(stay.len(), 2);
+        assert_eq!(max_ts_of(&files, fid), Some(900));
     }
 
     #[test]
-    fn refs_never_graduate_even_if_predicate_true() {
-        let (grad, stay) = split_for_graduation(&[a_ref()], &|_df: &DataFile| true);
-        assert!(grad.is_empty());
-        assert_eq!(stay.len(), 1);
+    fn max_ts_none_without_stat() {
+        assert_eq!(max_ts_of(&[df("a", None)], 5), None);
+    }
+
+    #[test]
+    fn file_max_ts_reads_field() {
+        assert_eq!(file_max_ts(&df("a", Some((5, 42))), 5), Some(42));
+        assert_eq!(file_max_ts(&df("a", Some((5, 42))), 9), None);
     }
 }

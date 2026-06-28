@@ -62,6 +62,10 @@ pub struct ManifestList {
     /// at the marked row indices in the referenced manifest should be skipped
     /// during scan planning.
     mdv_bitmaps: HashMap<String, Vec<u8>>,
+    /// V4 incremental path tombstones: data-file paths removed by a delta but
+    /// still physically present inside a referenced manifest. The scan skips any
+    /// data file whose path is in this set (the file-level analogue of an MDV).
+    removed_paths: std::collections::HashSet<String>,
 }
 
 impl ManifestList {
@@ -71,20 +75,35 @@ impl ManifestList {
             entries,
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
         }
     }
 
-    /// Construct a ManifestList with V4 inline entries and MDV bitmaps.
+    /// Construct a ManifestList with V4 inline entries, MDV bitmaps, and the
+    /// incremental path-tombstone set.
     pub fn with_inline_entries(
         entries: Vec<ManifestFile>,
         inline_entries: Vec<super::ManifestEntryRef>,
         mdv_bitmaps: HashMap<String, Vec<u8>>,
+        removed_paths: std::collections::HashSet<String>,
     ) -> Self {
         Self {
             entries,
             inline_entries,
             mdv_bitmaps,
+            removed_paths,
         }
+    }
+
+    /// Whether a data-file path is tombstoned by an incremental removal (the scan
+    /// must skip it). Always `false` when there are no tombstones.
+    pub fn is_removed(&self, data_file_path: &str) -> bool {
+        !self.removed_paths.is_empty() && self.removed_paths.contains(data_file_path)
+    }
+
+    /// The incremental path-tombstone set (data files the scan must skip).
+    pub fn removed_paths(&self) -> &std::collections::HashSet<String> {
+        &self.removed_paths
     }
 
     /// Parse manifest list from bytes.
@@ -1012,6 +1031,7 @@ pub(super) mod _serde {
                     .collect::<Result<Vec<_>>>()?,
                 inline_entries: vec![],
                 mdv_bitmaps: Default::default(),
+                removed_paths: Default::default(),
             })
         }
     }
@@ -1041,6 +1061,7 @@ pub(super) mod _serde {
                     .collect::<Result<Vec<_>>>()?,
                 inline_entries: vec![],
                 mdv_bitmaps: Default::default(),
+                removed_paths: Default::default(),
             })
         }
     }
@@ -1070,6 +1091,7 @@ pub(super) mod _serde {
                     .collect::<Result<Vec<_>>>()?,
                 inline_entries: vec![],
                 mdv_bitmaps: Default::default(),
+                removed_paths: Default::default(),
             })
         }
     }
@@ -1470,6 +1492,7 @@ mod test {
         let manifest_list = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![
                 ManifestFile {
                     manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
@@ -1522,6 +1545,7 @@ mod test {
         let manifest_list = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![
                 ManifestFile {
                     manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
@@ -1597,6 +1621,7 @@ mod test {
         let manifest_list = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![
                 ManifestFile {
                     manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
@@ -1673,6 +1698,7 @@ mod test {
         let manifest_list:ManifestListV1 = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
                 manifest_length: 5806,
@@ -1704,6 +1730,7 @@ mod test {
         let manifest_list:ManifestListV2 = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,
@@ -1737,6 +1764,7 @@ mod test {
         let manifest_list: ManifestListV3 = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,
@@ -1770,6 +1798,7 @@ mod test {
         let expected_manifest_list = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
                 manifest_length: 5806,
@@ -1819,6 +1848,7 @@ mod test {
         let mut expected_manifest_list = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,
@@ -1869,6 +1899,7 @@ mod test {
         let mut expected_manifest_list = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,
@@ -1919,6 +1950,7 @@ mod test {
         let expected_manifest_list = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
                 manifest_length: 5806,
@@ -1966,6 +1998,7 @@ mod test {
         let expected_manifest_list = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
                 manifest_length: 5806,
@@ -2015,6 +2048,7 @@ mod test {
         let mut expected_manifest_list = ManifestList {
             inline_entries: vec![],
             mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,

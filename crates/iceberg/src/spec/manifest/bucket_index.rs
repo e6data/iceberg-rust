@@ -208,6 +208,7 @@ mod tests {
             prev_root_path: None,
             chain_depth: 0,
             node_level: 0,
+            removed_paths: Vec::new(),
         }
     }
 

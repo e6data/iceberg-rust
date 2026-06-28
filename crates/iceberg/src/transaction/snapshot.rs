@@ -1127,36 +1127,59 @@ impl<'a> SnapshotProducer<'a> {
             .metadata()
             .current_snapshot()
             .map(|s| s.manifest_list().to_string());
+        // A delta may now carry removals too (recorded as path tombstones), so it
+        // no longer requires `removed_data_files.is_empty()` — laminar's
+        // merge-on-write (remove small inputs, add merged output) stays O(1).
         let do_delta = incremental
             && current_root_path.is_some()
-            && self.removed_data_files.is_empty()
             && current_chain_depth < MAX_CHAIN;
+        // Ref-resident tombstones carried forward from the chain on a collapse.
+        let mut carried_removed: Vec<String> = Vec::new();
         if do_delta {
             // Delta carries only this commit's new refs; discard the carried head.
             entries.clear();
         } else if incremental && current_chain_depth > 0 {
             // Collapse to a base: the head read above gave only the head delta's
-            // entries, so reconstruct the full live set from the chain.
+            // entries, so reconstruct the full live set from the chain. The
+            // reconstructed metadata carries the still-pending ref tombstones.
             if let Some(p) = &current_root_path {
-                let (_, full) = reconstruct_root(self.table.file_io(), p).await?;
+                let (recon_meta, full) = reconstruct_root(self.table.file_io(), p).await?;
                 entries = full;
+                carried_removed = recon_meta.removed_paths;
             }
         }
 
-        // Handle file removals (compaction / overwrite operations)
+        // Handle file removals (compaction / overwrite operations).
         let removed_data_files = std::mem::take(&mut self.removed_data_files);
-        if !removed_data_files.is_empty() {
-            let paths_to_remove: HashSet<String> = removed_data_files
-                .iter()
-                .map(|df| df.file_path.clone())
-                .collect();
+        let paths_to_remove: HashSet<String> = removed_data_files
+            .iter()
+            .map(|df| df.file_path.clone())
+            .collect();
 
-            // Remove matching inline entries directly
+        // Materialize inline removals (a no-op on the empty delta set; on a
+        // collapse it drops removed inline data from the reconstructed set).
+        // Track which removed paths matched an inline entry so a collapse carries
+        // only the ref-resident remainder forward as a tombstone.
+        let mut matched_inline: HashSet<String> = HashSet::new();
+        if !paths_to_remove.is_empty() {
             entries.retain(|entry| match entry {
-                RootManifestEntry::Inline(me) => !paths_to_remove.contains(&me.data_file.file_path),
+                RootManifestEntry::Inline(me) => {
+                    if paths_to_remove.contains(&me.data_file.file_path) {
+                        matched_inline.insert(me.data_file.file_path.clone());
+                        false
+                    } else {
+                        true
+                    }
+                }
                 RootManifestEntry::ManifestRef { .. } => true,
             });
+        }
 
+        // Non-incremental tables apply ref-resident removals via per-manifest MDV
+        // bitmaps. Incremental tables record removed paths as tombstones (keeps the
+        // delta O(1) — no manifest loads), applied later by `reconstruct_root` +
+        // the scan. So the MDV scan runs only on the non-incremental path.
+        if !incremental && !removed_data_files.is_empty() {
             // For manifest refs: build MDVs by scanning child manifests for removed paths.
             // Load each referenced manifest, find row indices of files being removed,
             // and create/merge MDV bitmaps.
@@ -1231,6 +1254,26 @@ impl<'a> SnapshotProducer<'a> {
                 );
             }
         }
+
+        // The new node's path-tombstone set (incremental only): the ref-resident
+        // tombstones carried from the chain on a collapse, plus this commit's
+        // removals that weren't materialized into an inline entry. On a delta this
+        // is exactly this commit's removals (entries is the empty new set, so
+        // nothing matched inline) — recorded so the reader excludes them from the
+        // prior chain. Non-incremental tables use MDV above and carry no tombstone.
+        let node_removed_paths: Vec<String> = if incremental {
+            let mut set: HashSet<String> = carried_removed.into_iter().collect();
+            for p in &paths_to_remove {
+                if !matched_inline.contains(p) {
+                    set.insert(p.clone());
+                }
+            }
+            let mut v: Vec<String> = set.into_iter().collect();
+            v.sort();
+            v
+        } else {
+            Vec::new()
+        };
 
         // Add new data files as inline entries
         let added_data_files = std::mem::take(&mut self.added_data_files);
@@ -1427,6 +1470,7 @@ impl<'a> SnapshotProducer<'a> {
             prev_root_path: if do_delta { current_root_path.clone() } else { None },
             chain_depth: if do_delta { current_chain_depth + 1 } else { 0 },
             node_level: 0,
+            removed_paths: node_removed_paths,
         };
 
         // Write the root. On an incremental COLLAPSE of a large live set (not a
@@ -1875,6 +1919,129 @@ mod test_v4_commit {
             head_entries.len() < N,
             "tree root holds child-node refs ({}), not the full {N} entries",
             head_entries.len()
+        );
+    }
+
+    /// e2e: a merge-on-write (remove the small inputs, add the merged output) on
+    /// an incremental table stays an O(1) DELTA and is CORRECT — the scan must see
+    /// the merged file and the untouched file, and must NOT see the removed files
+    /// (no double-count, no resurrection).
+    #[tokio::test]
+    async fn test_v4_incremental_delta_with_removals() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_inc_rm".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let mut table = catalog
+            .create_table(&ns, incremental_table_creation("v4incrm"))
+            .await
+            .unwrap();
+
+        // Append f1, f2, f3 across three delta commits.
+        for f in ["f1", "f2", "f3"] {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://b/{f}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+        assert_eq!(visible_paths(&table).await.len(), 3, "f1,f2,f3 all visible");
+
+        // Merge-on-write: remove f1 + f2, add the merged F. With removed-paths the
+        // commit is allowed to stay a delta even though it removes files.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .replace_data_files()
+            .delete_files(vec![
+                test_data_file("s3://b/f1.parquet"),
+                test_data_file("s3://b/f2.parquet"),
+            ])
+            .add_files(vec![test_data_file("s3://b/F.parquet")])
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        // Correctness: exactly {f3, F}. f1/f2 are tombstoned (gone), F is present,
+        // f3 is untouched. A bug would either leave f1/f2 (double-count) or drop f3.
+        let got = visible_paths(&table).await;
+        let want: HashSet<String> = ["s3://b/f3.parquet", "s3://b/F.parquet"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(got, want, "removed files excluded, merged + untouched kept");
+
+        // The merge-on-write stayed an O(1) DELTA carrying the merged file + the
+        // two tombstones (not a full collapse).
+        let (meta, head_entries) = read_head_root(&table).await;
+        assert!(meta.prev_root_path.is_some(), "merge-on-write stayed a delta");
+        assert_eq!(head_entries.len(), 1, "delta holds only the merged file inline");
+        let mut rp = meta.removed_paths.clone();
+        rp.sort();
+        assert_eq!(
+            rp,
+            vec!["s3://b/f1.parquet".to_string(), "s3://b/f2.parquet".to_string()],
+            "delta records the two removed paths as tombstones"
+        );
+    }
+
+    /// e2e: removal of a file that lives INSIDE a manifest ref (not inline) must be
+    /// applied by the SCAN via the path tombstone. Tiered+incremental flushes each
+    /// commit's files into a child manifest, so the removed file is ref-resident —
+    /// the inline filter can't drop it; the scan must skip it as it reads the ref.
+    #[tokio::test]
+    async fn test_v4_incremental_removal_tombstones_ref_file() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_inc_ref_rm".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let creation = TableCreation::builder()
+            .name("v4refrm".to_string())
+            .schema(test_schema())
+            .format_version(FormatVersion::V4)
+            .properties(HashMap::from([
+                ("root-manifest.incremental".to_string(), "true".to_string()),
+                ("tiered-metadata.enabled".to_string(), "true".to_string()),
+            ]))
+            .build();
+        let mut table = catalog.create_table(&ns, creation).await.unwrap();
+
+        for f in ["g1", "g2"] {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://b/{f}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+        assert_eq!(visible_paths(&table).await.len(), 2, "g1,g2 visible");
+
+        // Remove g1 (resident inside its flushed child manifest), add the merged G.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .replace_data_files()
+            .delete_files(vec![test_data_file("s3://b/g1.parquet")])
+            .add_files(vec![test_data_file("s3://b/G.parquet")])
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        // The scan must exclude g1 (tombstoned inside its ref) and keep g2 + G.
+        let got = visible_paths(&table).await;
+        let want: HashSet<String> = ["s3://b/g2.parquet", "s3://b/G.parquet"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(got, want, "ref-resident g1 tombstoned by the scan; g2 + G kept");
+
+        // g1 wasn't inline, so it stays a tombstone in removed_paths (the scan, not
+        // the inline filter, is what excludes it).
+        let (meta, _) = read_head_root(&table).await;
+        assert!(
+            meta.removed_paths.contains(&"s3://b/g1.parquet".to_string()),
+            "ref-resident removal persists as a scan tombstone"
         );
     }
 }

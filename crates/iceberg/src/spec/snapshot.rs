@@ -270,10 +270,18 @@ impl Snapshot {
                 manifest_files.extend(bucket_index.leaves().iter().cloned());
             }
 
+            // Incremental path tombstones: `reconstruct_root` already dropped any
+            // tombstoned INLINE data; what remains in `rm_meta.removed_paths` are
+            // files still physically present inside a manifest ref. Pass them to
+            // the scan so it skips those data files as it reads each manifest.
+            let removed_paths: std::collections::HashSet<String> =
+                rm_meta.removed_paths.iter().cloned().collect();
+
             return Ok(ManifestList::with_inline_entries(
                 manifest_files,
                 inlines,
                 mdv_bitmaps,
+                removed_paths,
             ));
         }
 

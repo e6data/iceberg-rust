@@ -235,6 +235,7 @@ impl TransactionAction for GraduateBucketsAction {
             prev_root_path: None,
             chain_depth: 0,
             node_level: 0,
+            removed_paths: Vec::new(),
         };
         let bi_bytes = write_bucket_index(&cold_leaves, &bi_metadata, &partition_type)?;
         table
@@ -255,6 +256,7 @@ impl TransactionAction for GraduateBucketsAction {
             prev_root_path: None,
             chain_depth: 0,
             node_level: 0,
+            removed_paths: rm_metadata.removed_paths.clone(),
         };
         let new_root_path = format!(
             "{}/{}/root-{}-{}.parquet",

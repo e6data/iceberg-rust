@@ -191,6 +191,16 @@ pub struct RootManifestMetadata {
     /// 0) when the live set exceeds the fan-out; small sets stay a single level-0
     /// node (a flat base). Encoded as `node-level`; absent ⇒ 0 (backward compat).
     pub node_level: u32,
+    /// Incremental removals: data-file paths this node TOMBSTONES. Lets an
+    /// incremental commit that removes files (e.g. laminar's merge-on-write:
+    /// remove the small inputs, add the merged output) stay an O(1) delta
+    /// instead of collapsing — the delta records the removed paths here, and the
+    /// reader (`reconstruct_root` → scan) excludes any data file whose path is in
+    /// the union of `removed_paths` down the chain. Newline-joined under the
+    /// `removed-paths` key; absent ⇒ empty (backward compatible). Cleared at
+    /// collapse for files materialized away; ref-resident removals persist as a
+    /// tombstone until the ref is rewritten.
+    pub removed_paths: Vec<String>,
 }
 
 /// The root manifest: replaces ManifestList in v4.
@@ -339,6 +349,9 @@ fn encode_root_manifest_metadata(metadata: &RootManifestMetadata) -> HashMap<Str
     if metadata.node_level > 0 {
         kv.insert("node-level".to_string(), metadata.node_level.to_string());
     }
+    if !metadata.removed_paths.is_empty() {
+        kv.insert("removed-paths".to_string(), metadata.removed_paths.join("\n"));
+    }
     kv.insert("root-manifest".to_string(), "true".to_string());
     kv.insert(
         "root-manifest-layout".to_string(),
@@ -468,6 +481,10 @@ fn decode_root_manifest_metadata(
         .get("node-level")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let removed_paths: Vec<String> = meta
+        .get("removed-paths")
+        .map(|s| s.split('\n').map(|p| p.to_string()).collect())
+        .unwrap_or_default();
 
     Ok(RootManifestMetadata {
         schema,
@@ -481,6 +498,7 @@ fn decode_root_manifest_metadata(
         prev_root_path,
         chain_depth,
         node_level,
+        removed_paths,
     })
 }
 
@@ -968,12 +986,19 @@ pub fn read_root_manifest(
 /// bookkeeping. For a base/flat root (`prev_root_path == None`) this is one read.
 ///
 /// `MAX_CHAIN_WALK` bounds the walk defensively against a corrupt/cyclic chain.
+///
+/// The returned metadata's `removed_paths` holds the tombstones that still apply
+/// to files inside child manifest **refs** (inline tombstones are materialized
+/// away here). Callers that write a new base carry this forward; the scan reads
+/// it to skip those data files. So `meta.removed_paths` on the result is the
+/// authoritative ref-tombstone set, NOT the head node's raw field.
 pub async fn reconstruct_root(
     file_io: &crate::io::FileIO,
     head_path: &str,
 ) -> Result<(RootManifestMetadata, Vec<RootManifestEntry>)> {
     const MAX_CHAIN_WALK: usize = 100_000;
     let mut entries: Vec<RootManifestEntry> = Vec::new();
+    let mut removed: HashSet<String> = HashSet::new();
     let mut head_meta: Option<RootManifestMetadata> = None;
     let mut path = head_path.to_string();
     for _ in 0..MAX_CHAIN_WALK {
@@ -982,18 +1007,30 @@ pub async fn reconstruct_root(
         if head_meta.is_none() {
             head_meta = Some(meta.clone());
         }
+        // Union the tombstones recorded down the chain.
+        for p in &meta.removed_paths {
+            removed.insert(p.clone());
+        }
         if meta.node_level > 0 {
             // Reached a balanced-tree base (the bottom of the L0 chain): its
             // entries are child-node refs, not data. Traverse the subtree to
             // gather the real leaf entries, then stop (a tree base has no prev).
             collect_subtree_entries(file_io, these, &mut entries).await?;
-            return Ok((head_meta.expect("read at least one root"), entries));
+            return Ok(finalize_reconstruct(
+                head_meta.expect("read at least one root"),
+                entries,
+                removed,
+            ));
         }
         entries.append(&mut these);
         match &meta.prev_root_path {
             Some(prev) => path = prev.clone(),
             None => {
-                return Ok((head_meta.expect("read at least one root"), entries));
+                return Ok(finalize_reconstruct(
+                    head_meta.expect("read at least one root"),
+                    entries,
+                    removed,
+                ));
             }
         }
     }
@@ -1001,6 +1038,41 @@ pub async fn reconstruct_root(
         ErrorKind::DataInvalid,
         "reconstruct_root: chain exceeded MAX_CHAIN_WALK (corrupt/cyclic prev-root-path?)",
     ))
+}
+
+/// Apply the chain's tombstones to the reconstructed entries: drop any INLINE
+/// entry whose data file was removed (materializing the removal), and set
+/// `meta.removed_paths` to the removals that did NOT match an inline entry —
+/// these reference files living inside child manifest refs, so they remain a
+/// tombstone the scan must apply when it reads those manifests. Pure.
+fn finalize_reconstruct(
+    mut meta: RootManifestMetadata,
+    entries: Vec<RootManifestEntry>,
+    removed: HashSet<String>,
+) -> (RootManifestMetadata, Vec<RootManifestEntry>) {
+    if removed.is_empty() {
+        meta.removed_paths = Vec::new();
+        return (meta, entries);
+    }
+    let mut matched: HashSet<String> = HashSet::new();
+    let kept: Vec<RootManifestEntry> = entries
+        .into_iter()
+        .filter(|e| match e {
+            RootManifestEntry::Inline(me) => {
+                if removed.contains(&me.data_file.file_path) {
+                    matched.insert(me.data_file.file_path.clone());
+                    false
+                } else {
+                    true
+                }
+            }
+            RootManifestEntry::ManifestRef { .. } => true,
+        })
+        .collect();
+    let mut for_refs: Vec<String> = removed.difference(&matched).cloned().collect();
+    for_refs.sort();
+    meta.removed_paths = for_refs;
+    (meta, kept)
 }
 
 /// Recursively gather the leaf-level entries under a set of interior-node refs.
@@ -1512,6 +1584,7 @@ mod tests {
             prev_root_path: None,
             chain_depth: 0,
             node_level: 0,
+            removed_paths: Vec::new(),
         }
     }
 

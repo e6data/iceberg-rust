@@ -49,6 +49,9 @@ pub(crate) struct ManifestFileContext {
     case_sensitive: bool,
     /// V4 manifest delete vector: serialized roaring bitmap of row indices to skip.
     mdv: Option<Vec<u8>>,
+    /// V4 incremental path tombstones: data-file paths to skip (file-level analogue
+    /// of the MDV). Shared across all manifests of one scan.
+    removed_paths: Arc<std::collections::HashSet<String>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -79,6 +82,7 @@ impl ManifestFileContext {
             expression_evaluator_cache,
             delete_file_index,
             mdv,
+            removed_paths,
             ..
         } = self;
 
@@ -103,6 +107,12 @@ impl ManifestFileContext {
                 if mdv.is_deleted(idx as u32) {
                     continue;
                 }
+            }
+            // Skip data files tombstoned by an incremental removal (file-level).
+            if !removed_paths.is_empty()
+                && removed_paths.contains(&manifest_entry.data_file.file_path)
+            {
+                continue;
             }
 
             let manifest_entry_context = ManifestEntryContext {
@@ -244,6 +254,9 @@ impl PlanContext {
             ManifestContentType::Data => 1,
         });
 
+        // Incremental path tombstones, shared (Arc) across every manifest of this scan.
+        let removed_paths = Arc::new(manifest_list.removed_paths().clone());
+
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
         for manifest_file in manifest_files {
@@ -281,6 +294,7 @@ impl PlanContext {
                 tx,
                 delete_file_idx.clone(),
                 mdv,
+                removed_paths.clone(),
             );
 
             filtered_mfcs.push(Ok(mfc));
@@ -348,6 +362,7 @@ impl PlanContext {
         sender: Sender<ManifestEntryContext>,
         delete_file_index: DeleteFileIndex,
         mdv: Option<Vec<u8>>,
+        removed_paths: Arc<std::collections::HashSet<String>>,
     ) -> ManifestFileContext {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
@@ -372,6 +387,7 @@ impl PlanContext {
             delete_file_index,
             case_sensitive: self.case_sensitive,
             mdv,
+            removed_paths,
         }
     }
 }

@@ -497,6 +497,7 @@ impl TransactionAction for RebalanceRootManifestAction {
             prev_root_path: None,
             chain_depth: 0,
             node_level: 0,
+            removed_paths: rm_metadata.removed_paths.clone(),
         };
 
         let new_root_manifest_path = format!(

@@ -98,6 +98,20 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// which is stored in the snapshot metadata for tracking and auditing purposes.
     fn operation(&self) -> Operation;
 
+    /// Whether this operation replaces the WHOLE table (truncate-and-replace), so
+    /// the snapshot summary should reset its cumulative TOTAL_* counters. Default
+    /// `false`: appends and partial compactions (ReplaceDataFiles) are NOT full
+    /// truncates. Only a true table-truncate op should override to `true`.
+    ///
+    /// Gating the summary's `truncate_table_summary` on this — rather than on
+    /// `operation() == Overwrite` — is deliberate: ReplaceDataFiles (compaction)
+    /// legitimately uses an overwrite-shaped snapshot, and conflating the two made
+    /// every compaction reset TOTAL_* and report `deleted-* = prev cumulative
+    /// total` (the summary lie, and the source of the i32 TOTAL_RECORDS overflow).
+    fn truncates_full_table(&self) -> bool {
+        false
+    }
+
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
     #[allow(unused)]
     fn delete_entries(
@@ -888,7 +902,7 @@ impl<'a> SnapshotProducer<'a> {
         update_snapshot_summaries(
             summary,
             previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
+            snapshot_produce_operation.truncates_full_table(),
         )
     }
 
@@ -1971,6 +1985,15 @@ mod test_v4_commit {
             .map(String::from)
             .collect();
         assert_eq!(got, want, "removed files excluded, merged + untouched kept");
+
+        // A.1: the replace snapshot must record operation=Replace (NOT Overwrite) —
+        // else truncate_table_summary fires and the summary lies (resets TOTAL_*,
+        // reports deleted-* = prior cumulative total).
+        assert_eq!(
+            table.metadata().current_snapshot().unwrap().summary().operation,
+            crate::spec::Operation::Replace,
+            "ReplaceDataFiles must record operation=Replace, not Overwrite"
+        );
 
         // The merge-on-write stayed an O(1) DELTA carrying the merged file + the
         // two tombstones (not a full collapse).

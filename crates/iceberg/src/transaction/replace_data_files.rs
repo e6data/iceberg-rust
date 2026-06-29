@@ -316,8 +316,16 @@ struct ReplaceOperation {
 
 impl SnapshotProduceOperation for ReplaceOperation {
     fn operation(&self) -> Operation {
-        Operation::Overwrite
+        // Replace, NOT Overwrite: per the Iceberg spec, `Replace` is "data/delete
+        // files added and removed WITHOUT changing table data" (compaction, format
+        // change, relocation) — exactly what ReplaceDataFiles does. `Overwrite` is a
+        // logical whole-table overwrite. Returning Overwrite made every compaction
+        // hit truncate_table_summary (reset TOTAL_*, deleted-* = prev cumulative).
+        Operation::Replace
     }
+
+    // ReplaceDataFiles is a partial compaction, never a full-table truncate, so it
+    // inherits the default `truncates_full_table() == false`.
 
     async fn delete_entries(
         &self,

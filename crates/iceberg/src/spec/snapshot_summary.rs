@@ -335,10 +335,14 @@ pub(crate) fn update_snapshot_summaries(
     previous_summary: Option<&Summary>,
     truncate_full_table: bool,
 ) -> Result<Summary> {
-    // Validate that the operation is supported
+    // Validate that the operation is supported. Replace (partial compaction) uses
+    // the same add/delete totals math as Overwrite — only the truncate branch below
+    // is Overwrite-specific (and gated on truncate_full_table), so Replace never
+    // resets the cumulative totals.
     if summary.operation != Operation::Append
         && summary.operation != Operation::Overwrite
         && summary.operation != Operation::Delete
+        && summary.operation != Operation::Replace
     {
         return Err(Error::new(
             ErrorKind::DataInvalid,

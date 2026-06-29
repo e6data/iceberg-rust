@@ -2044,4 +2044,74 @@ mod test_v4_commit {
             "ref-resident removal persists as a scan tombstone"
         );
     }
+
+    /// e2e: rewrite_manifests (tessellate's manifest consolidation) on an
+    /// incremental table must write a **V4 Parquet root**, not a standard Avro
+    /// manifest-list. Writing Avro here is what anchored the chain to a base the
+    /// collapse couldn't read ("corrupt footer"). With a V4 root the chain stays
+    /// all-V4 and reconstruct/collapse work.
+    #[tokio::test]
+    async fn test_v4_rewrite_manifests_writes_v4_root_not_avro() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_rw".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        // tiered+incremental so each append flushes to a manifest FILE (ref) —
+        // giving rewrite_manifests real manifests to consolidate.
+        let creation = TableCreation::builder()
+            .name("v4rw".to_string())
+            .schema(test_schema())
+            .format_version(FormatVersion::V4)
+            .properties(HashMap::from([
+                ("root-manifest.incremental".to_string(), "true".to_string()),
+                ("tiered-metadata.enabled".to_string(), "true".to_string()),
+            ]))
+            .build();
+        let mut table = catalog.create_table(&ns, creation).await.unwrap();
+
+        for f in ["a", "b", "c", "d"] {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://b/{f}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+        let before = visible_paths(&table).await;
+        assert_eq!(before.len(), 4, "a,b,c,d visible before rewrite");
+        let snap_before = table.metadata().current_snapshot_id();
+
+        // Consolidate the manifests.
+        let action = Transaction::new(&table).rewrite_manifests();
+        table = action.execute(&catalog, &table).await.unwrap();
+
+        // It must have committed a new snapshot whose manifest-list is a V4 root.
+        assert_ne!(
+            table.metadata().current_snapshot_id(),
+            snap_before,
+            "rewrite_manifests should have committed a consolidation snapshot"
+        );
+        let ml = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .manifest_list()
+            .to_string();
+        assert!(
+            ml.contains("/root-") && ml.ends_with(".parquet"),
+            "incremental rewrite_manifests must write a V4 Parquet root, got: {ml}"
+        );
+        assert!(
+            !ml.ends_with(".avro"),
+            "must NOT write an Avro manifest-list (the corrupt-footer cause), got: {ml}"
+        );
+
+        // The live set is preserved and reconstruct works through the new V4 base.
+        assert_eq!(
+            visible_paths(&table).await,
+            before,
+            "rewrite preserves the live set and reconstruct reads the V4-root base"
+        );
+    }
 }

@@ -1252,6 +1252,20 @@ impl<'a> SnapshotProducer<'a> {
                     }
 
                     if found_any {
+                        // Fix #5: record the child manifest snapshot the positional
+                        // bitmap was computed against, so a later scan detects a
+                        // stale MDV (manifest rewritten/reordered under it) instead
+                        // of soft-deleting the wrong rows.
+                        use crate::spec::root_manifest::ManifestDeleteVector;
+                        new_mdv.set_guard(
+                            manifest.entries().len() as u32,
+                            ManifestDeleteVector::compute_checksum(
+                                manifest
+                                    .entries()
+                                    .iter()
+                                    .map(|e| e.data_file.file_path.as_str()),
+                            ),
+                        );
                         *mdv = Some(new_mdv.serialize()?);
                     }
                 }
@@ -1330,10 +1344,44 @@ impl<'a> SnapshotProducer<'a> {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(100);
 
+        // Byte- and entry-count flush triggers (Fix #2): the inline-count
+        // threshold alone can't bound root size when entries vary in width or
+        // when the total set (refs + inlines) grows large. `flush-bytes` caps
+        // the estimated inline payload; `flush-entries` caps the total entry
+        // count. Either exceeded (for a non-tiered table with any inline) forces
+        // a flush to child manifests.
+        let flush_bytes = self
+            .table
+            .metadata()
+            .properties()
+            .get("root-manifest.flush-bytes")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8388608);
+
+        let flush_entries = self
+            .table
+            .metadata()
+            .properties()
+            .get("root-manifest.flush-entries")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1000);
+
         let inline_count = entries
             .iter()
             .filter(|e| matches!(e, RootManifestEntry::Inline(_)))
             .count();
+
+        // Rough per-inline byte estimate: fixed overhead plus the file path,
+        // which dominates the variable size of an inline manifest entry.
+        let inline_bytes = entries
+            .iter()
+            .filter_map(|e| match e {
+                RootManifestEntry::Inline(me) => Some(256 + me.data_file.file_path.len()),
+                RootManifestEntry::ManifestRef { .. } => None,
+            })
+            .sum::<usize>();
+
+        let total_entries = entries.len();
 
         // Tiered layout: APPEND-ONLY live nodes (V4 "one-file commit" principle).
         // Each commit flushes its just-added inline files into a fresh child
@@ -1351,23 +1399,50 @@ impl<'a> SnapshotProducer<'a> {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        if (tiered && inline_count > 0) || (!tiered && inline_count > inline_threshold) {
-            // Split inline entries by content type (data vs delete)
-            let mut data_entries: Vec<ManifestEntry> = Vec::new();
-            let mut delete_entries: Vec<ManifestEntry> = Vec::new();
+        if (tiered && inline_count > 0)
+            || (!tiered
+                && inline_count > 0
+                && (inline_count > inline_threshold
+                    || inline_bytes > flush_bytes
+                    || total_entries > flush_entries))
+        {
+            // Split inline entries by (content type, partition_spec_id).
+            // Grouping by spec id is required: a single commit can carry files
+            // written under different partition specs (e.g. compaction inputs
+            // after partition evolution). Writing them all under
+            // `default_partition_spec()` corrupts the child manifest's partition
+            // column. Look up each group's spec via `partition_spec_by_id`, as
+            // `RebalanceRootManifestAction` already does.
+            let mut data_by_spec: HashMap<i32, Vec<ManifestEntry>> = HashMap::new();
+            let mut delete_by_spec: HashMap<i32, Vec<ManifestEntry>> = HashMap::new();
             entries.retain(|e| match e {
                 RootManifestEntry::Inline(me) => {
+                    let spec_id = me.data_file.partition_spec_id;
                     match me.data_file.content {
-                        crate::spec::DataContentType::Data => data_entries.push(me.clone()),
-                        _ => delete_entries.push(me.clone()),
+                        crate::spec::DataContentType::Data => {
+                            data_by_spec.entry(spec_id).or_default().push(me.clone());
+                        }
+                        _ => {
+                            delete_by_spec.entry(spec_id).or_default().push(me.clone());
+                        }
                     }
                     false // remove from entries
                 }
                 RootManifestEntry::ManifestRef { .. } => true, // keep
             });
 
-            // Flush data entries to a child data manifest
-            if !data_entries.is_empty() {
+            // Flush data entries to child data manifests, one per partition spec.
+            for (spec_id, group) in data_by_spec {
+                let spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("partition spec {spec_id} not found"),
+                        )
+                    })?;
                 let path = format!(
                     "{}/{}/{}-m{}.parquet",
                     self.table.metadata().location(),
@@ -1380,11 +1455,11 @@ impl<'a> SnapshotProducer<'a> {
                     Some(self.snapshot_id),
                     self.key_metadata.clone(),
                     self.table.metadata().current_schema().clone(),
-                    self.table.metadata().default_partition_spec().as_ref().clone(),
+                    spec.as_ref().clone(),
                 )
                 .build_v3_data();
 
-                for entry in &data_entries {
+                for entry in &group {
                     writer.add_entry(entry.clone())?;
                 }
                 // V4 child manifests are Parquet -- the path was templated
@@ -1403,8 +1478,18 @@ impl<'a> SnapshotProducer<'a> {
                 });
             }
 
-            // Flush delete entries to a separate child delete manifest
-            if !delete_entries.is_empty() {
+            // Flush delete entries to child delete manifests, one per partition spec.
+            for (spec_id, group) in delete_by_spec {
+                let spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("partition spec {spec_id} not found"),
+                        )
+                    })?;
                 let path = format!(
                     "{}/{}/{}-m{}.parquet",
                     self.table.metadata().location(),
@@ -1417,11 +1502,11 @@ impl<'a> SnapshotProducer<'a> {
                     Some(self.snapshot_id),
                     self.key_metadata.clone(),
                     self.table.metadata().current_schema().clone(),
-                    self.table.metadata().default_partition_spec().as_ref().clone(),
+                    spec.as_ref().clone(),
                 )
                 .build_v3_deletes();
 
-                for entry in &delete_entries {
+                for entry in &group {
                     writer.add_entry(entry.clone())?;
                 }
                 // See the matching note on the data-entry flush above:
@@ -1493,8 +1578,18 @@ impl<'a> SnapshotProducer<'a> {
         // than an ever-growing single node. Small collapses (≤ fan-out) and the
         // O(1) delta path both still write a single flat node, so the hot path
         // and small tables are unchanged.
-        const TREE_FANOUT: usize = 64;
-        let root_manifest_path = if incremental && !do_delta && entries.len() > TREE_FANOUT {
+        // Fix #2: the fan-out that bounds each collapsed tree node's size is a
+        // tunable table property (`root-manifest.target-fanout`), so operators
+        // can trade node breadth against depth without a recompile. Absent/
+        // unparseable ⇒ the prior hardcoded default of 64.
+        let target_fanout = self
+            .table
+            .metadata()
+            .properties()
+            .get("root-manifest.target-fanout")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64);
+        let root_manifest_path = if incremental && !do_delta && entries.len() > target_fanout {
             build_balanced_tree(
                 self.table.file_io(),
                 self.table.metadata().location(),
@@ -1502,7 +1597,7 @@ impl<'a> SnapshotProducer<'a> {
                 &partition_type,
                 self.commit_uuid,
                 entries.clone(),
-                TREE_FANOUT,
+                target_fanout,
             )
             .await?
         } else {
@@ -2135,6 +2230,118 @@ mod test_v4_commit {
             visible_paths(&table).await,
             before,
             "rewrite preserves the live set and reconstruct reads the V4-root base"
+        );
+    }
+
+    /// Regression for the commit_v4 flush partition-spec bug: a single commit
+    /// carrying files under DIFFERENT partition specs (spec 0 unpartitioned +
+    /// spec 1 identity-on-`id`, as happens after partition evolution) must flush
+    /// each group under ITS OWN spec. The old code wrote every inline entry under
+    /// `default_partition_spec()`, so the unpartitioned file was written into a
+    /// manifest bound to the identity spec (and vice-versa), corrupting the
+    /// child manifest's partition column. Here we force a flush (threshold=1),
+    /// then assert both files stay visible and the flush produced exactly two
+    /// child manifests — one partitioned (spec 1), one not (spec 0).
+    #[tokio::test]
+    async fn test_v4_flush_groups_by_partition_spec() {
+        use crate::spec::{Literal, Transform};
+        use crate::transaction::action::ApplyTransactionAction;
+
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_multispec".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+
+        // V4 table, spec 0 = unpartitioned. Force a flush on any 2nd inline entry.
+        let table = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("v4multispec".to_string())
+                    .schema(test_schema())
+                    .format_version(FormatVersion::V4)
+                    .properties(HashMap::from([(
+                        "root-manifest.inline-threshold".to_string(),
+                        "1".to_string(),
+                    )]))
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(table.metadata().default_partition_spec_id(), 0);
+
+        // Evolve: add spec 1 = identity(id). (This also makes spec 1 the default,
+        // which is exactly why the old "write everything under the default spec"
+        // path corrupted the unpartitioned file.)
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_spec()
+            .add_field("id", "id", Transform::Identity)
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        assert!(
+            table.metadata().partition_spec_by_id(1).is_some(),
+            "spec 1 (identity on id) must exist after evolution"
+        );
+
+        // One commit, two files under two different specs -> flush triggers.
+        let file_a = test_data_file("s3://bucket/data/unpartitioned.parquet"); // spec 0
+        let mut file_b = test_data_file("s3://bucket/data/partitioned.parquet");
+        file_b.partition_spec_id = 1;
+        file_b.partition = Struct::from_iter([Some(Literal::long(42))]);
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(vec![file_a, file_b])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Both files must remain visible: a corrupt (wrong-spec) child manifest
+        // would fail to read or drop rows on scan.
+        let paths = visible_paths(&table).await;
+        assert_eq!(
+            paths,
+            HashSet::from([
+                "s3://bucket/data/unpartitioned.parquet".to_string(),
+                "s3://bucket/data/partitioned.parquet".to_string(),
+            ]),
+            "both spec-0 and spec-1 files must survive the flush"
+        );
+
+        // The flush must have replaced the inlines with manifest refs: exactly
+        // two child data manifests, one per spec.
+        let (_, entries) = read_head_root(&table).await;
+        let refs: Vec<&crate::spec::ManifestFile> = entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::spec::root_manifest::RootManifestEntry::ManifestRef {
+                    manifest_file,
+                    ..
+                } => Some(manifest_file),
+                crate::spec::root_manifest::RootManifestEntry::Inline(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            refs.len(),
+            "all inline entries must be flushed to refs (none left inline)"
+        );
+        assert_eq!(refs.len(), 2, "one child manifest per partition spec");
+
+        // Exactly one child manifest carries a (non-empty) partition summary:
+        // the spec-1 identity manifest. The spec-0 manifest is unpartitioned.
+        // The old bug would have written both under one spec -> either two
+        // partitioned summaries or a spec/partition-type mismatch.
+        let partitioned = refs
+            .iter()
+            .filter(|mf| mf.partitions.as_ref().is_some_and(|p| !p.is_empty()))
+            .count();
+        assert_eq!(
+            partitioned, 1,
+            "exactly one flushed manifest (spec 1) should be partitioned"
         );
     }
 }

@@ -101,6 +101,23 @@ impl ManifestFileContext {
             None
         };
 
+        // Fix #5: a guarded MDV carries the entry count + order-sensitive path
+        // checksum of the child manifest it was computed against. Validate that
+        // the manifest observed now still matches before applying the positional
+        // bitmap — otherwise a manifest rewritten/reordered under a stale MDV
+        // would silently soft-delete the wrong rows. Legacy (guardless) MDVs
+        // validate as Ok, preserving prior behavior.
+        if let Some(ref mdv) = mdv_bitmap {
+            let entry_count = manifest.entries().len() as u32;
+            let checksum = crate::spec::root_manifest::ManifestDeleteVector::compute_checksum(
+                manifest
+                    .entries()
+                    .iter()
+                    .map(|e| e.data_file.file_path.as_str()),
+            );
+            mdv.validate_against(entry_count, checksum)?;
+        }
+
         for (idx, manifest_entry) in manifest.entries().iter().enumerate() {
             // Skip entries marked as deleted by manifest delete vector
             if let Some(ref mdv) = mdv_bitmap {

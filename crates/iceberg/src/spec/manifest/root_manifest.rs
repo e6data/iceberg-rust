@@ -74,15 +74,43 @@ pub enum RootManifestEntry {
     Inline(ManifestEntry),
 }
 
+/// Magic prefix marking a *guarded* MDV envelope (staleness guard present).
+///
+/// Safe to use as a discriminator because a roaring bitmap serialization always
+/// begins with the cookie byte `0x3A` or `0x3B`, never `0x4D` (`'M'`). So a
+/// buffer starting with this magic is unambiguously a guarded envelope, and a
+/// legacy raw-roaring blob (written before guards existed) never collides.
+const MDV_MAGIC: &[u8; 4] = b"MDV1";
+
+/// Staleness guard for an MDV: a snapshot of the child manifest the positional
+/// bitmap was computed against.
+///
+/// The MDV is a *positional* soft-delete — its bitmap holds row indices into a
+/// specific child manifest, valid only if that manifest still has the exact same
+/// entry order and count at scan time. This guard records the child manifest's
+/// entry count plus an order-sensitive checksum of its entry file paths so a
+/// stale MDV (child manifest rewritten/reordered under it) is *detected* instead
+/// of silently soft-deleting the wrong rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MdvGuard {
+    entry_count: u32,
+    checksum: u64,
+}
+
 /// A manifest delete vector: marks specific row indices in a child manifest as
 /// logically deleted without rewriting the manifest file.
 ///
 /// Used during compaction (replace_data_files) on V4 tables to soft-delete
 /// entries in child manifests. The bitmap is serialized as roaring bitmap bytes
 /// and stored in the `mdv_bitmap` column of root manifest reference entries.
+///
+/// Optionally carries a staleness [`MdvGuard`]: when present it is serialized in
+/// a versioned envelope (magic prefix) so readers can validate the bitmap is
+/// still positionally aligned with the child manifest before applying it.
 #[derive(Debug, Clone)]
 pub struct ManifestDeleteVector {
     bitmap: RoaringBitmap,
+    guard: Option<MdvGuard>,
 }
 
 impl ManifestDeleteVector {
@@ -90,6 +118,7 @@ impl ManifestDeleteVector {
     pub fn new() -> Self {
         Self {
             bitmap: RoaringBitmap::new(),
+            guard: None,
         }
     }
 
@@ -114,19 +143,70 @@ impl ManifestDeleteVector {
     }
 
     /// Serialize to bytes for storage in root manifest.
+    ///
+    /// Without a guard this emits the legacy format — raw roaring bitmap bytes,
+    /// byte-for-byte identical to older writers, so old readers keep working.
+    /// With a guard it emits a versioned envelope:
+    /// `MDV_MAGIC (4) | entry_count u32 LE (4) | checksum u64 LE (8) | roaring bytes`.
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        self.bitmap
-            .serialize_into(&mut buf)
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("MDV serialize failed: {e}")))?;
-        Ok(buf)
+        match &self.guard {
+            None => {
+                let mut buf = Vec::new();
+                self.bitmap.serialize_into(&mut buf).map_err(|e| {
+                    Error::new(ErrorKind::Unexpected, format!("MDV serialize failed: {e}"))
+                })?;
+                Ok(buf)
+            }
+            Some(g) => {
+                let mut buf = Vec::with_capacity(16);
+                buf.extend_from_slice(MDV_MAGIC);
+                buf.extend_from_slice(&g.entry_count.to_le_bytes());
+                buf.extend_from_slice(&g.checksum.to_le_bytes());
+                self.bitmap.serialize_into(&mut buf).map_err(|e| {
+                    Error::new(ErrorKind::Unexpected, format!("MDV serialize failed: {e}"))
+                })?;
+                Ok(buf)
+            }
+        }
     }
 
     /// Deserialize from bytes read from root manifest.
+    ///
+    /// A buffer beginning with [`MDV_MAGIC`] is a guarded envelope (guard parsed
+    /// from the 16-byte header, bitmap from the remainder). Any other buffer is a
+    /// legacy raw-roaring blob and yields `guard == None` (a no-op guard).
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
-        let bitmap = RoaringBitmap::deserialize_from(bytes)
-            .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("MDV deserialize failed: {e}")))?;
-        Ok(Self { bitmap })
+        if bytes.len() >= MDV_MAGIC.len() && &bytes[..MDV_MAGIC.len()] == MDV_MAGIC {
+            if bytes.len() < 16 {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "MDV envelope too short",
+                ));
+            }
+            let entry_count = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let checksum = u64::from_le_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ]);
+            let bitmap = RoaringBitmap::deserialize_from(&bytes[16..]).map_err(|e| {
+                Error::new(ErrorKind::DataInvalid, format!("MDV deserialize failed: {e}"))
+            })?;
+            Ok(Self {
+                bitmap,
+                guard: Some(MdvGuard {
+                    entry_count,
+                    checksum,
+                }),
+            })
+        } else {
+            let bitmap = RoaringBitmap::deserialize_from(bytes).map_err(|e| {
+                Error::new(ErrorKind::DataInvalid, format!("MDV deserialize failed: {e}"))
+            })?;
+            Ok(Self {
+                bitmap,
+                guard: None,
+            })
+        }
     }
 
     /// Merge another MDV into this one (union of deleted indices).
@@ -140,6 +220,69 @@ impl ManifestDeleteVector {
             return 0.0;
         }
         self.bitmap.len() as f64 / total_entries as f64
+    }
+
+    /// Attach (or replace) the staleness guard: the child manifest entry count
+    /// and the order-sensitive checksum of its entry file paths this bitmap was
+    /// computed against. Call before `serialize` at MDV build time.
+    pub fn set_guard(&mut self, entry_count: u32, checksum: u64) {
+        self.guard = Some(MdvGuard {
+            entry_count,
+            checksum,
+        });
+    }
+
+    /// Order-sensitive FNV-1a 64-bit checksum over a sequence of file paths.
+    ///
+    /// Each path is length-delimited (its byte length hashed as 8 little-endian
+    /// bytes) before its bytes, so `["ab","c"]` and `["a","bc"]` hash
+    /// differently. Stable across processes (no `Hash` randomization), which the
+    /// guard needs since it is written and validated in different runs.
+    pub fn compute_checksum<'a, I: IntoIterator<Item = &'a str>>(paths: I) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x00000100000001b3;
+        let mut hash = FNV_OFFSET;
+        let fnv = |byte: u8, h: &mut u64| {
+            *h ^= byte as u64;
+            *h = h.wrapping_mul(FNV_PRIME);
+        };
+        for path in paths {
+            let len = path.len() as u64;
+            for b in len.to_le_bytes() {
+                fnv(b, &mut hash);
+            }
+            for b in path.as_bytes() {
+                fnv(*b, &mut hash);
+            }
+        }
+        hash
+    }
+
+    /// Validate this MDV is still positionally aligned with the child manifest.
+    ///
+    /// A guardless (legacy) MDV validates as `Ok` — it predates guards, so we
+    /// preserve the prior (unchecked) behavior rather than reject it. A guarded
+    /// MDV validates only when the recorded entry count and checksum both match
+    /// the manifest observed at scan time; otherwise it is stale and applying its
+    /// positional bitmap would delete the wrong rows, so we error.
+    pub fn validate_against(&self, entry_count: u32, checksum: u64) -> Result<()> {
+        match &self.guard {
+            None => Ok(()),
+            Some(g) => {
+                if g.entry_count == entry_count && g.checksum == checksum {
+                    Ok(())
+                } else {
+                    Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "stale manifest delete vector: guard(count={}, checksum={:#x}) != \
+                             manifest(count={}, checksum={:#x})",
+                            g.entry_count, g.checksum, entry_count, checksum
+                        ),
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -1985,6 +2128,95 @@ mod tests {
             RootManifestEntry::ManifestRef { mdv: None, .. } => {}
             _ => panic!("Expected ManifestRef without MDV"),
         }
+    }
+
+    #[test]
+    fn mdv_guard_round_trip_preserves_guard_and_bitmap() {
+        // A guarded MDV serializes into the versioned envelope and deserializes
+        // back with the guard intact, so a later scan can validate positional
+        // alignment. Fix #5.
+        let mut mdv = ManifestDeleteVector::new();
+        mdv.mark_deleted(1);
+        mdv.mark_deleted(4);
+        let checksum = ManifestDeleteVector::compute_checksum(
+            ["s3://b/a.parquet", "s3://b/b.parquet", "s3://b/c.parquet"],
+        );
+        mdv.set_guard(3, checksum);
+
+        let bytes = mdv.serialize().unwrap();
+        // Envelope, not raw roaring: begins with the magic prefix.
+        assert_eq!(&bytes[..4], MDV_MAGIC);
+
+        let read = ManifestDeleteVector::deserialize(&bytes).unwrap();
+        assert!(read.is_deleted(1));
+        assert!(read.is_deleted(4));
+        assert!(!read.is_deleted(0));
+        assert_eq!(read.deleted_count(), 2);
+        // Guard validates against the same manifest snapshot.
+        read.validate_against(3, checksum).unwrap();
+    }
+
+    #[test]
+    fn mdv_legacy_guardless_is_backward_compatible() {
+        // A guardless MDV serializes to raw roaring bytes (no magic prefix), so
+        // old readers keep working, and validate_against is a no-op (Ok).
+        let mut mdv = ManifestDeleteVector::new();
+        mdv.mark_deleted(0);
+        mdv.mark_deleted(2);
+        let bytes = mdv.serialize().unwrap();
+        assert_ne!(&bytes[..MDV_MAGIC.len().min(bytes.len())], MDV_MAGIC);
+
+        let read = ManifestDeleteVector::deserialize(&bytes).unwrap();
+        assert!(read.is_deleted(0));
+        assert!(read.is_deleted(2));
+        // No guard => validates against ANY manifest snapshot.
+        read.validate_against(999, 0xdead_beef).unwrap();
+    }
+
+    #[test]
+    fn mdv_guard_detects_stale_manifest() {
+        // A guarded MDV validated against a mismatched entry count OR checksum is
+        // stale (the child manifest was rewritten/reordered under it) and errors,
+        // instead of silently soft-deleting the wrong rows.
+        let mut mdv = ManifestDeleteVector::new();
+        mdv.mark_deleted(0);
+        let checksum = ManifestDeleteVector::compute_checksum(["s3://b/a.parquet"]);
+        mdv.set_guard(1, checksum);
+
+        // Mismatched entry count.
+        assert!(mdv.validate_against(2, checksum).is_err());
+        // Mismatched checksum.
+        assert!(mdv.validate_against(1, checksum ^ 1).is_err());
+        // Exact match is Ok.
+        mdv.validate_against(1, checksum).unwrap();
+    }
+
+    #[test]
+    fn mdv_checksum_is_order_sensitive_and_delimited() {
+        // Length-delimiting each path makes the checksum sensitive to path
+        // boundaries as well as order: concatenation collisions cannot occur.
+        let a = ManifestDeleteVector::compute_checksum(["ab", "c"]);
+        let b = ManifestDeleteVector::compute_checksum(["a", "bc"]);
+        assert_ne!(a, b, "boundary shift must change the checksum");
+
+        let fwd = ManifestDeleteVector::compute_checksum(["x", "y"]);
+        let rev = ManifestDeleteVector::compute_checksum(["y", "x"]);
+        assert_ne!(fwd, rev, "reordering must change the checksum");
+
+        // Deterministic across calls (no Hash randomization).
+        assert_eq!(
+            ManifestDeleteVector::compute_checksum(["p", "q", "r"]),
+            ManifestDeleteVector::compute_checksum(["p", "q", "r"]),
+        );
+    }
+
+    #[test]
+    fn mdv_envelope_too_short_errors() {
+        // A buffer that starts with the magic but is truncated below the 16-byte
+        // header is rejected rather than mis-parsed.
+        let mut bytes = MDV_MAGIC.to_vec();
+        bytes.extend_from_slice(&[0u8; 4]); // 8 bytes total, < 16
+        assert!(ManifestDeleteVector::deserialize(&bytes).is_err());
     }
 
     #[test]

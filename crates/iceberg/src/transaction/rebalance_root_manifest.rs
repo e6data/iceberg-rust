@@ -290,9 +290,47 @@ impl TransactionAction for RebalanceRootManifestAction {
             reconstruct_root(table.file_io(), root_manifest_path).await?;
         let root_manifest = RootManifest::new(rm_metadata.clone(), entries);
 
-        // 3. Check if rebalance is needed
+        // 3. Check if rebalance is needed.
+        // Read the SAME properties that the foreground commit path (`commit_v4`)
+        // uses for its flush triggers, across ALL THREE dimensions (inline count,
+        // estimated inline bytes, total entry count), so the rebalancer's flush
+        // branch stays alive even when an operator relies on the byte or entry
+        // triggers instead of inline count. Without this the branch was
+        // effectively dead: commit_v4 flushes at its defaults (100 for count,
+        // 8388608 for bytes, 1000 for entries), so the inline count alone rarely
+        // reached this action's hardcoded default (1000). The builder override
+        // (`with_inline_threshold`) still wins when the property is absent.
+        let inline_threshold = table
+            .metadata()
+            .properties()
+            .get("root-manifest.inline-threshold")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(self.inline_threshold);
+        let flush_bytes = table
+            .metadata()
+            .properties()
+            .get("root-manifest.flush-bytes")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8388608);
+        let flush_entries = table
+            .metadata()
+            .properties()
+            .get("root-manifest.flush-entries")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1000);
         let inline_count = root_manifest.inline_count();
-        let needs_flush = inline_count >= self.inline_threshold;
+        let inline_bytes = root_manifest
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                RootManifestEntry::Inline(me) => Some(256 + me.data_file.file_path.len()),
+                RootManifestEntry::ManifestRef { .. } => None,
+            })
+            .sum::<usize>();
+        let total_entries = root_manifest.entries().len();
+        let needs_flush = inline_count >= inline_threshold
+            || inline_bytes >= flush_bytes
+            || total_entries >= flush_entries;
         let needs_mdv_compact = self.needs_mdv_compaction(root_manifest.entries());
         let needs_recluster = self.needs_recluster(root_manifest.entries());
 

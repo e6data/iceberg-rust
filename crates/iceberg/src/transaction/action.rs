@@ -69,13 +69,6 @@ pub trait ApplyTransactionAction {
 impl<T: TransactionAction + 'static> ApplyTransactionAction for T {
     fn apply(self, mut tx: Transaction) -> Result<Transaction>
     where Self: Sized {
-        // ReplaceDataFiles carries a fixed delete-file list. Retrying with
-        // a refreshed table but the original delete list produces duplicate
-        // data when another writer already replaced those files. Disable
-        // retry so the caller handles OCC failures explicitly.
-        if (*(&self as &dyn std::any::Any)).is::<super::replace_data_files::ReplaceDataFilesAction>() {
-            tx.disable_retry = true;
-        }
         tx.actions.push(Arc::new(self));
         Ok(tx)
     }

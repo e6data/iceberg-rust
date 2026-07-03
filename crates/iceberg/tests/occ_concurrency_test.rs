@@ -438,6 +438,184 @@ async fn test_replace_with_retry_no_duplicates() {
 }
 
 // ─────────────────────────────────────────────────────────
+// Test 4b: Disjoint-partition replace with OCC retry
+//
+// Two writers each replace files in DIFFERENT partitions (disjoint).
+// With correct cache invalidation on retry, the loser should retry
+// and succeed — its delete list targets files the winner didn't touch.
+//
+// This test verifies the fix for the stale-cache bug:
+// - W1 compacts partition A files → merged_A
+// - W2 compacts partition B files → merged_B
+// - One wins CAS, other retries
+// - After fix: retry re-reads manifest list from new snapshot,
+//   finds its target files still present, succeeds
+// - Result: both merged files present, no data loss
+// ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_disjoint_partition_replace_retry_no_data_loss() {
+    let catalog = Arc::new(setup_catalog().await);
+    let _ = create_test_table(catalog.as_ref(), "test_ns5", "disjoint_replace").await;
+
+    let ident = iceberg::TableIdent::new(
+        NamespaceIdent::new("test_ns5".to_string()),
+        "disjoint_replace".to_string(),
+    );
+
+    // Seed: 3 files for "partition A" and 3 files for "partition B"
+    // (using file path to distinguish; unpartitioned table for simplicity)
+    for i in 0..3 {
+        let table = catalog.load_table(&ident).await.unwrap();
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![
+            test_data_file(&format!("s3://test/data/partA_file_{}.parquet", i), 100),
+        ]);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog.as_ref()).await.unwrap();
+    }
+    for i in 0..3 {
+        let table = catalog.load_table(&ident).await.unwrap();
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![
+            test_data_file(&format!("s3://test/data/partB_file_{}.parquet", i), 100),
+        ]);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog.as_ref()).await.unwrap();
+    }
+
+    // Verify seed: 6 files, 600 rows
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let seed_tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let seed_records: u64 = seed_tasks.iter().map(|t| t.record_count.unwrap_or(0)).sum();
+    assert_eq!(seed_records, 600, "seed should have 600 rows");
+    assert_eq!(seed_tasks.len(), 6, "seed should have 6 files");
+    println!("  Seed OK: 6 files, 600 rows");
+
+    // Writer A: replace partA_file_0..2 → merged_A (300 rows)
+    // Writer B: replace partB_file_0..2 → merged_B (300 rows)
+    // These are DISJOINT — no overlap in files_to_delete.
+    let barrier = Arc::new(Barrier::new(2));
+
+    let part_a_files: Vec<DataFile> = (0..3)
+        .map(|i| test_data_file(&format!("s3://test/data/partA_file_{}.parquet", i), 100))
+        .collect();
+    let part_b_files: Vec<DataFile> = (0..3)
+        .map(|i| test_data_file(&format!("s3://test/data/partB_file_{}.parquet", i), 100))
+        .collect();
+
+    let catalog_a = catalog.clone();
+    let catalog_b = catalog.clone();
+    let ident_a = ident.clone();
+    let ident_b = ident.clone();
+    let barrier_a = barrier.clone();
+    let barrier_b = barrier.clone();
+    let files_a = part_a_files.clone();
+    let files_b = part_b_files.clone();
+
+    let handle_a = tokio::spawn(async move {
+        let table = catalog_a.load_table(&ident_a).await.unwrap();
+        barrier_a.wait().await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_data_files()
+            .delete_files(files_a)
+            .add_files(vec![test_data_file(
+                "s3://test/data/merged_A.parquet",
+                300,
+            )]);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog_a.as_ref()).await
+    });
+
+    let handle_b = tokio::spawn(async move {
+        let table = catalog_b.load_table(&ident_b).await.unwrap();
+        barrier_b.wait().await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_data_files()
+            .delete_files(files_b)
+            .add_files(vec![test_data_file(
+                "s3://test/data/merged_B.parquet",
+                300,
+            )]);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog_b.as_ref()).await
+    });
+
+    let result_a = handle_a.await.unwrap();
+    let result_b = handle_b.await.unwrap();
+
+    println!(
+        "  Writer A: {}",
+        if result_a.is_ok() { "SUCCESS" } else { "FAILED" }
+    );
+    println!(
+        "  Writer B: {}",
+        if result_b.is_ok() { "SUCCESS" } else { "FAILED" }
+    );
+
+    // BOTH should succeed — disjoint partitions, retry should handle OCC
+    assert!(
+        result_a.is_ok(),
+        "Writer A should succeed: {:?}",
+        result_a.err()
+    );
+    assert!(
+        result_b.is_ok(),
+        "Writer B should succeed: {:?}",
+        result_b.err()
+    );
+
+    // Verify final state: 2 files (merged_A + merged_B), 600 rows total
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let final_tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let final_records: u64 = final_tasks.iter().map(|t| t.record_count.unwrap_or(0)).sum();
+    let final_paths: Vec<String> = final_tasks.iter().map(|t| t.data_file_path().to_string()).collect();
+
+    println!("  Final files: {:?}", final_paths);
+    println!("  Final records: {}", final_records);
+
+    assert_eq!(
+        final_records, 600,
+        "expected 600 rows (no data loss), got {}",
+        final_records
+    );
+    assert_eq!(
+        final_tasks.len(),
+        2,
+        "expected 2 merged files, got {}",
+        final_tasks.len()
+    );
+    assert!(
+        final_paths.contains(&"s3://test/data/merged_A.parquet".to_string()),
+        "merged_A missing from final files"
+    );
+    assert!(
+        final_paths.contains(&"s3://test/data/merged_B.parquet".to_string()),
+        "merged_B missing from final files"
+    );
+
+    println!("  PASS: disjoint replace with OCC retry — 2 files, 600 rows, no data loss");
+}
+
+// ─────────────────────────────────────────────────────────
 // Test 4: Two-replica ingest + merge simulation
 //
 // Simulates the production Laminar scenario:
@@ -661,5 +839,495 @@ async fn test_two_replica_ingest_and_merge_no_data_loss() {
     // What matters: no data loss (records match) and no duplicates.
     println!("  Files: {} (some may be merged)", actual_files);
     println!("  PASS: all {} rows present in {} files — no data loss", actual_records, actual_files);
+}
+
+// ─────────────────────────────────────────────────────────
+// Test 5: Overlapping replace — correct conflict detection
+//
+// Two writers replace THE SAME files. One wins, the other's retry
+// correctly fails because the files are already gone.
+// ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_overlapping_replace_correct_conflict() {
+    let catalog = Arc::new(setup_catalog().await);
+    let _ = create_test_table(catalog.as_ref(), "test_overlap", "same_files").await;
+
+    let ident = iceberg::TableIdent::new(
+        NamespaceIdent::new("test_overlap".to_string()),
+        "same_files".to_string(),
+    );
+
+    // Seed with 4 files (400 rows)
+    let _table = seed_table(catalog.as_ref(), "test_overlap", "same_files", 4).await;
+
+    let seed_files: Vec<DataFile> = (0..4)
+        .map(|i| test_data_file(&format!("s3://test/data/seed_{}.parquet", i), 100))
+        .collect();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+
+    for writer_id in 0..2u32 {
+        let catalog = catalog.clone();
+        let ident = ident.clone();
+        let barrier = barrier.clone();
+        let files = seed_files.clone();
+
+        handles.push(tokio::spawn(async move {
+            let table = catalog.load_table(&ident).await.unwrap();
+            barrier.wait().await;
+
+            let tx = Transaction::new(&table);
+            let action = tx
+                .replace_data_files()
+                .delete_files(files)
+                .add_files(vec![test_data_file(
+                    &format!("s3://test/data/merged_w{}.parquet", writer_id),
+                    400,
+                )]);
+            let tx = action.apply(tx).unwrap();
+            tx.commit(catalog.as_ref()).await
+        }));
+    }
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let successes = results.iter().filter(|r| r.is_ok()).count();
+    let failures = results.iter().filter(|r| r.is_err()).count();
+
+    println!("  Overlapping replace: {} success, {} failed", successes, failures);
+
+    // Exactly one should succeed. The other retries, refreshes the table,
+    // rebuilds manifests from the new snapshot, can't find files to delete.
+    assert_eq!(successes, 1, "exactly one writer should succeed");
+    assert_eq!(failures, 1, "the other should fail (files already replaced)");
+
+    // Verify: 1 merged file, 400 rows, no duplicates
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_records: u64 = tasks.iter().map(|t| t.record_count.unwrap_or(0)).sum();
+
+    println!("  Final: {} files, {} records", tasks.len(), total_records);
+    assert_eq!(total_records, 400, "no duplicates: expected 400, got {}", total_records);
+    assert_eq!(tasks.len(), 1, "expected 1 merged file");
+
+    println!("  PASS: overlapping replace — correct conflict, no duplicates");
+}
+
+// ─────────────────────────────────────────────────────────
+// Test 6: Replace + concurrent FastAppend
+//
+// Compaction races with ingest. Both should succeed.
+// ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_replace_plus_concurrent_fast_append() {
+    let catalog = Arc::new(setup_catalog().await);
+    let _ = create_test_table(catalog.as_ref(), "test_mixed", "replace_append").await;
+
+    let ident = iceberg::TableIdent::new(
+        NamespaceIdent::new("test_mixed".to_string()),
+        "replace_append".to_string(),
+    );
+
+    // Seed 3 files (300 rows)
+    let _table = seed_table(catalog.as_ref(), "test_mixed", "replace_append", 3).await;
+
+    let seed_files: Vec<DataFile> = (0..3)
+        .map(|i| test_data_file(&format!("s3://test/data/seed_{}.parquet", i), 100))
+        .collect();
+
+    let barrier = Arc::new(Barrier::new(2));
+
+    // Writer A: Replace (compact seed files)
+    let catalog_a = catalog.clone();
+    let ident_a = ident.clone();
+    let barrier_a = barrier.clone();
+    let files_a = seed_files.clone();
+
+    let handle_replace = tokio::spawn(async move {
+        let table = catalog_a.load_table(&ident_a).await.unwrap();
+        barrier_a.wait().await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_data_files()
+            .delete_files(files_a)
+            .add_files(vec![test_data_file("s3://test/data/merged.parquet", 300)]);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog_a.as_ref()).await
+    });
+
+    // Writer B: FastAppend (new data)
+    let catalog_b = catalog.clone();
+    let ident_b = ident.clone();
+    let barrier_b = barrier.clone();
+
+    let handle_append = tokio::spawn(async move {
+        let table = catalog_b.load_table(&ident_b).await.unwrap();
+        barrier_b.wait().await;
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![test_data_file(
+            "s3://test/data/new_ingest.parquet",
+            200,
+        )]);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog_b.as_ref()).await
+    });
+
+    let result_replace = handle_replace.await.unwrap();
+    let result_append = handle_append.await.unwrap();
+
+    println!(
+        "  Replace: {}, Append: {}",
+        if result_replace.is_ok() { "SUCCESS" } else { "FAILED" },
+        if result_append.is_ok() { "SUCCESS" } else { "FAILED" },
+    );
+
+    // Both should succeed
+    assert!(result_replace.is_ok(), "Replace should succeed: {:?}", result_replace.err());
+    assert!(result_append.is_ok(), "Append should succeed: {:?}", result_append.err());
+
+    // Verify: merged.parquet (300) + new_ingest.parquet (200) = 500 rows, 2 files
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_records: u64 = tasks.iter().map(|t| t.record_count.unwrap_or(0)).sum();
+    let paths: Vec<String> = tasks.iter().map(|t| t.data_file_path().to_string()).collect();
+
+    println!("  Final: {:?}, {} records", paths, total_records);
+    assert_eq!(total_records, 500, "expected 500 rows, got {}", total_records);
+    assert_eq!(tasks.len(), 2, "expected 2 files");
+
+    println!("  PASS: replace + append both succeeded, no data loss");
+}
+
+// ─────────────────────────────────────────────────────────
+// Test 7: 4-way disjoint replace via OCC retry cascade
+//
+// Four writers each compact their own disjoint file set.
+// All should succeed via retry cascade (up to 3 retries).
+// ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_four_way_disjoint_replace() {
+    let catalog = Arc::new(setup_catalog().await);
+    let _ = create_test_table(catalog.as_ref(), "test_4way", "disjoint4").await;
+
+    let ident = iceberg::TableIdent::new(
+        NamespaceIdent::new("test_4way".to_string()),
+        "disjoint4".to_string(),
+    );
+
+    // Seed: 4 groups of 2 files each (8 files, 800 rows)
+    for group in 0..4u32 {
+        for file_idx in 0..2u32 {
+            let table = catalog.load_table(&ident).await.unwrap();
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(vec![test_data_file(
+                &format!("s3://test/data/g{}_f{}.parquet", group, file_idx),
+                100,
+            )]);
+            let tx = action.apply(tx).unwrap();
+            tx.commit(catalog.as_ref()).await.unwrap();
+        }
+    }
+
+    // Verify seed
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let seed_tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(seed_tasks.len(), 8, "seed should have 8 files");
+    println!("  Seed OK: 8 files, 800 rows");
+
+    // 4 concurrent writers, each compacting their own group
+    let barrier = Arc::new(Barrier::new(4));
+    let mut handles = Vec::new();
+
+    for group in 0..4u32 {
+        let catalog = catalog.clone();
+        let ident = ident.clone();
+        let barrier = barrier.clone();
+
+        let group_files: Vec<DataFile> = (0..2)
+            .map(|f| test_data_file(&format!("s3://test/data/g{}_f{}.parquet", group, f), 100))
+            .collect();
+
+        handles.push(tokio::spawn(async move {
+            let table = catalog.load_table(&ident).await.unwrap();
+            barrier.wait().await;
+
+            let tx = Transaction::new(&table);
+            let action = tx
+                .replace_data_files()
+                .delete_files(group_files)
+                .add_files(vec![test_data_file(
+                    &format!("s3://test/data/merged_g{}.parquet", group),
+                    200,
+                )]);
+            let tx = action.apply(tx).unwrap();
+            let result = tx.commit(catalog.as_ref()).await;
+            (group, result)
+        }));
+    }
+
+    let mut successes = 0u32;
+    for handle in handles {
+        let (group, result) = handle.await.unwrap();
+        let status = if result.is_ok() { "SUCCESS" } else { "FAILED" };
+        println!("  Group {}: {}", group, status);
+        if result.is_ok() {
+            successes += 1;
+        } else {
+            panic!("Group {} failed: {:?}", group, result.err());
+        }
+    }
+
+    assert_eq!(successes, 4, "all 4 disjoint writers should succeed");
+
+    // Verify: 4 merged files, 800 rows
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_records: u64 = tasks.iter().map(|t| t.record_count.unwrap_or(0)).sum();
+    let paths: Vec<String> = tasks.iter().map(|t| t.data_file_path().to_string()).collect();
+
+    println!("  Final: {} files, {} records", tasks.len(), total_records);
+    assert_eq!(total_records, 800, "expected 800 rows, got {}", total_records);
+    assert_eq!(tasks.len(), 4, "expected 4 merged files");
+
+    for g in 0..4 {
+        let expected = format!("s3://test/data/merged_g{}.parquet", g);
+        assert!(paths.contains(&expected), "missing {}", expected);
+    }
+
+    println!("  PASS: 4-way disjoint replace — all succeeded, 800 rows, no data loss");
+}
+
+// ─────────────────────────────────────────────────────────
+// Test 8: Many-manifest cache invalidation stress
+//
+// 20 individual commits (20 manifests), then two disjoint
+// writers. Stresses cache rebuild with a large manifest list.
+// ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_disjoint_replace_many_manifests() {
+    let catalog = Arc::new(setup_catalog().await);
+    let _ = create_test_table(catalog.as_ref(), "test_many", "manifests").await;
+
+    let ident = iceberg::TableIdent::new(
+        NamespaceIdent::new("test_many".to_string()),
+        "manifests".to_string(),
+    );
+
+    // Seed 20 files, each in its own commit (= 20 manifests)
+    for i in 0..20u32 {
+        let table = catalog.load_table(&ident).await.unwrap();
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![test_data_file(
+            &format!("s3://test/data/file_{:02}.parquet", i),
+            50,
+        )]);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog.as_ref()).await.unwrap();
+    }
+
+    // Verify seed
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let seed_tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(seed_tasks.len(), 20, "seed should have 20 files");
+    println!("  Seed OK: 20 files in 20 manifests");
+
+    // Writer A: compact files 0-9 → merged_first_half
+    // Writer B: compact files 10-19 → merged_second_half
+    let files_a: Vec<DataFile> = (0..10)
+        .map(|i| test_data_file(&format!("s3://test/data/file_{:02}.parquet", i), 50))
+        .collect();
+    let files_b: Vec<DataFile> = (10..20)
+        .map(|i| test_data_file(&format!("s3://test/data/file_{:02}.parquet", i), 50))
+        .collect();
+
+    let barrier = Arc::new(Barrier::new(2));
+
+    let catalog_a = catalog.clone();
+    let ident_a = ident.clone();
+    let barrier_a = barrier.clone();
+    let handle_a = tokio::spawn(async move {
+        let table = catalog_a.load_table(&ident_a).await.unwrap();
+        barrier_a.wait().await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_data_files()
+            .delete_files(files_a)
+            .add_files(vec![test_data_file(
+                "s3://test/data/merged_first_half.parquet",
+                500,
+            )]);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog_a.as_ref()).await
+    });
+
+    let catalog_b = catalog.clone();
+    let ident_b = ident.clone();
+    let barrier_b = barrier.clone();
+    let handle_b = tokio::spawn(async move {
+        let table = catalog_b.load_table(&ident_b).await.unwrap();
+        barrier_b.wait().await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_data_files()
+            .delete_files(files_b)
+            .add_files(vec![test_data_file(
+                "s3://test/data/merged_second_half.parquet",
+                500,
+            )]);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog_b.as_ref()).await
+    });
+
+    let result_a = handle_a.await.unwrap();
+    let result_b = handle_b.await.unwrap();
+
+    assert!(result_a.is_ok(), "Writer A failed: {:?}", result_a.err());
+    assert!(result_b.is_ok(), "Writer B failed: {:?}", result_b.err());
+
+    // Verify: 2 merged files, 1000 rows
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_records: u64 = tasks.iter().map(|t| t.record_count.unwrap_or(0)).sum();
+
+    println!("  Final: {} files, {} records", tasks.len(), total_records);
+    assert_eq!(total_records, 1000, "expected 1000 rows, got {}", total_records);
+    assert_eq!(tasks.len(), 2, "expected 2 merged files");
+
+    println!("  PASS: many-manifest disjoint replace — cache invalidation correct");
+}
+
+// ─────────────────────────────────────────────────────────
+// Test 9: Sequential replace — no contention baseline
+//
+// Single writer, no contention. Regression guard for cache-tagging.
+// ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_sequential_replace_no_contention() {
+    let catalog = Arc::new(setup_catalog().await);
+    let _ = create_test_table(catalog.as_ref(), "test_seq", "no_contention").await;
+
+    let ident = iceberg::TableIdent::new(
+        NamespaceIdent::new("test_seq".to_string()),
+        "no_contention".to_string(),
+    );
+
+    // Seed 5 files
+    let _table = seed_table(catalog.as_ref(), "test_seq", "no_contention", 5).await;
+
+    let seed_files: Vec<DataFile> = (0..5)
+        .map(|i| test_data_file(&format!("s3://test/data/seed_{}.parquet", i), 100))
+        .collect();
+
+    // Single writer: replace all 5 → 1 merged
+    let table = catalog.load_table(&ident).await.unwrap();
+    let tx = Transaction::new(&table);
+    let action = tx
+        .replace_data_files()
+        .delete_files(seed_files)
+        .add_files(vec![test_data_file("s3://test/data/merged.parquet", 500)]);
+    let tx = action.apply(tx).unwrap();
+    let result = tx.commit(catalog.as_ref()).await;
+
+    assert!(result.is_ok(), "single writer should succeed: {:?}", result.err());
+
+    // Verify
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_records: u64 = tasks.iter().map(|t| t.record_count.unwrap_or(0)).sum();
+
+    assert_eq!(total_records, 500, "expected 500, got {}", total_records);
+    assert_eq!(tasks.len(), 1, "expected 1 merged file");
+
+    // Second replace on the merged file — cache doesn't interfere
+    let table = catalog.load_table(&ident).await.unwrap();
+    let tx = Transaction::new(&table);
+    let action = tx
+        .replace_data_files()
+        .delete_files(vec![test_data_file("s3://test/data/merged.parquet", 500)])
+        .add_files(vec![test_data_file("s3://test/data/remerged.parquet", 500)]);
+    let tx = action.apply(tx).unwrap();
+    let result = tx.commit(catalog.as_ref()).await;
+
+    assert!(result.is_ok(), "second replace should succeed: {:?}", result.err());
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    let scan = table.scan().build().unwrap();
+    let tasks: Vec<_> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_records: u64 = tasks.iter().map(|t| t.record_count.unwrap_or(0)).sum();
+
+    assert_eq!(total_records, 500);
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].data_file_path(), "s3://test/data/remerged.parquet");
+
+    println!("  PASS: sequential replace — no contention, cache doesn't interfere");
 }
 

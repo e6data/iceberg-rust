@@ -47,9 +47,11 @@ pub struct ReplaceDataFilesAction {
     validate_from_snapshot_id: Option<i64>,
     data_sequence_number: Option<i64>,
     added_delete_files: Vec<DataFile>,
-    /// Cached manifest result from the first commit attempt.
-    /// On retry, reuse this to skip re-reading all manifests from S3.
-    cached_manifests: Arc<Mutex<Option<Vec<ManifestFile>>>>,
+    /// Cached manifest result from the first commit attempt, tagged with
+    /// the snapshot_id it was built from. On retry, reuse only if the
+    /// current snapshot matches; otherwise discard and rebuild from the
+    /// new snapshot's manifest list.
+    cached_manifests: Arc<Mutex<Option<(Option<i64>, Vec<ManifestFile>)>>>,
     /// Caller-provided override for the new snapshot's id. Mirrors
     /// `FastAppendAction.with_snapshot_id`. Set via
     /// [`Self::with_snapshot_id`]; pair with
@@ -308,10 +310,13 @@ struct ReplaceOperation {
     data_files_to_delete: Vec<DataFile>,
     commit_uuid: Uuid,
     key_metadata: Option<Vec<u8>>,
-    /// Shared cache for manifest computation results. Populated on the first
-    /// commit attempt and reused on retries to avoid re-reading manifests
-    /// from S3.
-    cached_manifests: Arc<Mutex<Option<Vec<ManifestFile>>>>,
+    /// Shared cache for manifest computation results, tagged with the
+    /// snapshot_id they were built from. Populated on the first commit
+    /// attempt and reused on retries only if the snapshot hasn't changed
+    /// (i.e., no concurrent commit occurred). When a concurrent commit
+    /// advances the snapshot, the cache is invalidated and manifests are
+    /// rebuilt from the new snapshot's manifest list.
+    cached_manifests: Arc<Mutex<Option<(Option<i64>, Vec<ManifestFile>)>>>,
 }
 
 impl SnapshotProduceOperation for ReplaceOperation {
@@ -338,29 +343,40 @@ impl SnapshotProduceOperation for ReplaceOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // On retry, reuse the cached manifest result to avoid re-reading all
-        // manifests from S3. The manifest content hasn't changed between
-        // retries — only the snapshot ref may have advanced.
+        // On retry, reuse the cached manifest result ONLY if the base
+        // snapshot hasn't changed (no concurrent commit occurred). When a
+        // concurrent commit advances the snapshot, the manifest list is
+        // different — reusing stale cached manifests would silently drop
+        // the concurrent commit's new/rewritten manifests, causing data loss.
         //
-        // Rewritten manifests in the cache carry the OLD snapshot's ID in
-        // `added_snapshot_id`. The ManifestListWriter requires unassigned-
-        // sequence manifests to match the CURRENT snapshot ID. Fix up the
-        // IDs so the retry's ManifestListWriter accepts them.
+        // When the cache IS valid (same snapshot, e.g., retry due to a
+        // transient network error), rewritten manifests carry the OLD
+        // snapshot's ID in `added_snapshot_id`. Fix up the IDs so the
+        // retry's ManifestListWriter accepts them.
         {
             let cache = self.cached_manifests.lock().unwrap();
-            if let Some(ref cached) = *cache {
-                let current_snap_id = snapshot_produce.snapshot_id();
-                let fixed: Vec<ManifestFile> = cached
-                    .iter()
-                    .map(|mf| {
-                        let mut m = mf.clone();
-                        if m.sequence_number == crate::spec::UNASSIGNED_SEQUENCE_NUMBER {
-                            m.added_snapshot_id = current_snap_id;
-                        }
-                        m
-                    })
-                    .collect();
-                return Ok(fixed);
+            if let Some((cached_snapshot_id, ref cached)) = *cache {
+                let current_snapshot_id = snapshot_produce
+                    .table
+                    .metadata()
+                    .current_snapshot()
+                    .map(|s| s.snapshot_id());
+                if cached_snapshot_id == current_snapshot_id {
+                    let current_snap_id = snapshot_produce.snapshot_id();
+                    let fixed: Vec<ManifestFile> = cached
+                        .iter()
+                        .map(|mf| {
+                            let mut m = mf.clone();
+                            if m.sequence_number == crate::spec::UNASSIGNED_SEQUENCE_NUMBER {
+                                m.added_snapshot_id = current_snap_id;
+                            }
+                            m
+                        })
+                        .collect();
+                    return Ok(fixed);
+                }
+                // Cache is stale — snapshot changed due to a concurrent
+                // commit. Fall through to rebuild from the new snapshot.
             }
         }
 
@@ -566,10 +582,16 @@ impl SnapshotProduceOperation for ReplaceOperation {
             ));
         }
 
-        // Cache the result for future retries.
+        // Cache the result tagged with the current snapshot_id. On retry,
+        // the cache is only reused if the snapshot hasn't changed.
         {
+            let current_snapshot_id = snapshot_produce
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id());
             let mut cache = self.cached_manifests.lock().unwrap();
-            *cache = Some(result_manifests.clone());
+            *cache = Some((current_snapshot_id, result_manifests.clone()));
         }
 
         Ok(result_manifests)

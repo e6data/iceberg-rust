@@ -1886,6 +1886,65 @@ mod tests {
         );
     }
 
+    // Regression for the attribute_index wedge: a collapsed balanced-tree base has
+    // `node_level > 0` AND `prev_root_path == None`. The raw single read
+    // (`read_root_manifest`) returns the base's DIRECT entries — refs to INTERIOR
+    // nodes, not data manifests. `load_manifest_list` must therefore route such a
+    // base through `reconstruct_root` (which recurses to the leaves), not the raw
+    // read; otherwise the interior node leaks out as a data ManifestFile and the
+    // data-manifest reader misreads it (empty file_format). This asserts the two
+    // conditions the fix keys on and that reconstruct yields only real data leaves.
+    #[tokio::test]
+    async fn tree_base_has_no_prev_and_positive_node_level_reconstruct_flattens() {
+        use crate::io::FileIOBuilder;
+        let schema = test_schema();
+        let spec = test_partition_spec(&schema);
+        let partition_type = spec.partition_type(&schema).unwrap();
+        let template = test_metadata(&schema, &spec);
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let location = "memory:///tbl";
+
+        let n = 50usize; // fan-out 4 over 50 → multi-level interior tree
+        let entries: Vec<RootManifestEntry> = (0..n)
+            .map(|i| RootManifestEntry::Inline(test_inline_entry(&format!("memory:///tbl/data/f{i}.parquet"), 1)))
+            .collect();
+        let root_path = build_balanced_tree(&file_io, location, &template, &partition_type, uuid::Uuid::nil(), entries, 4)
+            .await
+            .unwrap();
+
+        // The collapsed tree base: node_level>0 AND no prev pointer — the exact combo
+        // that the buggy `else` branch mis-handled.
+        let bytes = file_io.new_input(&root_path).unwrap().read().await.unwrap();
+        let (base_meta, base_direct) = read_root_manifest(bytes).unwrap();
+        assert!(base_meta.node_level > 0, "tree base must have node_level>0");
+        assert!(base_meta.prev_root_path.is_none(), "a collapsed base has no prev pointer");
+
+        // Raw read surfaces INTERIOR-node refs (the leak): every direct entry is a ref
+        // whose target is itself a node (node_level>0), never a data manifest.
+        let mut saw_interior_ref = false;
+        for e in &base_direct {
+            if let RootManifestEntry::ManifestRef { manifest_file, .. } = e {
+                let cb = file_io.new_input(&manifest_file.manifest_path).unwrap().read().await.unwrap();
+                let (child_meta, _) = read_root_manifest(cb).unwrap();
+                if child_meta.node_level > 0 {
+                    saw_interior_ref = true;
+                }
+            }
+        }
+        assert!(saw_interior_ref, "raw read of a multi-level tree base must expose interior-node refs");
+
+        // The fix: reconstruct_root flattens to exactly the data leaves — no interior refs.
+        let (_, flat) = reconstruct_root(&file_io, &root_path).await.unwrap();
+        assert_eq!(flat.len(), n, "reconstruct must return every data leaf");
+        for e in &flat {
+            if let RootManifestEntry::ManifestRef { manifest_file, .. } = e {
+                let cb = file_io.new_input(&manifest_file.manifest_path).unwrap().read().await.unwrap();
+                let (child_meta, _) = read_root_manifest(cb).unwrap();
+                assert_eq!(child_meta.node_level, 0, "reconstruct must not surface interior nodes");
+            }
+        }
+    }
+
     #[test]
     fn round_trip_mixed_entries() {
         let schema = test_schema();

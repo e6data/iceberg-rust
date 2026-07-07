@@ -223,14 +223,22 @@ impl Snapshot {
         // scan trying to parse the Parquet as Avro. See
         // `crate::spec::table_metadata::E6_ACTUAL_FORMAT_VERSION_KEY`.
         if table_metadata.effective_format_version() == FormatVersion::V4 {
-            // Incremental (log-structured) root: if the head is a delta
-            // (`prev_root_path` set), walk the chain to reconstruct the full live
-            // set; otherwise it's a base/flat root and one read suffices. The head
-            // metadata (its `bucket_index_path`) is authoritative either way.
+            // Incremental (log-structured) root: reconstruct the full live set when
+            // the head is either a delta (`prev_root_path` set — walk the chain) OR a
+            // collapsed balanced-tree base (`node_level > 0` — its direct entries are
+            // interior *node* refs, not data manifests, so they must be recursed to
+            // the leaves). Only a plain flat base (no prev, node_level 0) can use the
+            // single head read. `reconstruct_root` handles all three uniformly.
+            // Missing the `node_level > 0` case surfaced interior tree nodes as data
+            // ManifestFiles; loading them with the data-manifest reader misreads the
+            // node's ref-rows (empty file_format) and wedges every subsequent commit
+            // — the attribute_index tables broke exactly this way once they grew past
+            // the LSM fan-out and collapsed to a tree. The head metadata (its
+            // `bucket_index_path`) is authoritative either way.
             let (rm_meta, entries) = {
                 let (head_meta, head_entries) =
                     crate::spec::root_manifest::read_root_manifest(manifest_list_content.clone())?;
-                if head_meta.prev_root_path.is_some() {
+                if head_meta.prev_root_path.is_some() || head_meta.node_level > 0 {
                     crate::spec::root_manifest::reconstruct_root(file_io, &self.manifest_list)
                         .await?
                 } else {

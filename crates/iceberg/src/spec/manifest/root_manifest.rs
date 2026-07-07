@@ -1565,7 +1565,7 @@ fn record_batch_to_inline_entries(
             })
             .unwrap_or_default();
 
-        let fformat: DataFileFormat = file_format_arr
+        let fformat_raw = file_format_arr
             .and_then(|a| {
                 if Array::is_null(a, i) {
                     None
@@ -1573,8 +1573,18 @@ fn record_batch_to_inline_entries(
                     Some(a.value(i))
                 }
             })
-            .unwrap_or("PARQUET")
-            .parse()?;
+            .unwrap_or("PARQUET");
+        let fformat: DataFileFormat = fformat_raw.parse().map_err(|e| {
+            let path = file_path_arr
+                .and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) })
+                .unwrap_or("<none>");
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "root inline entry {i}: bad file_format {fformat_raw:?} (path={path}): {e}"
+                ),
+            )
+        })?;
 
         let partition = parse_partition_json(
             partition_json_arr.and_then(|a| {

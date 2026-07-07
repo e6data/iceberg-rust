@@ -467,7 +467,16 @@ pub(super) fn record_batch_to_manifest_entries(
 
         let content_type: DataContentType = content_arr.value(i).try_into()?;
         let file_path = file_path_arr.value(i).to_string();
-        let file_format: DataFileFormat = file_format_arr.value(i).parse()?;
+        let file_format: DataFileFormat = file_format_arr.value(i).parse().map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "child manifest entry {i}/{n}: bad file_format {:?} (path={file_path}, content={}): {e}",
+                    file_format_arr.value(i),
+                    content_arr.value(i),
+                ),
+            )
+        })?;
         let record_count = record_count_arr.value(i) as u64;
         let file_size = file_size_arr.value(i) as u64;
 

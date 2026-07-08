@@ -101,6 +101,175 @@ fn file_max_ts(df: &DataFile, ts_field_id: i32) -> Option<i64> {
     }
 }
 
+/// Outcome of a graduation fold when something was actually moved to cold.
+pub(crate) struct FoldOutcome {
+    /// Path of the freshly-written bucket-index (existing cold leaves + newly
+    /// closed nodes/inline). The caller sets this as the new root's
+    /// `bucket_index_path`.
+    pub bucket_index_path: String,
+    pub nodes_moved: usize,
+    pub inline_leaves: usize,
+    pub cold_leaves_total: usize,
+}
+
+/// Fold the "closed" entries of a reconstructed live set (those whose max
+/// `ts_field_id` event time is below `cutoff_micros`) into the cold bucket-index,
+/// returning the entries that stay hot (`kept`) and — if anything was moved — a
+/// [`FoldOutcome`] with the updated bucket-index path.
+///
+/// This is the durable core of graduation: it reads any existing bucket-index at
+/// `carried_bucket_index_path`, relocates closed clean nodes by reference,
+/// materializes closed inline files into partition-tight cold leaves, and writes
+/// a new bucket-index — but it does NOT write a root. The caller folds this into
+/// its own root commit (a collapse, or a standalone base), so graduation is
+/// atomic with the root rewrite and cannot be orphaned by a concurrent append.
+/// Partition-spec-agnostic (keys purely on the time cutoff).
+///
+/// Returns `(kept, None)` when nothing is closed (caller keeps its carried
+/// pointer and its entries unchanged). `manifest_counter`/`commit_uuid` are
+/// threaded from the caller so cold-leaf manifests share the caller's namespace.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fold_closed_into_bucket_index(
+    table: &Table,
+    entries: Vec<RootManifestEntry>,
+    carried_bucket_index_path: Option<&str>,
+    cutoff_micros: i64,
+    ts_field_id: i32,
+    snapshot_id: i64,
+    commit_uuid: Uuid,
+    manifest_counter: &mut u64,
+) -> Result<(Vec<RootManifestEntry>, Option<FoldOutcome>)> {
+    // Existing cold leaves (graduated nodes get appended to these).
+    let mut cold_leaves: Vec<ManifestFile> = match carried_bucket_index_path {
+        Some(path) => {
+            let b = table.file_io().new_input(path)?.read().await?;
+            read_bucket_index(b)?.leaves().to_vec()
+        }
+        None => Vec::new(),
+    };
+
+    // Partition into: closed live nodes (→ cold by reference), closed inline
+    // files (→ materialize as cold leaves), and kept (stay hot).
+    let mut kept: Vec<RootManifestEntry> = Vec::new();
+    let mut graduated_nodes: Vec<ManifestFile> = Vec::new();
+    let mut closed_inline_files: Vec<DataFile> = Vec::new();
+
+    for entry in entries {
+        match entry {
+            RootManifestEntry::ManifestRef { manifest_file, mdv } => {
+                let manifest = manifest_file.load_manifest(table.file_io()).await?;
+                let files: Vec<DataFile> = manifest
+                    .entries()
+                    .iter()
+                    .filter(|e| e.is_alive())
+                    .map(|e| e.data_file().clone())
+                    .collect();
+                let closed = max_ts_of(&files, ts_field_id)
+                    .map(|mx| mx < cutoff_micros)
+                    .unwrap_or(false);
+                // Only graduate clean nodes; an MDV-carrying node has pending
+                // deletes and is left for the rebalance/compaction path.
+                if closed && mdv.is_none() {
+                    graduated_nodes.push(manifest_file);
+                } else {
+                    kept.push(RootManifestEntry::ManifestRef { manifest_file, mdv });
+                }
+            }
+            RootManifestEntry::Inline(me) => {
+                let closed = file_max_ts(&me.data_file, ts_field_id)
+                    .map(|mx| mx < cutoff_micros)
+                    .unwrap_or(false);
+                if closed {
+                    closed_inline_files.push(me.data_file.clone());
+                } else {
+                    kept.push(RootManifestEntry::Inline(me));
+                }
+            }
+        }
+    }
+
+    if graduated_nodes.is_empty() && closed_inline_files.is_empty() {
+        return Ok((kept, None));
+    }
+    let nodes_moved = graduated_nodes.len();
+
+    let schema = table.metadata().current_schema().clone();
+    let format_version = table.metadata().format_version();
+    let spec = table.metadata().default_partition_spec().clone();
+    let partition_type = spec.partition_type(&schema)?;
+    let next_seq_num = table.metadata().next_sequence_number();
+
+    // Materialize any closed inline files into new partition-tight cold leaves.
+    let mut inline_leaves = 0usize;
+    if !closed_inline_files.is_empty() {
+        let grad_entries: Vec<ManifestEntry> = closed_inline_files
+            .into_iter()
+            .map(|df| {
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Existing)
+                    .data_file(df)
+                    .build()
+            })
+            .collect();
+        let new_leaves = write_entries_clustered(
+            table,
+            &schema,
+            spec.as_ref(),
+            format_version,
+            snapshot_id,
+            commit_uuid,
+            manifest_counter,
+            false,
+            grad_entries,
+            true,
+        )
+        .await?;
+        inline_leaves = new_leaves.len();
+        cold_leaves.extend(new_leaves);
+    }
+    // Move graduated live nodes into cold by reference (immutable, no rewrite).
+    cold_leaves.extend(graduated_nodes);
+
+    let bucket_index_path = format!(
+        "{}/{}/bucket-index-{}-{}.parquet",
+        table.metadata().location(),
+        META_ROOT_PATH,
+        snapshot_id,
+        commit_uuid,
+    );
+    let bi_metadata = RootManifestMetadata {
+        schema: schema.clone(),
+        schema_id: table.metadata().current_schema_id(),
+        partition_spec: spec.clone(),
+        format_version: FormatVersion::V4,
+        snapshot_id,
+        sequence_number: next_seq_num,
+        parent_snapshot_id: table.metadata().current_snapshot_id(),
+        bucket_index_path: None,
+        prev_root_path: None,
+        chain_depth: 0,
+        node_level: 0,
+        removed_paths: Vec::new(),
+    };
+    let bi_bytes = write_bucket_index(&cold_leaves, &bi_metadata, &partition_type)?;
+    table
+        .file_io()
+        .new_output(&bucket_index_path)?
+        .write(bi_bytes.into())
+        .await?;
+
+    let cold_leaves_total = cold_leaves.len();
+    Ok((
+        kept,
+        Some(FoldOutcome {
+            bucket_index_path,
+            nodes_moved,
+            inline_leaves,
+            cold_leaves_total,
+        }),
+    ))
+}
+
 #[async_trait]
 impl TransactionAction for GraduateBucketsAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
@@ -122,128 +291,38 @@ impl TransactionAction for GraduateBucketsAction {
         let root_path = current_snapshot.manifest_list();
         let (rm_metadata, entries) = reconstruct_root(table.file_io(), root_path).await?;
 
-        // Existing cold leaves (graduated nodes get appended to these).
-        let mut cold_leaves: Vec<ManifestFile> = match &rm_metadata.bucket_index_path {
-            Some(path) => {
-                let b = table.file_io().new_input(path)?.read().await?;
-                read_bucket_index(b)?.leaves().to_vec()
-            }
-            None => Vec::new(),
-        };
-
-        // Partition root entries into: closed live nodes (→ cold by reference),
-        // closed inline files (→ materialize as cold leaves), and kept (live).
-        let mut kept: Vec<RootManifestEntry> = Vec::new();
-        let mut graduated_nodes: Vec<ManifestFile> = Vec::new();
-        let mut closed_inline_files: Vec<DataFile> = Vec::new();
-
-        for entry in entries {
-            match entry {
-                RootManifestEntry::ManifestRef { manifest_file, mdv } => {
-                    let manifest = manifest_file.load_manifest(table.file_io()).await?;
-                    let files: Vec<DataFile> = manifest
-                        .entries()
-                        .iter()
-                        .filter(|e| e.is_alive())
-                        .map(|e| e.data_file().clone())
-                        .collect();
-                    let closed = max_ts_of(&files, self.ts_field_id)
-                        .map(|mx| mx < self.cutoff_micros)
-                        .unwrap_or(false);
-                    // Only graduate clean nodes; an MDV-carrying node has pending
-                    // deletes and is left for the rebalance/compaction path.
-                    if closed && mdv.is_none() {
-                        graduated_nodes.push(manifest_file);
-                    } else {
-                        kept.push(RootManifestEntry::ManifestRef { manifest_file, mdv });
-                    }
-                }
-                RootManifestEntry::Inline(me) => {
-                    let closed = file_max_ts(&me.data_file, self.ts_field_id)
-                        .map(|mx| mx < self.cutoff_micros)
-                        .unwrap_or(false);
-                    if closed {
-                        closed_inline_files.push(me.data_file.clone());
-                    } else {
-                        kept.push(RootManifestEntry::Inline(me));
-                    }
-                }
-            }
-        }
-
-        if graduated_nodes.is_empty() && closed_inline_files.is_empty() {
-            return Ok(ActionCommit::new(vec![], vec![]));
-        }
-        let graduated_node_count = graduated_nodes.len();
-
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
-        let next_seq_num = table.metadata().next_sequence_number();
-        let schema = table.metadata().current_schema().clone();
-        let format_version = table.metadata().format_version();
         let commit_uuid = self.commit_uuid;
-        let spec = table.metadata().default_partition_spec().clone();
-        let partition_type = spec.partition_type(table.metadata().current_schema())?;
         let mut manifest_counter: u64 = 0;
 
-        // Materialize any closed inline files into new partition-tight cold leaves.
-        let mut inline_leaf_count = 0usize;
-        if !closed_inline_files.is_empty() {
-            let grad_entries: Vec<ManifestEntry> = closed_inline_files
-                .into_iter()
-                .map(|df| {
-                    ManifestEntry::builder()
-                        .status(ManifestStatus::Existing)
-                        .data_file(df)
-                        .build()
-                })
-                .collect();
-            let new_leaves = write_entries_clustered(
-                table,
-                &schema,
-                spec.as_ref(),
-                format_version,
-                snapshot_id,
-                commit_uuid,
-                &mut manifest_counter,
-                false,
-                grad_entries,
-                true,
-            )
-            .await?;
-            inline_leaf_count = new_leaves.len();
-            cold_leaves.extend(new_leaves);
-        }
-        // Move graduated live nodes into cold by reference (immutable, no rewrite).
-        cold_leaves.extend(graduated_nodes);
-
-        let bucket_index_path = format!(
-            "{}/{}/bucket-index-{}-{}.parquet",
-            table.metadata().location(),
-            META_ROOT_PATH,
+        // Fold closed entries into the cold bucket-index (shared with the
+        // commit_v4 collapse path). Returns the entries that stay hot plus the
+        // updated bucket-index; None ⇒ nothing closed this pass.
+        let (kept, fold) = fold_closed_into_bucket_index(
+            table,
+            entries,
+            rm_metadata.bucket_index_path.as_deref(),
+            self.cutoff_micros,
+            self.ts_field_id,
             snapshot_id,
             commit_uuid,
-        );
-        let bi_metadata = RootManifestMetadata {
-            schema: schema.clone(),
-            schema_id: table.metadata().current_schema_id(),
-            partition_spec: spec.clone(),
-            format_version: FormatVersion::V4,
-            snapshot_id,
-            sequence_number: next_seq_num,
-            parent_snapshot_id: table.metadata().current_snapshot_id(),
-            bucket_index_path: None,
-            prev_root_path: None,
-            chain_depth: 0,
-            node_level: 0,
-            removed_paths: Vec::new(),
+            &mut manifest_counter,
+        )
+        .await?;
+        let fold = match fold {
+            Some(f) => f,
+            None => return Ok(ActionCommit::new(vec![], vec![])),
         };
-        let bi_bytes = write_bucket_index(&cold_leaves, &bi_metadata, &partition_type)?;
-        table
-            .file_io()
-            .new_output(&bucket_index_path)?
-            .write(bi_bytes.into())
-            .await?;
 
+        let schema = table.metadata().current_schema().clone();
+        let next_seq_num = table.metadata().next_sequence_number();
+        let spec = table.metadata().default_partition_spec().clone();
+        let partition_type = spec.partition_type(&schema)?;
+
+        // Standalone base root (this action resets the chain to a base). NOTE:
+        // the durable path is commit_v4's collapse, which folds graduation
+        // atomically with the chain rewrite; this standalone action is retained
+        // for manual / maintenance-window use where no concurrent appends race it.
         let new_rm_metadata = RootManifestMetadata {
             schema: schema.clone(),
             schema_id: table.metadata().current_schema_id(),
@@ -252,7 +331,7 @@ impl TransactionAction for GraduateBucketsAction {
             snapshot_id,
             sequence_number: next_seq_num,
             parent_snapshot_id: table.metadata().current_snapshot_id(),
-            bucket_index_path: Some(bucket_index_path.clone()),
+            bucket_index_path: Some(fold.bucket_index_path.clone()),
             prev_root_path: None,
             chain_depth: 0,
             node_level: 0,
@@ -277,15 +356,15 @@ impl TransactionAction for GraduateBucketsAction {
             additional_properties: HashMap::from([
                 (
                     "graduate-nodes-moved".to_string(),
-                    graduated_node_count.to_string(),
+                    fold.nodes_moved.to_string(),
                 ),
                 (
                     "graduate-inline-leaves".to_string(),
-                    inline_leaf_count.to_string(),
+                    fold.inline_leaves.to_string(),
                 ),
                 (
                     "graduate-cold-leaves-total".to_string(),
-                    cold_leaves.len().to_string(),
+                    fold.cold_leaves_total.to_string(),
                 ),
             ]),
         };
@@ -326,7 +405,7 @@ impl TransactionAction for GraduateBucketsAction {
         ];
 
         Ok(ActionCommit::new(updates, requirements)
-            .with_manifest_paths(vec![new_root_path, bucket_index_path]))
+            .with_manifest_paths(vec![new_root_path, fold.bucket_index_path]))
     }
 }
 

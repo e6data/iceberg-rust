@@ -1063,7 +1063,7 @@ impl<'a> SnapshotProducer<'a> {
         // pointer MUST be carried forward: the hot commit only rewrites the live
         // tier, so dropping it here would orphan the cold bucket-index (tiered
         // layout). Tuple: (entries, carried bucket_index_path).
-        let (mut entries, carried_bucket_index_path, current_chain_depth): (
+        let (mut entries, mut carried_bucket_index_path, current_chain_depth): (
             Vec<RootManifestEntry>,
             Option<String>,
             u32,
@@ -1325,6 +1325,80 @@ impl<'a> SnapshotProducer<'a> {
                 file_sequence_number: Some(next_seq_num),
                 data_file: df,
             }));
+        }
+
+        // Tiered graduation, folded into the collapse (durable path). On a
+        // base/tree rewrite (`!do_delta`) of a tiered table, relocate entries
+        // whose newest event time is below `now − tiered-metadata.bucket-window-secs`
+        // into the cold bucket-index — ATOMICALLY with this root rewrite. Doing it
+        // here rather than in a standalone periodic action (which wrote a competing
+        // base root) is what makes graduation survive laminar's continuous append
+        // stream: a concurrent append commits against the base this same commit
+        // produces, so it can never orphan the cold pointer. Skipped on deltas
+        // (`do_delta`) to keep hot commits O(1). Cutoff/field come from table
+        // properties (no laminar→fork plumbing).
+        if !do_delta {
+            let is_tiered = self
+                .table
+                .metadata()
+                .properties()
+                .get("tiered-metadata.enabled")
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let window_secs = self
+                .table
+                .metadata()
+                .properties()
+                .get("tiered-metadata.bucket-window-secs")
+                .and_then(|v| v.parse::<u64>().ok());
+            if let (true, Some(window_secs)) = (is_tiered, window_secs) {
+                let ts_field_name = self
+                    .table
+                    .metadata()
+                    .properties()
+                    .get("tiered-metadata.timestamp-field")
+                    .map(|s| s.as_str())
+                    .unwrap_or("timestamp");
+                match self
+                    .table
+                    .metadata()
+                    .current_schema()
+                    .field_by_name(ts_field_name)
+                    .map(|f| f.id)
+                {
+                    Some(ts_field_id) => {
+                        let cutoff_micros = chrono::Utc::now().timestamp_micros()
+                            - (window_secs as i64) * 1_000_000;
+                        // Distinct commit_uuid so the fold's cold-leaf manifests
+                        // never collide with this commit's own child manifests
+                        // (which are named from `self.commit_uuid`).
+                        let fold_uuid = Uuid::now_v7();
+                        let mut fold_counter: u64 = 0;
+                        let (kept, fold) =
+                            crate::transaction::graduate_buckets::fold_closed_into_bucket_index(
+                                &self.table,
+                                std::mem::take(&mut entries),
+                                carried_bucket_index_path.as_deref(),
+                                cutoff_micros,
+                                ts_field_id,
+                                self.snapshot_id,
+                                fold_uuid,
+                                &mut fold_counter,
+                            )
+                            .await?;
+                        entries = kept;
+                        if let Some(f) = fold {
+                            carried_bucket_index_path = Some(f.bucket_index_path);
+                        }
+                    }
+                    None => {
+                        log::warn!(
+                            "tiered graduation skipped: timestamp field '{}' not found in schema",
+                            ts_field_name
+                        );
+                    }
+                }
+            }
         }
 
         // Adaptive inline→child flush: when inline count exceeds threshold,
@@ -2028,6 +2102,108 @@ mod test_v4_commit {
             head_entries.len() < N,
             "tree root holds child-node refs ({}), not the full {N} entries",
             head_entries.len()
+        );
+    }
+
+    fn tiered_table_creation(name: &str, window_secs: u64) -> TableCreation {
+        TableCreation::builder()
+            .name(name.to_string())
+            .schema(test_schema())
+            .format_version(FormatVersion::V4)
+            .properties(HashMap::from([
+                ("root-manifest.incremental".to_string(), "true".to_string()),
+                ("tiered-metadata.enabled".to_string(), "true".to_string()),
+                (
+                    "tiered-metadata.bucket-window-secs".to_string(),
+                    window_secs.to_string(),
+                ),
+                // Reuse the "id" field (id=1, Long) as the event-time field.
+                (
+                    "tiered-metadata.timestamp-field".to_string(),
+                    "id".to_string(),
+                ),
+            ]))
+            .build()
+    }
+
+    /// A data file carrying a max event-time (upper-bound on field 1 = "id").
+    fn ts_data_file(path: &str, ts: i64) -> DataFile {
+        let mut df = test_data_file(path);
+        df.upper_bounds = HashMap::from([(1, crate::spec::Datum::long(ts))]);
+        df
+    }
+
+    /// Regression for the graduate-durability bug. The old standalone graduate
+    /// wrote a competing base and got orphaned by the next 15s append
+    /// (`bucket_index_path` landed None on the live root, no bucket-index
+    /// persisted). Folding graduation into the collapse must (1) LINK a
+    /// bucket-index on the collapsed base, and (2) have that pointer SURVIVE the
+    /// next append — which is exactly what failed before.
+    #[tokio::test]
+    async fn test_v4_collapse_graduates_and_carries_bucket_index_forward() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_grad_collapse".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        // window 3600s ⇒ cutoff ≈ now (~1.78e15 µs); ts=1000 is far below ⇒ closed;
+        // ts=i64::MAX is far above ⇒ stays hot.
+        let mut table = catalog
+            .create_table(&ns, tiered_table_creation("v4grad", 3600))
+            .await
+            .unwrap();
+
+        // 66 commits of OLD data forces a collapse at the depth cap (MAX_CHAIN=64),
+        // which now graduates the closed set into a bucket-index atomically with
+        // the base rewrite.
+        const N: usize = 66;
+        for i in 0..N {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![ts_data_file(
+                    &format!("s3://bucket/data/old{i}.parquet"),
+                    1000,
+                )])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+
+        // (1) The collapsed base LINKS a bucket-index (the bug: it was None).
+        let (meta, _) = read_head_root(&table).await;
+        assert_eq!(meta.chain_depth, 0, "chain collapsed");
+        assert!(
+            meta.bucket_index_path.is_some(),
+            "collapse must link a bucket-index (graduation folded in)"
+        );
+        // Graduated cold data is still fully visible (flattened on read).
+        assert_eq!(
+            visible_paths(&table).await.len(),
+            N,
+            "all graduated files visible post-collapse"
+        );
+
+        // (2) The pointer SURVIVES the next append — the fix. One O(1) delta with
+        // a fresh (hot) file; bucket_index_path must still be carried forward.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(vec![ts_data_file("s3://bucket/data/new.parquet", i64::MAX)])
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        let (meta2, _) = read_head_root(&table).await;
+        assert!(
+            meta2.bucket_index_path.is_some(),
+            "bucket_index_path must survive the next append (carry-forward); \
+             the standalone graduate was orphaned exactly here"
+        );
+        assert_eq!(
+            visible_paths(&table).await.len(),
+            N + 1,
+            "graduated cold + new hot all visible"
         );
     }
 

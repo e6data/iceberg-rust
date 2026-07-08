@@ -47,7 +47,8 @@ use crate::spec::root_manifest::{
 };
 use crate::spec::{
     DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus, Operation,
-    PrimitiveLiteral, Snapshot, SnapshotReference, SnapshotRetention, Summary, MAIN_BRANCH,
+    PartitionSpec, PrimitiveLiteral, Snapshot, SnapshotReference, SnapshotRetention, Summary,
+    Transform, MAIN_BRANCH,
 };
 use crate::table::Table;
 use crate::transaction::action::TransactionAction;
@@ -101,6 +102,52 @@ fn file_max_ts(df: &DataFile, ts_field_id: i32) -> Option<i64> {
     }
 }
 
+fn le_i32(b: &[u8]) -> Option<i64> {
+    (b.len() >= 4).then(|| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
+}
+fn le_i64(b: &[u8]) -> Option<i64> {
+    (b.len() >= 8).then(|| i64::from_le_bytes(b[..8].try_into().unwrap()))
+}
+
+/// Exclusive upper bound (micros) of event time covered by a partition
+/// upper-bound value (Iceberg little-endian single-value encoding), for the
+/// contiguous, monotonic time transforms. `None` for transforms whose bucket
+/// doesn't map to a simple time range (month/year variable width, bucket,
+/// truncate, …) — the caller then falls back to loading the manifest. Pure.
+fn transform_upper_micros(transform: &Transform, bytes: &[u8]) -> Option<i64> {
+    const HOUR_US: i64 = 3_600 * 1_000_000;
+    const DAY_US: i64 = 86_400 * 1_000_000;
+    match transform {
+        // hour/day: value is the bucket ordinal from the epoch; the newest
+        // possible event is the END of that bucket (exclusive).
+        Transform::Hour => Some((le_i32(bytes)? + 1) * HOUR_US),
+        Transform::Day => Some((le_i32(bytes)? + 1) * DAY_US),
+        // identity on a timestamp column: the bound IS the max event time.
+        Transform::Identity => le_i64(bytes),
+        _ => None,
+    }
+}
+
+/// Newest event time (micros, exclusive upper bound) a manifest can hold,
+/// derived from its PARTITION SUMMARY for the `ts_field_id`-derived partition
+/// field — WITHOUT loading the manifest. `None` when the timestamp isn't
+/// partitioned by a supported time transform (caller falls back to the manifest).
+/// This is what keeps graduation's classification O(refs) cheap reads instead of
+/// O(refs) full manifest loads. Pure.
+fn ref_max_event_micros(mf: &ManifestFile, spec: &PartitionSpec, ts_field_id: i32) -> Option<i64> {
+    let parts = mf.partitions.as_ref()?;
+    for (idx, pf) in spec.fields().iter().enumerate() {
+        if pf.source_id != ts_field_id {
+            continue;
+        }
+        let ub = parts.get(idx)?.upper_bound.as_ref()?;
+        if let Some(m) = transform_upper_micros(&pf.transform, ub) {
+            return Some(m);
+        }
+    }
+    None
+}
+
 /// Outcome of a graduation fold when something was actually moved to cold.
 pub(crate) struct FoldOutcome {
     /// Path of the freshly-written bucket-index (existing cold leaves + newly
@@ -135,10 +182,17 @@ pub(crate) async fn fold_closed_into_bucket_index(
     carried_bucket_index_path: Option<&str>,
     cutoff_micros: i64,
     ts_field_id: i32,
+    max_graduate: Option<usize>,
     snapshot_id: i64,
     commit_uuid: Uuid,
     manifest_counter: &mut u64,
 ) -> Result<(Vec<RootManifestEntry>, Option<FoldOutcome>)> {
+    let schema = table.metadata().current_schema().clone();
+    let format_version = table.metadata().format_version();
+    let spec = table.metadata().default_partition_spec().clone();
+    let partition_type = spec.partition_type(&schema)?;
+    let next_seq_num = table.metadata().next_sequence_number();
+
     // Existing cold leaves (graduated nodes get appended to these).
     let mut cold_leaves: Vec<ManifestFile> = match carried_bucket_index_path {
         Some(path) => {
@@ -149,30 +203,41 @@ pub(crate) async fn fold_closed_into_bucket_index(
     };
 
     // Partition into: closed live nodes (→ cold by reference), closed inline
-    // files (→ materialize as cold leaves), and kept (stay hot).
+    // files (→ materialize as cold leaves), and kept (stay hot). `closed_refs`
+    // carries each node's newest event time so we can graduate the COLDEST
+    // first when the per-collapse cap trims the batch.
     let mut kept: Vec<RootManifestEntry> = Vec::new();
-    let mut graduated_nodes: Vec<ManifestFile> = Vec::new();
+    let mut closed_refs: Vec<(ManifestFile, i64)> = Vec::new();
     let mut closed_inline_files: Vec<DataFile> = Vec::new();
 
     for entry in entries {
         match entry {
             RootManifestEntry::ManifestRef { manifest_file, mdv } => {
-                let manifest = manifest_file.load_manifest(table.file_io()).await?;
-                let files: Vec<DataFile> = manifest
-                    .entries()
-                    .iter()
-                    .filter(|e| e.is_alive())
-                    .map(|e| e.data_file().clone())
-                    .collect();
-                let closed = max_ts_of(&files, ts_field_id)
-                    .map(|mx| mx < cutoff_micros)
-                    .unwrap_or(false);
                 // Only graduate clean nodes; an MDV-carrying node has pending
                 // deletes and is left for the rebalance/compaction path.
-                if closed && mdv.is_none() {
-                    graduated_nodes.push(manifest_file);
-                } else {
+                if mdv.is_some() {
                     kept.push(RootManifestEntry::ManifestRef { manifest_file, mdv });
+                    continue;
+                }
+                // Fast path: newest event time straight from the partition
+                // summary (no manifest read). Fall back to loading the manifest
+                // only when the ts field isn't partitioned by a time transform.
+                let max_micros = match ref_max_event_micros(&manifest_file, &spec, ts_field_id) {
+                    Some(m) => Some(m),
+                    None => {
+                        let manifest = manifest_file.load_manifest(table.file_io()).await?;
+                        let files: Vec<DataFile> = manifest
+                            .entries()
+                            .iter()
+                            .filter(|e| e.is_alive())
+                            .map(|e| e.data_file().clone())
+                            .collect();
+                        max_ts_of(&files, ts_field_id)
+                    }
+                };
+                match max_micros {
+                    Some(mx) if mx < cutoff_micros => closed_refs.push((manifest_file, mx)),
+                    _ => kept.push(RootManifestEntry::ManifestRef { manifest_file, mdv }),
                 }
             }
             RootManifestEntry::Inline(me) => {
@@ -188,16 +253,27 @@ pub(crate) async fn fold_closed_into_bucket_index(
         }
     }
 
+    // Bound the graduation per collapse. On a long-history table the first
+    // graduation can otherwise move most of the table in one commit; cap it and
+    // graduate the COLDEST refs first — the rest stay hot and graduate on later
+    // collapses (eventually consistent, bounded per-commit work).
+    if let Some(cap) = max_graduate {
+        if closed_refs.len() > cap {
+            closed_refs.sort_by_key(|(_, mx)| *mx);
+            for (mf, _) in closed_refs.split_off(cap) {
+                kept.push(RootManifestEntry::ManifestRef {
+                    manifest_file: mf,
+                    mdv: None,
+                });
+            }
+        }
+    }
+    let graduated_nodes: Vec<ManifestFile> = closed_refs.into_iter().map(|(mf, _)| mf).collect();
+
     if graduated_nodes.is_empty() && closed_inline_files.is_empty() {
         return Ok((kept, None));
     }
     let nodes_moved = graduated_nodes.len();
-
-    let schema = table.metadata().current_schema().clone();
-    let format_version = table.metadata().format_version();
-    let spec = table.metadata().default_partition_spec().clone();
-    let partition_type = spec.partition_type(&schema)?;
-    let next_seq_num = table.metadata().next_sequence_number();
 
     // Materialize any closed inline files into new partition-tight cold leaves.
     let mut inline_leaves = 0usize;
@@ -304,6 +380,7 @@ impl TransactionAction for GraduateBucketsAction {
             rm_metadata.bucket_index_path.as_deref(),
             self.cutoff_micros,
             self.ts_field_id,
+            None, // manual/maintenance use: no per-collapse cap
             snapshot_id,
             commit_uuid,
             &mut manifest_counter,
@@ -451,5 +528,34 @@ mod tests {
     fn file_max_ts_reads_field() {
         assert_eq!(file_max_ts(&df("a", Some((5, 42))), 5), Some(42));
         assert_eq!(file_max_ts(&df("a", Some((5, 42))), 9), None);
+    }
+
+    #[test]
+    fn transform_upper_micros_decodes_time_buckets() {
+        const H: i64 = 3_600 * 1_000_000;
+        const D: i64 = 86_400 * 1_000_000;
+        // hour ordinal 10 → exclusive upper = END of hour 10 = hour 11 start.
+        assert_eq!(
+            transform_upper_micros(&Transform::Hour, &10i32.to_le_bytes()),
+            Some(11 * H)
+        );
+        // day ordinal 3 → end of day 3 = day 4 start.
+        assert_eq!(
+            transform_upper_micros(&Transform::Day, &3i32.to_le_bytes()),
+            Some(4 * D)
+        );
+        // identity on a timestamp column: bound IS the max event time (micros).
+        assert_eq!(
+            transform_upper_micros(&Transform::Identity, &1_700_000_000_000_000i64.to_le_bytes()),
+            Some(1_700_000_000_000_000)
+        );
+        // variable-width / non-time transforms fall back (None → load manifest).
+        assert_eq!(
+            transform_upper_micros(&Transform::Month, &10i32.to_le_bytes()),
+            None
+        );
+        // truncated/garbage bytes → None (safe fallback), never a bogus bound.
+        assert_eq!(transform_upper_micros(&Transform::Hour, &[1u8, 2]), None);
+        assert_eq!(transform_upper_micros(&Transform::Identity, &[1u8, 2, 3, 4]), None);
     }
 }

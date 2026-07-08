@@ -1369,6 +1369,18 @@ impl<'a> SnapshotProducer<'a> {
                     Some(ts_field_id) => {
                         let cutoff_micros = chrono::Utc::now().timestamp_micros()
                             - (window_secs as i64) * 1_000_000;
+                        // Bound how many refs graduate in one collapse so a
+                        // long-history table can't move most of itself in a
+                        // single commit (which blew the 30s commit timeout).
+                        // Classification is cheap (partition summary), but this
+                        // also bounds the bucket-index rewrite + cold-leaf churn.
+                        let max_graduate = self
+                            .table
+                            .metadata()
+                            .properties()
+                            .get("tiered-metadata.max-graduate-refs-per-collapse")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(16);
                         // Distinct commit_uuid so the fold's cold-leaf manifests
                         // never collide with this commit's own child manifests
                         // (which are named from `self.commit_uuid`).
@@ -1381,6 +1393,7 @@ impl<'a> SnapshotProducer<'a> {
                                 carried_bucket_index_path.as_deref(),
                                 cutoff_micros,
                                 ts_field_id,
+                                Some(max_graduate),
                                 self.snapshot_id,
                                 fold_uuid,
                                 &mut fold_counter,

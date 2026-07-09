@@ -75,6 +75,43 @@ fn partition_grouping_key(partition: &Struct, positions: &[usize]) -> String {
         .join("|")
 }
 
+/// Resolve which partition field positions form the manifest grouping key, given
+/// the ordered partition field names and the `write.manifest.grouping-fields`
+/// property value.
+///
+/// - **Explicit** (`"timestamp_hour"` or `"timestamp_hour,tenant"`) → those fields'
+///   positions (names not in the spec are skipped).
+/// - **Unset / empty / no name matched** → the **smart default**: `timestamp_hour`'s
+///   position if the spec has that field (the useful time-scoped key), otherwise
+///   `[0]` (the original first-field behavior for non-time-partitioned tables).
+///
+/// So on a time-partitioned, `partition-scoped` table the grouping becomes
+/// time-tight with zero configuration; the property is only needed to override.
+fn resolve_grouping_positions(field_names: &[&str], grouping_fields: Option<&str>) -> Vec<usize> {
+    let idx_of = |name: &str| field_names.iter().position(|&n| n == name);
+    let default = || {
+        idx_of("timestamp_hour")
+            .map(|p| vec![p])
+            .unwrap_or_else(|| vec![0])
+    };
+    match grouping_fields {
+        Some(list) if !list.trim().is_empty() => {
+            let positions: Vec<usize> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(idx_of)
+                .collect();
+            if positions.is_empty() {
+                default()
+            } else {
+                positions
+            }
+        }
+        _ => default(),
+    }
+}
+
 /// A trait that defines how different table operations produce new snapshots.
 ///
 /// `SnapshotProduceOperation` is used by [`SnapshotProducer`] to customize snapshot creation
@@ -515,14 +552,14 @@ impl<'a> SnapshotProducer<'a> {
     /// manifest per distinct value of the grouping key, producing tight partition
     /// summaries the manifest evaluator can skip whole manifests by.
     ///
-    /// The grouping key defaults to the **first** partition field (index 0), but is
-    /// configurable via `write.manifest.grouping-fields` — a comma-separated list of
-    /// partition field NAMES to project the key onto. This matters when the leading
-    /// field is a constant (e.g. `signallake_tenant`, cardinality 1 on a dedicated
-    /// stack): the default then lumps every file into one wide manifest, whereas
-    /// `write.manifest.grouping-fields=timestamp_hour` yields ~1 tight, time-scoped
-    /// manifest per commit regardless of tenant count. Only low-/bounded-cardinality
-    /// fields belong here; high-cardinality fields still prune at the file level.
+    /// The grouping key defaults (smart) to `timestamp_hour` when the table has that
+    /// partition field, else the first field (index 0); it is overridable via
+    /// `write.manifest.grouping-fields` — a comma-separated list of partition field
+    /// NAMES (see `resolve_grouping_positions`). The `timestamp_hour` default yields
+    /// ~1 tight, time-scoped manifest per commit regardless of tenant count, and
+    /// avoids the no-op that a constant leading field (e.g. `signallake_tenant`,
+    /// cardinality 1) causes. Only low-/bounded-cardinality fields belong in the key;
+    /// high-cardinality fields still prune at the file level.
     ///
     /// Without `partition-scoped` (default), all files go into a single manifest.
     async fn write_added_manifests(&mut self) -> Result<Vec<ManifestFile>> {
@@ -548,32 +585,19 @@ impl<'a> SnapshotProducer<'a> {
             return Ok(vec![manifest]);
         }
 
-        // Resolve which partition field positions form the grouping key. Names in
-        // `write.manifest.grouping-fields` map to positions in the default partition
-        // spec; unset (or none matched) → `[0]`, the original first-field behavior.
+        // Resolve which partition field positions form the grouping key: explicit
+        // `write.manifest.grouping-fields` names, else the smart default
+        // (timestamp_hour if present, else fields[0]). See resolve_grouping_positions.
         let grouping_positions: Vec<usize> = {
             let spec = self.table.metadata().default_partition_spec();
-            match self
+            let names: Vec<&str> = spec.fields().iter().map(|f| f.name.as_str()).collect();
+            let prop = self
                 .table
                 .metadata()
                 .properties()
                 .get("write.manifest.grouping-fields")
-            {
-                Some(list) if !list.trim().is_empty() => {
-                    let positions: Vec<usize> = list
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .filter_map(|name| spec.fields().iter().position(|f| f.name == name))
-                        .collect();
-                    if positions.is_empty() {
-                        vec![0]
-                    } else {
-                        positions
-                    }
-                }
-                _ => vec![0],
-            }
+                .map(|s| s.as_str());
+            resolve_grouping_positions(&names, prop)
         };
 
         // Group files by the projected grouping key
@@ -1811,7 +1835,7 @@ mod test_v4_commit {
         DataContentType, DataFile, DataFileFormat, FormatVersion, NestedField, PrimitiveType,
         Schema, Struct, Type,
     };
-    use super::partition_grouping_key;
+    use super::{partition_grouping_key, resolve_grouping_positions};
     use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
     use futures::TryStreamExt;
@@ -1892,6 +1916,26 @@ mod test_v4_commit {
         // Empty positions / empty partition → sentinel (single group).
         assert_eq!(partition_grouping_key(&a, &[]), "__empty__");
         assert_eq!(partition_grouping_key(&Struct::empty(), &[0]), "__empty__");
+    }
+
+    #[test]
+    fn resolve_grouping_positions_smart_default_and_override() {
+        let names = ["signallake_tenant", "tenant", "timestamp_hour"];
+        // Unset / empty → smart default = timestamp_hour (pos 2), NOT fields[0].
+        assert_eq!(resolve_grouping_positions(&names, None), vec![2]);
+        assert_eq!(resolve_grouping_positions(&names, Some("  ")), vec![2]);
+        // Explicit single + multi-field override.
+        assert_eq!(resolve_grouping_positions(&names, Some("timestamp_hour")), vec![2]);
+        assert_eq!(
+            resolve_grouping_positions(&names, Some("tenant, timestamp_hour")),
+            vec![1, 2]
+        );
+        // Unknown name → skipped → falls back to smart default.
+        assert_eq!(resolve_grouping_positions(&names, Some("nope")), vec![2]);
+        // No timestamp_hour in the spec → default is fields[0]; explicit still works.
+        let flat = ["region", "shard"];
+        assert_eq!(resolve_grouping_positions(&flat, None), vec![0]);
+        assert_eq!(resolve_grouping_positions(&flat, Some("shard")), vec![1]);
     }
 
     #[tokio::test]

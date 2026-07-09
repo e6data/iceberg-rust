@@ -1985,6 +1985,27 @@ mod test_v4_commit {
         tasks.iter().map(|t| t.data_file_path.clone()).collect()
     }
 
+    /// Alive data-file paths that live in the COLD bucket-index (not the hot
+    /// root refs). Used to target cold-tier compaction precisely, robust to the
+    /// per-collapse graduation cap (only some files land cold).
+    async fn cold_paths(table: &crate::table::Table) -> HashSet<String> {
+        let (meta, _) = read_head_root(table).await;
+        let mut out = HashSet::new();
+        if let Some(bp) = &meta.bucket_index_path {
+            let bytes = table.file_io().new_input(bp).unwrap().read().await.unwrap();
+            let bi = crate::spec::bucket_index::read_bucket_index(bytes).unwrap();
+            for leaf in bi.leaves() {
+                let manifest = leaf.load_manifest(table.file_io()).await.unwrap();
+                for e in manifest.entries() {
+                    if e.is_alive() {
+                        out.insert(e.data_file().file_path.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn incremental_table_creation(name: &str) -> TableCreation {
         TableCreation::builder()
             .name(name.to_string())
@@ -2217,6 +2238,84 @@ mod test_v4_commit {
             visible_paths(&table).await.len(),
             N + 1,
             "graduated cold + new hot all visible"
+        );
+    }
+
+    /// e2e for cold-file compaction: after graduation builds a bucket-index of
+    /// many small cold files, `compact_cold_tier` must swap them for the
+    /// caller-merged files IN THE COLD TIER — every merged file visible, every
+    /// small file gone (no resurrection, no loss), the bucket-index still linked.
+    /// This locks the CAS-safe cold swap that tessellate's cold-compaction driver
+    /// drives (tessellate does the parquet merge; this action does the metadata).
+    #[tokio::test]
+    async fn test_v4_compact_cold_tier_swaps_small_for_merged() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_cold_compact".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let mut table = catalog
+            .create_table(&ns, tiered_table_creation("v4coldcompact", 3600))
+            .await
+            .unwrap();
+
+        // Graduate 66 small OLD files into the cold bucket-index (collapse at the
+        // MAX_CHAIN cap folds graduation in).
+        const N: usize = 66;
+        let small: Vec<String> = (0..N)
+            .map(|i| format!("s3://bucket/data/small{i}.parquet"))
+            .collect();
+        for p in &small {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![ts_data_file(p, 1000)])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+        let (meta, _) = read_head_root(&table).await;
+        assert!(
+            meta.bucket_index_path.is_some(),
+            "graduation built a cold bucket-index"
+        );
+        let before = visible_paths(&table).await;
+        assert_eq!(before.len(), N, "all 66 small files visible (hot + cold)");
+        let cold = cold_paths(&table).await;
+        assert!(!cold.is_empty(), "some small files graduated to cold");
+        assert!(cold.iter().all(|c| small.contains(c)), "cold ⊆ the small set");
+
+        // Cold-compact: the caller (tessellate) merged the cold small files into
+        // ONE big file and hands us {removed cold paths, pre-written merged file}.
+        let merged_path = "s3://bucket/data/compacted-0.parquet";
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .compact_cold_tier()
+            .remove_files(cold.iter().cloned())
+            .add_files(vec![ts_data_file(merged_path, 1000)])
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        // The swap landed in the cold tier: bucket-index still linked; every cold
+        // small file gone (no resurrection), the merged file present (no loss),
+        // and the HOT files untouched.
+        let (meta2, _) = read_head_root(&table).await;
+        assert!(
+            meta2.bucket_index_path.is_some(),
+            "bucket-index still linked after cold compaction"
+        );
+        let after = visible_paths(&table).await;
+        assert!(after.contains(merged_path), "merged file visible");
+        assert!(
+            cold.iter().all(|c| !after.contains(c)),
+            "every compacted cold small file removed (no resurrection)"
+        );
+        let hot: HashSet<String> = before.difference(&cold).cloned().collect();
+        let mut want = hot;
+        want.insert(merged_path.to_string());
+        assert_eq!(
+            after, want,
+            "cold swapped for the merged file; hot files untouched"
         );
     }
 

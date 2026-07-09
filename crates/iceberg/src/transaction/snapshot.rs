@@ -53,17 +53,26 @@ pub fn generate_unique_snapshot_id(table: &Table) -> i64 {
 
 const META_ROOT_PATH: &str = "metadata";
 
-/// Extract a string key from the first partition field value for grouping.
-/// Returns "__null__" for null first fields or "__empty__" for unpartitioned.
-fn first_partition_value_key(partition: &Struct) -> String {
+/// Extract a grouping key from the partition values at the given field positions.
+/// Empty partition / no positions → "__empty__"; each position encodes its value
+/// (or "__null__" for a null field, "__oob__" for an out-of-range position),
+/// joined so distinct partition tuples never collide. Callers pass `[0]` to
+/// preserve the original first-field grouping, or a projected subset of positions
+/// chosen via the `write.manifest.grouping-fields` table property.
+fn partition_grouping_key(partition: &Struct, positions: &[usize]) -> String {
     let fields = partition.fields();
-    if fields.is_empty() {
+    if fields.is_empty() || positions.is_empty() {
         return "__empty__".to_string();
     }
-    match &fields[0] {
-        Some(literal) => format!("{literal:?}"),
-        None => "__null__".to_string(),
-    }
+    positions
+        .iter()
+        .map(|&i| match fields.get(i) {
+            Some(Some(literal)) => format!("{literal:?}"),
+            Some(None) => "__null__".to_string(),
+            None => "__oob__".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// A trait that defines how different table operations produce new snapshots.
@@ -502,12 +511,20 @@ impl<'a> SnapshotProducer<'a> {
 
     /// Write manifest files for added data files, grouped by first partition value.
     ///
-    /// When `write.manifest.partition-scoped=true`, files are grouped by the first
-    /// partition field value and each group gets its own manifest. This produces tight
-    /// partition summaries (lower_bound == upper_bound for the grouping field), enabling
-    /// the manifest evaluator to skip 98%+ of manifests during query planning.
+    /// When `write.manifest.partition-scoped=true`, files are grouped into one
+    /// manifest per distinct value of the grouping key, producing tight partition
+    /// summaries the manifest evaluator can skip whole manifests by.
     ///
-    /// Without this property (default), all files go into a single manifest (original behavior).
+    /// The grouping key defaults to the **first** partition field (index 0), but is
+    /// configurable via `write.manifest.grouping-fields` — a comma-separated list of
+    /// partition field NAMES to project the key onto. This matters when the leading
+    /// field is a constant (e.g. `signallake_tenant`, cardinality 1 on a dedicated
+    /// stack): the default then lumps every file into one wide manifest, whereas
+    /// `write.manifest.grouping-fields=timestamp_hour` yields ~1 tight, time-scoped
+    /// manifest per commit regardless of tenant count. Only low-/bounded-cardinality
+    /// fields belong here; high-cardinality fields still prune at the file level.
+    ///
+    /// Without `partition-scoped` (default), all files go into a single manifest.
     async fn write_added_manifests(&mut self) -> Result<Vec<ManifestFile>> {
         let added_data_files = std::mem::take(&mut self.added_data_files);
         if added_data_files.is_empty() {
@@ -531,10 +548,38 @@ impl<'a> SnapshotProducer<'a> {
             return Ok(vec![manifest]);
         }
 
-        // Group files by first partition field value
+        // Resolve which partition field positions form the grouping key. Names in
+        // `write.manifest.grouping-fields` map to positions in the default partition
+        // spec; unset (or none matched) → `[0]`, the original first-field behavior.
+        let grouping_positions: Vec<usize> = {
+            let spec = self.table.metadata().default_partition_spec();
+            match self
+                .table
+                .metadata()
+                .properties()
+                .get("write.manifest.grouping-fields")
+            {
+                Some(list) if !list.trim().is_empty() => {
+                    let positions: Vec<usize> = list
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|name| spec.fields().iter().position(|f| f.name == name))
+                        .collect();
+                    if positions.is_empty() {
+                        vec![0]
+                    } else {
+                        positions
+                    }
+                }
+                _ => vec![0],
+            }
+        };
+
+        // Group files by the projected grouping key
         let mut groups: HashMap<String, Vec<DataFile>> = HashMap::new();
         for data_file in added_data_files {
-            let key = first_partition_value_key(&data_file.partition);
+            let key = partition_grouping_key(&data_file.partition, &grouping_positions);
             groups.entry(key).or_default().push(data_file);
         }
 
@@ -1766,6 +1811,7 @@ mod test_v4_commit {
         DataContentType, DataFile, DataFileFormat, FormatVersion, NestedField, PrimitiveType,
         Schema, Struct, Type,
     };
+    use super::partition_grouping_key;
     use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
     use futures::TryStreamExt;
@@ -1804,6 +1850,48 @@ mod test_v4_commit {
             content_size_in_bytes: None,
             referenced_data_file: None,
         }
+    }
+
+    #[test]
+    fn partition_grouping_key_projects_configured_positions() {
+        use crate::spec::Literal;
+        // partition tuple = (signallake_tenant, tenant, timestamp_hour)
+        let a = Struct::from_iter([
+            Some(Literal::string("st")),
+            Some(Literal::string("cops")),
+            Some(Literal::long(495445)),
+        ]);
+        let b = Struct::from_iter([
+            Some(Literal::string("st")),
+            Some(Literal::string("cops")),
+            Some(Literal::long(495446)), // different hour
+        ]);
+
+        // Default [0] keys on signallake_tenant — constant here → distinct hours
+        // collapse into ONE wide group (the bug the property fixes).
+        assert_eq!(
+            partition_grouping_key(&a, &[0]),
+            partition_grouping_key(&b, &[0]),
+        );
+        // grouping-fields=timestamp_hour (position 2) → distinct hours split apart.
+        assert_ne!(
+            partition_grouping_key(&a, &[2]),
+            partition_grouping_key(&b, &[2]),
+        );
+        // A multi-field projection [tenant, timestamp_hour] ignores position 0, so
+        // two rows with a different signallake_tenant but same tenant+hour co-group.
+        let c = Struct::from_iter([
+            Some(Literal::string("OTHER")),
+            Some(Literal::string("cops")),
+            Some(Literal::long(495445)),
+        ]);
+        assert_eq!(
+            partition_grouping_key(&a, &[1, 2]),
+            partition_grouping_key(&c, &[1, 2]),
+        );
+        // Empty positions / empty partition → sentinel (single group).
+        assert_eq!(partition_grouping_key(&a, &[]), "__empty__");
+        assert_eq!(partition_grouping_key(&Struct::empty(), &[0]), "__empty__");
     }
 
     #[tokio::test]

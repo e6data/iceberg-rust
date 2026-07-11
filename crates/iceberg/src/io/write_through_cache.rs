@@ -55,7 +55,7 @@ use opendal::raw::{
     RpRead, RpStat, RpWrite,
 };
 use opendal::{Buffer, EntryMode, Metadata, Operator, Result};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// Default cache byte cap (40 GiB) — deliberately below the provisioned
 /// `/data` volume so we evict before the kubelet trips the volume `sizeLimit`.
@@ -312,28 +312,34 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
     }
 }
 
-/// Read the range requested by `args` from a locally-cached file. Returns
-/// `None` on any mismatch (missing/evicted file, short read) so the caller
-/// falls back to the object store.
+/// Read the range requested by `args` from a locally-cached file. Reads ONLY
+/// the requested bytes (seek + bounded read) — merge input reads are range
+/// reads (parquet footer, then row groups), so a whole-file read per range
+/// would amplify local IO enormously. Returns `None` on any mismatch
+/// (missing/evicted file, short read) so the caller falls back to the store.
 async fn read_local_range(local: &Path, args: &OpRead) -> Option<Buffer> {
-    let bytes = tokio::fs::read(local).await.ok()?;
+    use std::io::SeekFrom;
     let range = args.range();
-    let offset = range.offset() as usize;
-    if offset > bytes.len() {
-        return None;
+    let offset = range.offset();
+    let mut f = tokio::fs::File::open(local).await.ok()?;
+    if offset > 0 {
+        f.seek(SeekFrom::Start(offset)).await.ok()?;
     }
-    let end = match range.size() {
+    match range.size() {
+        // Bounded range: read exactly `sz` bytes; a short read means the local
+        // copy doesn't cover the request (stale/evicted) → fall back to store.
         Some(sz) => {
-            let end = offset.checked_add(sz as usize)?;
-            if end > bytes.len() {
-                // Requested more than we have → stale/short, don't serve.
-                return None;
-            }
-            end
+            let mut buf = vec![0u8; sz as usize];
+            f.read_exact(&mut buf).await.ok()?;
+            Some(Buffer::from(buf))
         }
-        None => bytes.len(),
-    };
-    Some(Buffer::from(bytes[offset..end].to_vec()))
+        // Unbounded: read from the offset to EOF.
+        None => {
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).await.ok()?;
+            Some(Buffer::from(buf))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

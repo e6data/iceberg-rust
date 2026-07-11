@@ -151,16 +151,22 @@ pub(crate) struct CacheManager {
 
 impl CacheManager {
     fn new(cfg: CacheConfig) -> Self {
+        // Use a dedicated SUBDIRECTORY of the configured dir. The dir is often
+        // shared (e.g. `/data` also holds laminar's `state.sqlite`), so the
+        // cache must never read/write/sweep the parent directly — only files
+        // under this subdir belong to us.
+        let dir = cfg.dir.join("laminar-merge-cache");
         // Startup sweep: clear any orphans from a previous (possibly crashed)
-        // pod so stale files never count against the cap or get served.
-        let _ = std::fs::create_dir_all(&cfg.dir);
-        if let Ok(rd) = std::fs::read_dir(&cfg.dir) {
+        // pod so stale files never count against the cap or get served. Scoped
+        // strictly to the cache subdir — nothing else on the volume is touched.
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let _ = std::fs::remove_file(e.path());
             }
         }
         Self {
-            dir: cfg.dir,
+            dir,
             max_bytes: cfg.max_bytes,
             seq: AtomicU64::new(0),
             state: Mutex::new(CacheState::default()),
@@ -534,14 +540,28 @@ mod tests {
     }
 
     #[test]
-    fn startup_sweep_clears_orphans() {
+    fn startup_sweep_clears_cache_subdir_but_not_siblings() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("orphan.pq"), b"stale").unwrap();
+        // A sibling in the shared dir (e.g. laminar's state.sqlite) MUST survive.
+        std::fs::write(dir.path().join("state.sqlite"), b"precious").unwrap();
+        // A stale file inside the cache subdir must be swept.
+        let sub = dir.path().join("laminar-merge-cache");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("orphan.pq"), b"stale").unwrap();
+
         let _mgr = CacheManager::new(CacheConfig {
             dir: dir.path().to_path_buf(),
             max_bytes: 1024,
         });
-        assert!(!dir.path().join("orphan.pq").exists(), "sweep removed orphan");
+
+        assert!(
+            dir.path().join("state.sqlite").exists(),
+            "sibling state DB untouched by the sweep"
+        );
+        assert!(
+            !sub.join("orphan.pq").exists(),
+            "stale cache-subdir file swept"
+        );
     }
 
     #[cfg(feature = "storage-memory")]

@@ -51,8 +51,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use opendal::raw::oio::{Read as OioRead, Write as OioWrite};
 use opendal::raw::{
-    Access, Layer, LayeredAccess, OpDelete, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead,
-    RpWrite,
+    Access, Layer, LayeredAccess, OpDelete, OpList, OpRead, OpStat, OpWrite, RpDelete, RpList,
+    RpRead, RpStat, RpWrite,
 };
 use opendal::{Buffer, EntryMode, Metadata, Operator, Result};
 use tokio::io::AsyncWriteExt;
@@ -106,12 +106,19 @@ pub(crate) fn maybe_wrap(op: Operator) -> Operator {
     }
 }
 
-/// Only data files are cached: parquet under a table's `/data/` prefix. This
-/// deliberately excludes `.parquet.stats` sidecars, `_stats/*.puffin`, Avro
-/// manifests, and `/metadata/` JSON — none of which the merge reads and some of
-/// which mutate/are-deleted (so caching them could serve stale bytes).
+/// What the inline merge reads from a table's `/data/` prefix, and what we
+/// therefore cache:
+/// - `*.parquet` data files (read in the `streaming_concat` phase), and
+/// - `*.parquet.stats` per-file sidecars (read in the `puffin_carry_forward`
+///   phase — the dominant cost of a terminal merge, one GET per input file).
+///
+/// Both are write-once/immutable, so serving them from a local copy is always
+/// correct. This deliberately excludes the partition-level `_stats/*.puffin`
+/// (rewritten in place on terminal merges → could serve stale bytes), Avro
+/// manifests, and `/metadata/` JSON.
 fn is_cacheable(rel_path: &str) -> bool {
-    rel_path.contains("/data/") && rel_path.ends_with(".parquet")
+    rel_path.contains("/data/")
+        && (rel_path.ends_with(".parquet") || rel_path.ends_with(".parquet.stats"))
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +281,20 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                 tee,
             },
         ))
+    }
+
+    async fn stat(&self, path: &str, args: OpStat) -> Result<RpStat> {
+        // Serve size from the local copy when cached — kills the per-input
+        // HEAD in puffin_carry_forward. Only content_length is synthesised
+        // (the local file is a byte-exact copy, so it is exact); anything
+        // uncached falls through to the object store.
+        if let Some(local) = self.mgr.local_for(path) {
+            if let Ok(md) = tokio::fs::metadata(&local).await {
+                let meta = Metadata::new(EntryMode::FILE).with_content_length(md.len());
+                return Ok(RpStat::new(meta));
+            }
+        }
+        self.inner.stat(path, args).await
     }
 
     async fn delete(&self) -> Result<(RpDelete, Self::Deleter)> {
@@ -466,9 +487,12 @@ mod tests {
     }
 
     #[test]
-    fn is_cacheable_matches_only_data_parquet() {
+    fn is_cacheable_matches_data_parquet_and_per_file_sidecars() {
+        // Data files (streaming_concat) and per-file sidecars
+        // (puffin_carry_forward) are both cached — both are immutable.
         assert!(is_cacheable("obs/ns/tbl/data/tenant=x/f.parquet"));
-        assert!(!is_cacheable("obs/ns/tbl/data/tenant=x/f.parquet.stats"));
+        assert!(is_cacheable("obs/ns/tbl/data/tenant=x/f.parquet.stats"));
+        // The partition-level puffin is rewritten in place → never cached.
         assert!(!is_cacheable("obs/ns/tbl/data/_stats/p/partition.puffin"));
         assert!(!is_cacheable("obs/ns/tbl/metadata/snap-1.avro"));
         assert!(!is_cacheable("obs/ns/tbl/metadata/v3.metadata.json"));
@@ -567,10 +591,12 @@ mod tests {
         assert_eq!(&got[..], b"2345");
     }
 
-    /// Non-data paths (metadata, `.parquet.stats` sidecars) are never cached.
+    /// Metadata / manifests / the partition puffin are never cached; per-file
+    /// `.parquet.stats` sidecars ARE (they're immutable and read in
+    /// puffin_carry_forward).
     #[cfg(feature = "storage-memory")]
     #[tokio::test]
-    async fn layer_does_not_cache_non_data_paths() {
+    async fn layer_caches_sidecars_but_not_metadata_or_partition_puffin() {
         let (mgr, _d) = tmp_manager(1 << 20);
         let op = memory_op().layer(WriteThroughCacheLayer { mgr: mgr.clone() });
 
@@ -579,9 +605,16 @@ mod tests {
             .unwrap();
         assert!(mgr.local_for("obs/ns/tbl/metadata/snap.avro").is_none());
 
+        op.write("obs/ns/tbl/data/_stats/p/partition.puffin", b"puffin".to_vec())
+            .await
+            .unwrap();
+        assert!(mgr
+            .local_for("obs/ns/tbl/data/_stats/p/partition.puffin")
+            .is_none());
+
         op.write("obs/ns/tbl/data/p/f.parquet.stats", b"sidecar".to_vec())
             .await
             .unwrap();
-        assert!(mgr.local_for("obs/ns/tbl/data/p/f.parquet.stats").is_none());
+        assert!(mgr.local_for("obs/ns/tbl/data/p/f.parquet.stats").is_some());
     }
 }

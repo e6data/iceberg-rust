@@ -227,6 +227,11 @@ impl Storage {
         // harm in retrying temporary failures for other storage backends as well.
         let operator = operator.layer(RetryLayer::new());
 
+        // Optionally stack the local NVMe write-through cache (merge-on-write
+        // read acceleration). No-op unless LAMINAR_LOCAL_CACHE_ENABLE=1, in
+        // which case the returned operator is byte-identical to the above.
+        let operator = super::write_through_cache::maybe_wrap(operator);
+
         Ok((operator, relative_path))
     }
 

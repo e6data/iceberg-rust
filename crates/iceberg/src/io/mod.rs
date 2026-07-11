@@ -68,6 +68,7 @@
 
 mod file_io;
 mod storage;
+mod write_through_cache;
 
 pub use file_io::*;
 pub(crate) mod object_cache;

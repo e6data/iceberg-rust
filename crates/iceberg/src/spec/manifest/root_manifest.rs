@@ -1118,6 +1118,34 @@ pub fn read_root_manifest(
     Ok((metadata, entries))
 }
 
+/// Predicate deciding whether a reconstructed *data-file* entry is materialized.
+/// Lets a caller prune the live set to a partition/time band while walking the
+/// chain + tree, instead of building the full set and filtering after — the
+/// difference between O(whole table) and O(band) peak memory.
+///
+/// `None` = keep everything (the default). Every caller EXCEPT the closed-hour
+/// consolidation sweep passes `None`: graduation's collapse-fold, cold-tier
+/// compaction, drop-cold-buckets, rebalance, and the read path all require the
+/// complete live set for correctness. Only the sweep — which acts solely on the
+/// closed-but-not-graduated hour band — supplies a filter. The predicate applies
+/// to `Inline` (materialized data) entries only; `ManifestRef` entries pass
+/// through unchanged (interior tree-node refs carry no partition summary yet, so
+/// a subtree can't be skipped wholesale here; the caller prunes any refs it then
+/// loads).
+pub type EntryFilter<'a> = &'a (dyn Fn(&DataFile) -> bool + Sync);
+
+/// `true` if the entry survives the filter. `ManifestRef`s always survive
+/// (pass-through); `Inline` data entries are tested against the predicate.
+fn entry_passes(entry: &RootManifestEntry, keep: Option<EntryFilter<'_>>) -> bool {
+    match keep {
+        None => true,
+        Some(k) => match entry {
+            RootManifestEntry::Inline(me) => k(me.data_file()),
+            RootManifestEntry::ManifestRef { .. } => true,
+        },
+    }
+}
+
 /// Reconstruct the full entry set of an incremental (chained) root by walking
 /// `prev_root_path` from `head_path` back to the base, unioning each delta's
 /// entries. Returns the entries plus the HEAD metadata (its `bucket_index_path`
@@ -1135,9 +1163,24 @@ pub fn read_root_manifest(
 /// away here). Callers that write a new base carry this forward; the scan reads
 /// it to skip those data files. So `meta.removed_paths` on the result is the
 /// authoritative ref-tombstone set, NOT the head node's raw field.
+///
+/// This is the full-live-set reconstruct every caller but the closed-hour sweep
+/// uses; see [`reconstruct_root_filtered`] for the band-pruned variant.
 pub async fn reconstruct_root(
     file_io: &crate::io::FileIO,
     head_path: &str,
+) -> Result<(RootManifestMetadata, Vec<RootManifestEntry>)> {
+    reconstruct_root_filtered(file_io, head_path, None).await
+}
+
+/// Like [`reconstruct_root`] but prunes materialized data entries by `keep` as
+/// it walks — leaf entries failing the predicate are never accumulated, so peak
+/// memory scales with the kept band, not the whole tiered tree. See
+/// [`EntryFilter`]. `keep = None` is identical to [`reconstruct_root`].
+pub async fn reconstruct_root_filtered(
+    file_io: &crate::io::FileIO,
+    head_path: &str,
+    keep: Option<EntryFilter<'_>>,
 ) -> Result<(RootManifestMetadata, Vec<RootManifestEntry>)> {
     const MAX_CHAIN_WALK: usize = 100_000;
     let mut entries: Vec<RootManifestEntry> = Vec::new();
@@ -1150,21 +1193,26 @@ pub async fn reconstruct_root(
         if head_meta.is_none() {
             head_meta = Some(meta.clone());
         }
-        // Union the tombstones recorded down the chain.
+        // Union the tombstones recorded down the chain. Collected in FULL even
+        // when filtering (they are cheap path strings, and a tombstone for a
+        // kept file must still drop it in finalize).
         for p in &meta.removed_paths {
             removed.insert(p.clone());
         }
         if meta.node_level > 0 {
             // Reached a balanced-tree base (the bottom of the L0 chain): its
             // entries are child-node refs, not data. Traverse the subtree to
-            // gather the real leaf entries, then stop (a tree base has no prev).
-            collect_subtree_entries(file_io, these, &mut entries).await?;
+            // gather the real leaf entries (filtered per `keep`), then stop (a
+            // tree base has no prev).
+            collect_subtree_entries(file_io, these, &mut entries, keep).await?;
             return Ok(finalize_reconstruct(
                 head_meta.expect("read at least one root"),
                 entries,
                 removed,
             ));
         }
+        // L0 delta: drop out-of-band inline entries before accumulating.
+        these.retain(|e| entry_passes(e, keep));
         entries.append(&mut these);
         match &meta.prev_root_path {
             Some(prev) => path = prev.clone(),
@@ -1226,6 +1274,7 @@ fn collect_subtree_entries<'a>(
     file_io: &'a crate::io::FileIO,
     interior_entries: Vec<RootManifestEntry>,
     out: &'a mut Vec<RootManifestEntry>,
+    keep: Option<EntryFilter<'a>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         for entry in interior_entries {
@@ -1234,11 +1283,16 @@ fn collect_subtree_entries<'a>(
                 continue;
             };
             let bytes = file_io.new_input(&manifest_file.manifest_path)?.read().await?;
-            let (child_meta, child_entries) = read_root_manifest(bytes)?;
+            let (child_meta, mut child_entries) = read_root_manifest(bytes)?;
             if child_meta.node_level == 0 {
+                // Leaf: filter its data entries to the band before accumulating.
+                // The leaf is read in full (one at a time — bounded transient),
+                // but only kept entries persist in `out`, so the accumulated set
+                // is O(band), not O(whole tree).
+                child_entries.retain(|e| entry_passes(e, keep));
                 out.extend(child_entries);
             } else {
-                collect_subtree_entries(file_io, child_entries, out).await?;
+                collect_subtree_entries(file_io, child_entries, out, keep).await?;
             }
         }
         Ok(())
@@ -1884,6 +1938,68 @@ mod tests {
             got_paths, want,
             "tree reconstruct must return every leaf exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn reconstruct_root_filtered_prunes_leaves_through_tree() {
+        use std::collections::HashSet;
+
+        use crate::io::FileIOBuilder;
+
+        let schema = test_schema();
+        let spec = test_partition_spec(&schema);
+        let partition_type = spec.partition_type(&schema).unwrap();
+        let template = test_metadata(&schema, &spec);
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let location = "memory:///tbl";
+
+        // 50 entries → multi-level tree; record_count = i is the discriminator so
+        // the filter must prune at the LEAF level while recursing interior nodes.
+        let n = 50u64;
+        let entries: Vec<RootManifestEntry> = (0..n)
+            .map(|i| {
+                RootManifestEntry::Inline(test_inline_entry(
+                    &format!("memory:///tbl/data/f{i}.parquet"),
+                    i,
+                ))
+            })
+            .collect();
+        let root_path = build_balanced_tree(
+            &file_io,
+            location,
+            &template,
+            &partition_type,
+            uuid::Uuid::nil(),
+            entries,
+            4,
+        )
+        .await
+        .unwrap();
+
+        // Keep only even record_count.
+        let keep = |df: &DataFile| df.record_count % 2 == 0;
+        let (_, got) = reconstruct_root_filtered(&file_io, &root_path, Some(&keep))
+            .await
+            .unwrap();
+        let got_counts: HashSet<u64> = got
+            .iter()
+            .map(|e| match e {
+                RootManifestEntry::Inline(me) => me.data_file.record_count,
+                RootManifestEntry::ManifestRef { .. } => unreachable!("leaves are inline"),
+            })
+            .collect();
+        let want: HashSet<u64> = (0..n).filter(|i| i % 2 == 0).collect();
+        assert_eq!(
+            got_counts, want,
+            "filtered reconstruct returns ONLY kept leaves, pruned through the tree"
+        );
+        assert_eq!(got.len(), 25, "exactly half of 50 kept");
+
+        // `None` == unfiltered == every leaf (parity with reconstruct_root).
+        let (_, all) = reconstruct_root_filtered(&file_io, &root_path, None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 50, "None filter keeps everything (unpruned)");
     }
 
     // Regression for the attribute_index wedge: a collapsed balanced-tree base has

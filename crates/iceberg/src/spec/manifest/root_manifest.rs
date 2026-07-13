@@ -1299,6 +1299,43 @@ fn collect_subtree_entries<'a>(
     })
 }
 
+/// Reorder `entries` so all entries of the same partition tuple are contiguous.
+/// [`build_balanced_tree`] then packs each leaf node from a contiguous slice, so
+/// every leaf comes out **partition-tight** (its partition summary spans one —
+/// or, only at a chunk boundary, a couple of — partitions) instead of the
+/// arbitrary wide spread that fan-out-order chunking of the reconstructed set
+/// produces.
+///
+/// This is the manifest-layer compaction the standalone rebalance did, folded
+/// into the (single-writer, race-free) collapse: the reader prunes leaves by
+/// partition summary and graduation folds fewer wide manifests — with no extra
+/// commit, no second writer, and no dependency on lakekeeper being linearizable
+/// (the standalone rebalance's data-loss trap).
+///
+/// Safe: the reconstructed live set is order-independent (a set), so reordering
+/// changes only which leaf a data file lands in, never which files are present.
+/// `ManifestRef` entries (no single partition) are grouped together at the end.
+fn cluster_entries_by_partition(entries: Vec<RootManifestEntry>) -> Vec<RootManifestEntry> {
+    let mut by_part: HashMap<crate::spec::Struct, Vec<RootManifestEntry>> = HashMap::new();
+    let mut refs: Vec<RootManifestEntry> = Vec::new();
+    for e in entries {
+        match &e {
+            RootManifestEntry::Inline(me) => {
+                let p = me.data_file.partition.clone();
+                by_part.entry(p).or_default().push(e);
+            }
+            RootManifestEntry::ManifestRef { .. } => refs.push(e),
+        }
+    }
+    let mut out: Vec<RootManifestEntry> =
+        Vec::with_capacity(refs.len() + by_part.values().map(Vec::len).sum::<usize>());
+    for group in by_part.into_values() {
+        out.extend(group);
+    }
+    out.extend(refs);
+    out
+}
+
 /// Build a balanced fan-out tree over `entries` and return the path of its root
 /// node (already written, along with every interior/leaf node). The root carries
 /// the template's `bucket_index_path`, `node_level = tree height`, and
@@ -1306,12 +1343,14 @@ fn collect_subtree_entries<'a>(
 ///
 /// When `entries.len() <= fanout` this writes a single level-0 node (a flat base
 /// — identical to the pre-tree collapse), so small live sets pay nothing. Above
-/// the fan-out it chunks bottom-up: level-0 leaf nodes, then interior levels of
-/// node refs, until one root remains.
+/// the fan-out the entries are **partition-clustered** (see
+/// [`cluster_entries_by_partition`]) and chunked bottom-up: partition-tight
+/// level-0 leaf nodes, then interior levels of node refs, until one root remains.
 ///
 /// Interior node refs carry `partitions: None` (conservative) for now — the
-/// bounds aggregation that lets the reader PRUNE subtrees is the paired read-side
-/// increment; today `reconstruct_root` still visits every leaf.
+/// bounds aggregation that lets the reader PRUNE whole subtrees is the paired
+/// read-side increment; today `reconstruct_root` still visits every leaf, but
+/// the leaves themselves are now partition-tight so the read side prunes them.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_balanced_tree(
     file_io: &crate::io::FileIO,
@@ -1340,6 +1379,11 @@ pub async fn build_balanced_tree(
         file_io.new_output(&root_path)?.write(bytes.into()).await?;
         return Ok(root_path);
     }
+
+    // Cluster by partition so each leaf chunk is partition-tight (see
+    // cluster_entries_by_partition). This is the hot-side manifest compaction,
+    // done for free during the collapse's base rewrite.
+    let entries = cluster_entries_by_partition(entries);
 
     let mut counter: u64 = 0;
     let node_ref = |path: &str| RootManifestEntry::ManifestRef {
@@ -1846,6 +1890,46 @@ mod tests {
                 content_size_in_bytes: None,
             },
         }
+    }
+
+    #[test]
+    fn cluster_entries_by_partition_groups_same_partition_contiguously() {
+        use crate::spec::{Literal, Struct};
+        let mk = |path: &str, p: i64| {
+            let mut e = test_inline_entry(path, 1);
+            e.data_file.partition = Struct::from_iter([Some(Literal::long(p))]);
+            RootManifestEntry::Inline(e)
+        };
+        // Interleaved partitions A(1) B(2) A(1) C(3) B(2) A(1) + one ManifestRef.
+        let entries = vec![
+            mk("f0", 1),
+            mk("f1", 2),
+            mk("f2", 1),
+            mk("f3", 3),
+            mk("f4", 2),
+            mk("f5", 1),
+        ];
+        let out = cluster_entries_by_partition(entries);
+        assert_eq!(out.len(), 6, "no entries lost or added");
+        let parts: Vec<Struct> = out
+            .iter()
+            .map(|e| match e {
+                RootManifestEntry::Inline(me) => me.data_file.partition.clone(),
+                RootManifestEntry::ManifestRef { .. } => unreachable!("all inline here"),
+            })
+            .collect();
+        // Every distinct partition must form exactly ONE contiguous run.
+        let mut runs: Vec<Struct> = Vec::new();
+        for p in &parts {
+            if runs.last() != Some(p) {
+                assert!(
+                    !runs.contains(p),
+                    "partition appears in a second, non-contiguous run"
+                );
+                runs.push(p.clone());
+            }
+        }
+        assert_eq!(runs.len(), 3, "three distinct partitions, three contiguous runs");
     }
 
     #[test]

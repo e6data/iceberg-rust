@@ -52,7 +52,7 @@ use super::{ManifestEntry, ManifestStatus};
 use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestFile,
-    PartitionSpec, SchemaRef, StructType,
+    PartitionSpec, SchemaRef, StructType, Transform,
 };
 use crate::{Error, ErrorKind};
 
@@ -1314,8 +1314,25 @@ fn collect_subtree_entries<'a>(
 ///
 /// Safe: the reconstructed live set is order-independent (a set), so reordering
 /// changes only which leaf a data file lands in, never which files are present.
-/// `ManifestRef` entries (no single partition) are grouped together at the end.
-fn cluster_entries_by_partition(entries: Vec<RootManifestEntry>) -> Vec<RootManifestEntry> {
+///
+/// Two entry shapes are clustered independently:
+/// - **Inline** data files → grouped by their full partition tuple (a
+///   HashMap group per partition), the same as before.
+/// - **`ManifestRef`** entries → sorted by their time-transform partition
+///   **bucket** (the `Hour`/`Day` ordinal read from the manifest's partition
+///   summary, no manifest load). On a **tiered** table the reconstructed live
+///   set is entirely manifest refs (not inline files), so this is the branch
+///   that actually tightens its leaves: same-hour refs become contiguous, so
+///   each leaf chunk spans one — or, only at a chunk boundary, two adjacent —
+///   time buckets instead of an arbitrary 4-hour spread. The reader then prunes
+///   whole leaves by time range and graduation folds time-contiguous leaves.
+///   A stable sort preserves any within-hour partition locality already present
+///   in the reconstructed order. Tables with no time-transform partition field
+///   leave the refs in reconstruction order (no worse than before).
+fn cluster_entries_by_partition(
+    entries: Vec<RootManifestEntry>,
+    spec: &PartitionSpec,
+) -> Vec<RootManifestEntry> {
     let mut by_part: HashMap<crate::spec::Struct, Vec<RootManifestEntry>> = HashMap::new();
     let mut refs: Vec<RootManifestEntry> = Vec::new();
     for e in entries {
@@ -1327,6 +1344,21 @@ fn cluster_entries_by_partition(entries: Vec<RootManifestEntry>) -> Vec<RootMani
             RootManifestEntry::ManifestRef { .. } => refs.push(e),
         }
     }
+    // Sort manifest refs by their time-transform bucket so same-hour refs land in
+    // the same leaf. Falls back to reconstruction order when the table has no
+    // monotonic time-transform partition field.
+    if let Some(idx) = spec
+        .fields()
+        .iter()
+        .position(|pf| matches!(pf.transform, Transform::Hour | Transform::Day))
+    {
+        refs.sort_by_key(|e| match e {
+            RootManifestEntry::ManifestRef { manifest_file, .. } => {
+                ref_time_bucket(manifest_file, idx)
+            }
+            _ => i64::MAX,
+        });
+    }
     let mut out: Vec<RootManifestEntry> =
         Vec::with_capacity(refs.len() + by_part.values().map(Vec::len).sum::<usize>());
     for group in by_part.into_values() {
@@ -1334,6 +1366,19 @@ fn cluster_entries_by_partition(entries: Vec<RootManifestEntry>) -> Vec<RootMani
     }
     out.extend(refs);
     out
+}
+
+/// Time-transform bucket ordinal (`Hour`/`Day` value) of a manifest ref, read
+/// from its partition summary lower bound at field index `idx` (Iceberg
+/// little-endian single-value encoding). Refs missing the summary sort last so
+/// they don't split a well-formed run. Pure.
+fn ref_time_bucket(mf: &ManifestFile, idx: usize) -> i64 {
+    mf.partitions
+        .as_ref()
+        .and_then(|parts| parts.get(idx))
+        .and_then(|fs| fs.lower_bound.as_ref())
+        .and_then(|b| (b.len() >= 4).then(|| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64))
+        .unwrap_or(i64::MAX)
 }
 
 /// Build a balanced fan-out tree over `entries` and return the path of its root
@@ -1380,10 +1425,11 @@ pub async fn build_balanced_tree(
         return Ok(root_path);
     }
 
-    // Cluster by partition so each leaf chunk is partition-tight (see
+    // Cluster by partition so each leaf chunk is partition-/time-tight (see
     // cluster_entries_by_partition). This is the hot-side manifest compaction,
-    // done for free during the collapse's base rewrite.
-    let entries = cluster_entries_by_partition(entries);
+    // done for free during the collapse's base rewrite. On tiered tables the
+    // entries are manifest refs, so this clusters them by their time bucket.
+    let entries = cluster_entries_by_partition(entries, &template.partition_spec);
 
     let mut counter: u64 = 0;
     let node_ref = |path: &str| RootManifestEntry::ManifestRef {
@@ -1895,6 +1941,8 @@ mod tests {
     #[test]
     fn cluster_entries_by_partition_groups_same_partition_contiguously() {
         use crate::spec::{Literal, Struct};
+        let schema = test_schema();
+        let spec = test_partition_spec(&schema);
         let mk = |path: &str, p: i64| {
             let mut e = test_inline_entry(path, 1);
             e.data_file.partition = Struct::from_iter([Some(Literal::long(p))]);
@@ -1909,7 +1957,7 @@ mod tests {
             mk("f4", 2),
             mk("f5", 1),
         ];
-        let out = cluster_entries_by_partition(entries);
+        let out = cluster_entries_by_partition(entries, &spec);
         assert_eq!(out.len(), 6, "no entries lost or added");
         let parts: Vec<Struct> = out
             .iter()
@@ -1930,6 +1978,68 @@ mod tests {
             }
         }
         assert_eq!(runs.len(), 3, "three distinct partitions, three contiguous runs");
+    }
+
+    #[test]
+    fn cluster_entries_by_partition_sorts_manifest_refs_by_time_bucket() {
+        use crate::spec::{ByteBuf, FieldSummary};
+
+        // Partition spec: hour(ts). Field index 0 is the Hour transform, so the
+        // clustering sorts refs by that summary's lower bound.
+        let schema = test_schema();
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_unbound_field(UnboundPartitionField {
+                source_id: 3,
+                field_id: None,
+                name: "ts_hour".to_string(),
+                transform: crate::spec::Transform::Hour,
+            })
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // A manifest ref whose partition summary reports `hour` at field 0.
+        let mk_ref = |path: &str, hour: i32| {
+            let mut mf = test_manifest_file(path);
+            mf.partitions = Some(vec![FieldSummary {
+                contains_null: false,
+                contains_nan: Some(false),
+                lower_bound: Some(ByteBuf::from(hour.to_le_bytes().to_vec())),
+                upper_bound: Some(ByteBuf::from(hour.to_le_bytes().to_vec())),
+            }]);
+            RootManifestEntry::ManifestRef {
+                manifest_file: mf,
+                mdv: None,
+            }
+        };
+
+        // Interleaved hours 495533, 495484, 495533, 495486, 495484 (the exact
+        // 4-hour-mixed spread seen live). After clustering they must come out
+        // sorted, so each leaf chunk covers one contiguous hour run.
+        let entries = vec![
+            mk_ref("m0", 495533),
+            mk_ref("m1", 495484),
+            mk_ref("m2", 495533),
+            mk_ref("m3", 495486),
+            mk_ref("m4", 495484),
+        ];
+        let out = cluster_entries_by_partition(entries, &spec);
+        assert_eq!(out.len(), 5, "no refs lost or added");
+        let hours: Vec<i64> = out
+            .iter()
+            .map(|e| match e {
+                RootManifestEntry::ManifestRef { manifest_file, .. } => {
+                    ref_time_bucket(manifest_file, 0)
+                }
+                RootManifestEntry::Inline(_) => unreachable!("all refs here"),
+            })
+            .collect();
+        assert_eq!(
+            hours,
+            vec![495484, 495484, 495486, 495533, 495533],
+            "refs sorted by hour bucket => same-hour refs contiguous"
+        );
     }
 
     #[test]

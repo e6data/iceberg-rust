@@ -218,6 +218,58 @@ pub(crate) struct SnapshotProducer<'a> {
     file_to_manifest_index: Option<HashMap<String, String>>,
 }
 
+/// Group key of a manifest for partition-scoped merging: the `(lower, upper)`
+/// partition-summary bounds at the grouping `positions` (the same positions the
+/// write side groups by — see [`resolve_grouping_positions`]). Using BOTH bounds
+/// is deliberate: a single-partition manifest has `lower == upper`, so it keys
+/// distinctly from any manifest that already spans a range at that position —
+/// hence a pre-existing multi-hour manifest is never merged back into single-hour
+/// ones (which would re-widen them). A manifest with no summary → empty key
+/// (all such manifests share one group, preserving the old behaviour for them).
+fn manifest_group_key(
+    mf: &ManifestFile,
+    positions: &[usize],
+) -> Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    let parts = match &mf.partitions {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    positions
+        .iter()
+        .map(|&i| match parts.get(i) {
+            Some(fs) => (
+                fs.lower_bound.as_ref().map(|b| b.to_vec()),
+                fs.upper_bound.as_ref().map(|b| b.to_vec()),
+            ),
+            None => (None, None),
+        })
+        .collect()
+}
+
+/// Group mergeable manifests for bin-packing. When `positions` is `Some`, group by
+/// the manifest group key so the merge never welds different partitions (esp.
+/// different `timestamp_hour`s) into one manifest — a multi-hour manifest's
+/// partition-summary upper hour is the newest hour it swept in, and that recent
+/// upper blocks tiered graduation (`fold_closed` can't classify it closed). `None`
+/// → the original single-group behaviour (non-tiered tables, order preserved).
+fn partition_scoped_merge_groups(
+    manifests: Vec<ManifestFile>,
+    positions: Option<&[usize]>,
+) -> Vec<Vec<ManifestFile>> {
+    let Some(positions) = positions else {
+        return vec![manifests];
+    };
+    let mut by_key: HashMap<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>, Vec<ManifestFile>> =
+        HashMap::new();
+    for mf in manifests {
+        by_key
+            .entry(manifest_group_key(&mf, positions))
+            .or_default()
+            .push(mf);
+    }
+    by_key.into_values().collect()
+}
+
 impl<'a> SnapshotProducer<'a> {
     pub(crate) fn new(
         table: &'a Table,
@@ -818,24 +870,62 @@ impl<'a> SnapshotProducer<'a> {
             return Ok(to_keep);
         }
 
-        // Sort by size (smallest first) for optimal bin packing
-        to_merge.sort_by_key(|mf| mf.manifest_length);
+        // On a TIERED table, never weld different partitions (esp. different
+        // `timestamp_hour`s) into one manifest. The bin-packer is otherwise
+        // partition-blind (it groups only by spec_id), so it freely merges many
+        // hours into one manifest whose partition-summary upper hour is the
+        // NEWEST hour it swept in — and that recent upper makes tiered graduation
+        // (`fold_closed`) keep the whole manifest hot, trapping the closed hours
+        // inside it (observed live: a 6-hour metrics manifest / a 52-hour logs
+        // manifest holding ~41% of the hot tier in already-closed hours). Group
+        // by the partition tuple first so every merged manifest stays single-
+        // partition (single tenant+hour) → its upper hour is real → closed hours
+        // graduate whole. Non-tiered tables keep the original single-group pack.
+        let tiered = self
+            .table
+            .metadata()
+            .properties()
+            .get("tiered-metadata.enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
-        // Bin-pack: group small manifests into bins of ~target_size
+        // On a tiered table, group by the SAME positions the write side groups by
+        // (`write.manifest.grouping-fields`, default `timestamp_hour`) so merged
+        // manifests stay single-hour and can graduate.
+        let positions: Option<Vec<usize>> = if tiered {
+            let spec = self.table.metadata().default_partition_spec();
+            let names: Vec<&str> = spec.fields().iter().map(|f| f.name.as_str()).collect();
+            let prop = self
+                .table
+                .metadata()
+                .properties()
+                .get("write.manifest.grouping-fields")
+                .map(|s| s.as_str());
+            Some(resolve_grouping_positions(&names, prop))
+        } else {
+            None
+        };
+
+        let groups = partition_scoped_merge_groups(to_merge, positions.as_deref());
+
+        // Bin-pack within each partition group into bins of ~target_size.
         let mut bins: Vec<Vec<ManifestFile>> = Vec::new();
-        let mut current_bin: Vec<ManifestFile> = Vec::new();
-        let mut current_bin_size: i64 = 0;
-
-        for mf in to_merge {
-            if current_bin_size + mf.manifest_length > target_size && !current_bin.is_empty() {
-                bins.push(std::mem::take(&mut current_bin));
-                current_bin_size = 0;
+        for mut group in groups {
+            // Sort by size (smallest first) for optimal bin packing
+            group.sort_by_key(|mf| mf.manifest_length);
+            let mut current_bin: Vec<ManifestFile> = Vec::new();
+            let mut current_bin_size: i64 = 0;
+            for mf in group {
+                if current_bin_size + mf.manifest_length > target_size && !current_bin.is_empty() {
+                    bins.push(std::mem::take(&mut current_bin));
+                    current_bin_size = 0;
+                }
+                current_bin_size += mf.manifest_length;
+                current_bin.push(mf);
             }
-            current_bin_size += mf.manifest_length;
-            current_bin.push(mf);
-        }
-        if !current_bin.is_empty() {
-            bins.push(current_bin);
+            if !current_bin.is_empty() {
+                bins.push(current_bin);
+            }
         }
 
         // Merge each bin with >1 manifest into a single manifest
@@ -1936,6 +2026,76 @@ mod test_v4_commit {
         let flat = ["region", "shard"];
         assert_eq!(resolve_grouping_positions(&flat, None), vec![0]);
         assert_eq!(resolve_grouping_positions(&flat, Some("shard")), vec![1]);
+    }
+
+    #[test]
+    fn partition_scoped_merge_groups_never_welds_hours() {
+        use super::partition_scoped_merge_groups;
+        use crate::spec::{ByteBuf, FieldSummary, ManifestContentType, ManifestFile};
+
+        // A manifest whose timestamp_hour partition summary (position 0 here) has
+        // the given [lower, upper] hour bounds. Everything else is boilerplate.
+        let mk = |path: &str, lo: i32, hi: i32| ManifestFile {
+            manifest_path: path.to_string(),
+            manifest_length: 100,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(vec![FieldSummary {
+                contains_null: false,
+                contains_nan: Some(false),
+                lower_bound: Some(ByteBuf::from(lo.to_le_bytes().to_vec())),
+                upper_bound: Some(ByteBuf::from(hi.to_le_bytes().to_vec())),
+            }]),
+            key_metadata: None,
+            first_row_id: None,
+        };
+
+        // Two hour-495530 manifests, two hour-495531, and one pre-existing
+        // multi-hour (495530..495535) manifest.
+        let manifests = vec![
+            mk("a", 495530, 495530),
+            mk("b", 495531, 495531),
+            mk("c", 495530, 495530),
+            mk("d", 495531, 495531),
+            mk("wide", 495530, 495535),
+        ];
+
+        // Tiered: group by timestamp_hour (position 0) → same-hour manifests
+        // co-group, the multi-hour one is isolated in its own group.
+        let groups = partition_scoped_merge_groups(manifests.clone(), Some(&[0]));
+        assert_eq!(groups.len(), 3, "hour 495530, hour 495531, and the wide one");
+        for g in &groups {
+            let hi: Vec<_> = g
+                .iter()
+                .map(|m| {
+                    let p = &m.partitions.as_ref().unwrap()[0];
+                    (
+                        p.lower_bound.as_ref().unwrap().to_vec(),
+                        p.upper_bound.as_ref().unwrap().to_vec(),
+                    )
+                })
+                .collect();
+            assert!(
+                hi.iter().all(|k| *k == hi[0]),
+                "every manifest in a group shares one (lower,upper) hour key"
+            );
+        }
+        // The wide manifest is alone — never merged back into a single-hour group.
+        assert!(groups.iter().any(|g| g.len() == 1 && g[0].manifest_path == "wide"));
+
+        // Non-tiered: single group (original behaviour).
+        let flat = partition_scoped_merge_groups(manifests, None);
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].len(), 5);
     }
 
     #[tokio::test]

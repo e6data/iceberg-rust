@@ -1616,15 +1616,29 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         // Surface TTL-dropped paths (Type 1 retention) to laminar — the sole
-        // tombstone writer — via the snapshot summary. laminar reads this off the
-        // just-committed snapshot and records them as reason=ttl tombstones.
-        // Newline-joined; bounded by the fold's per-collapse file cap so the
-        // summary stays small. Empty ⇒ key absent (the common, no-TTL case).
+        // tombstone writer. A single dropped cold leaf can hold tens of thousands
+        // of files, so the path list does NOT go inline in the snapshot summary
+        // (that oversized the commit and made the drop fail to persist → re-drop
+        // loop). Instead write the newline-joined paths to a small SIDECAR object
+        // and put only its path in the summary. laminar reads the sidecar off the
+        // just-committed snapshot, records reason=ttl tombstones, and deletes it.
         if !ttl_dropped_paths.is_empty() {
-            summary.additional_properties.insert(
-                "tiered-metadata.ttl-dropped".to_string(),
-                ttl_dropped_paths.join("\n"),
+            let sidecar_path = format!(
+                "{}/{}/ttl-dropped-{}-{}.txt",
+                self.table.metadata().location(),
+                META_ROOT_PATH,
+                self.snapshot_id,
+                Uuid::now_v7(),
             );
+            let body = ttl_dropped_paths.join("\n");
+            self.table
+                .file_io()
+                .new_output(&sidecar_path)?
+                .write(body.into())
+                .await?;
+            summary
+                .additional_properties
+                .insert("tiered-metadata.ttl-dropped-sidecar".to_string(), sidecar_path);
         }
 
         // Adaptive inline→child flush: when inline count exceeds threshold,

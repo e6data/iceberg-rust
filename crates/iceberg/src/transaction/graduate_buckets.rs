@@ -157,6 +157,12 @@ pub(crate) struct FoldOutcome {
     pub nodes_moved: usize,
     pub inline_leaves: usize,
     pub cold_leaves_total: usize,
+    /// TTL-drop (Type 1 retention): S3 object paths that this fold removed from
+    /// the tree because their newest `ts_field_id` value fell below the retention
+    /// cutoff — the data files (and the manifest/leaf files that held them). The
+    /// caller surfaces these to the sole tombstone writer (laminar) so they are
+    /// reclaimed after grace. Empty unless a retention cutoff was supplied.
+    pub ttl_dropped_paths: Vec<String>,
 }
 
 /// Fold the "closed" entries of a reconstructed live set (those whose max
@@ -183,6 +189,14 @@ pub(crate) async fn fold_closed_into_bucket_index(
     cutoff_micros: i64,
     ts_field_id: i32,
     max_graduate: Option<usize>,
+    // TTL (Type 1 retention): entries/leaves whose newest `ts_field_id` value is
+    // below this cutoff are DROPPED from the tree (not graduated, not kept) and
+    // their object paths returned in `FoldOutcome::ttl_dropped_paths`. `None`
+    // disables TTL (graduation-only fold). `max_ttl_drop_files` bounds how many
+    // paths one fold may drop so the caller's snapshot summary stays small — the
+    // rest drop on later collapses (eventually consistent).
+    retention_cutoff_micros: Option<i64>,
+    max_ttl_drop_files: usize,
     snapshot_id: i64,
     commit_uuid: Uuid,
     manifest_counter: &mut u64,
@@ -193,6 +207,13 @@ pub(crate) async fn fold_closed_into_bucket_index(
     let partition_type = spec.partition_type(&schema)?;
     let next_seq_num = table.metadata().next_sequence_number();
 
+    // Accumulates TTL-dropped object paths (data files + the manifest/leaf files
+    // that referenced them), bounded by `max_ttl_drop_files`. `ttl_budget_left`
+    // returns whether another leaf/entry may still be dropped this fold.
+    let mut ttl_dropped_paths: Vec<String> = Vec::new();
+    let ttl_budget_left =
+        |dropped: &Vec<String>| retention_cutoff_micros.is_some() && dropped.len() < max_ttl_drop_files;
+
     // Existing cold leaves (graduated nodes get appended to these).
     let mut cold_leaves: Vec<ManifestFile> = match carried_bucket_index_path {
         Some(path) => {
@@ -201,6 +222,47 @@ pub(crate) async fn fold_closed_into_bucket_index(
         }
         None => Vec::new(),
     };
+
+    // ── TTL prune of the cold tier (steady-state path). Data ages into cold via
+    // graduation long before it hits retention (retention ≫ bucket-window), so
+    // expired data almost always lives here. Drop each cold leaf whose newest
+    // `ts_field_id` value is below the retention cutoff; tombstone its data files
+    // and the leaf manifest itself. Bounded by the file budget. ──
+    if let Some(retention_cutoff) = retention_cutoff_micros {
+        let mut surviving: Vec<ManifestFile> = Vec::with_capacity(cold_leaves.len());
+        // Coldest-first so the budget reclaims the oldest data before newer.
+        let mut with_ts: Vec<(ManifestFile, Option<i64>)> = Vec::with_capacity(cold_leaves.len());
+        for leaf in std::mem::take(&mut cold_leaves) {
+            let mx = match ref_max_event_micros(&leaf, &spec, ts_field_id) {
+                Some(m) => Some(m),
+                None => {
+                    let manifest = leaf.load_manifest(table.file_io()).await?;
+                    let files: Vec<DataFile> = manifest
+                        .entries()
+                        .iter()
+                        .filter(|e| e.is_alive())
+                        .map(|e| e.data_file().clone())
+                        .collect();
+                    max_ts_of(&files, ts_field_id)
+                }
+            };
+            with_ts.push((leaf, mx));
+        }
+        with_ts.sort_by_key(|(_, mx)| mx.unwrap_or(i64::MAX));
+        for (leaf, mx) in with_ts {
+            let expired = mx.map(|m| m < retention_cutoff).unwrap_or(false);
+            if expired && ttl_budget_left(&ttl_dropped_paths) {
+                let manifest = leaf.load_manifest(table.file_io()).await?;
+                for e in manifest.entries().iter().filter(|e| e.is_alive()) {
+                    ttl_dropped_paths.push(e.data_file().file_path().to_string());
+                }
+                ttl_dropped_paths.push(leaf.manifest_path.clone());
+            } else {
+                surviving.push(leaf);
+            }
+        }
+        cold_leaves = surviving;
+    }
 
     // Partition into: closed live nodes (→ cold by reference), closed inline
     // files (→ materialize as cold leaves), and kept (stay hot). `closed_refs`
@@ -235,15 +297,34 @@ pub(crate) async fn fold_closed_into_bucket_index(
                         max_ts_of(&files, ts_field_id)
                     }
                 };
+                // Expired past retention (edge case for hot data: normally it
+                // graduates to cold long before this). Drop + tombstone rather
+                // than graduate. `retention_cutoff < cutoff_micros`, so an expired
+                // ref is always also "closed".
+                let expired = matches!((retention_cutoff_micros, max_micros),
+                    (Some(rc), Some(mx)) if mx < rc);
+                if expired && ttl_budget_left(&ttl_dropped_paths) {
+                    let manifest = manifest_file.load_manifest(table.file_io()).await?;
+                    for e in manifest.entries().iter().filter(|e| e.is_alive()) {
+                        ttl_dropped_paths.push(e.data_file().file_path().to_string());
+                    }
+                    ttl_dropped_paths.push(manifest_file.manifest_path.clone());
+                    continue;
+                }
                 match max_micros {
                     Some(mx) if mx < cutoff_micros => closed_refs.push((manifest_file, mx)),
                     _ => kept.push(RootManifestEntry::ManifestRef { manifest_file, mdv }),
                 }
             }
             RootManifestEntry::Inline(me) => {
-                let closed = file_max_ts(&me.data_file, ts_field_id)
-                    .map(|mx| mx < cutoff_micros)
-                    .unwrap_or(false);
+                let mx = file_max_ts(&me.data_file, ts_field_id);
+                let expired = matches!((retention_cutoff_micros, mx),
+                    (Some(rc), Some(m)) if m < rc);
+                if expired && ttl_budget_left(&ttl_dropped_paths) {
+                    ttl_dropped_paths.push(me.data_file.file_path().to_string());
+                    continue;
+                }
+                let closed = mx.map(|m| m < cutoff_micros).unwrap_or(false);
                 if closed {
                     closed_inline_files.push(me.data_file.clone());
                 } else {
@@ -270,7 +351,13 @@ pub(crate) async fn fold_closed_into_bucket_index(
     }
     let graduated_nodes: Vec<ManifestFile> = closed_refs.into_iter().map(|(mf, _)| mf).collect();
 
-    if graduated_nodes.is_empty() && closed_inline_files.is_empty() {
+    // Nothing to do only if no graduation AND no TTL prune happened. A TTL-only
+    // fold (cold leaves dropped, nothing graduated) still must persist the
+    // pruned bucket-index and return the dropped paths.
+    if graduated_nodes.is_empty()
+        && closed_inline_files.is_empty()
+        && ttl_dropped_paths.is_empty()
+    {
         return Ok((kept, None));
     }
     let nodes_moved = graduated_nodes.len();
@@ -342,6 +429,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
             nodes_moved,
             inline_leaves,
             cold_leaves_total,
+            ttl_dropped_paths,
         }),
     ))
 }
@@ -381,6 +469,8 @@ impl TransactionAction for GraduateBucketsAction {
             self.cutoff_micros,
             self.ts_field_id,
             None, // manual/maintenance use: no per-collapse cap
+            None, // TTL retention drop is driven only by the commit_v4 collapse
+            0,
             snapshot_id,
             commit_uuid,
             &mut manifest_counter,

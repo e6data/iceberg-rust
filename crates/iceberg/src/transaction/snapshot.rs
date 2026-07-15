@@ -1486,6 +1486,10 @@ impl<'a> SnapshotProducer<'a> {
             }));
         }
 
+        // TTL-dropped object paths surfaced by the fold (see below); stashed in
+        // the snapshot summary for laminar (the sole tombstone writer) to drain.
+        let mut ttl_dropped_paths: Vec<String> = Vec::new();
+
         // Tiered graduation, folded into the collapse (durable path). On a
         // base/tree rewrite (`!do_delta`) of a tiered table, relocate entries
         // whose newest event time is below `now − tiered-metadata.bucket-window-secs`
@@ -1540,6 +1544,30 @@ impl<'a> SnapshotProducer<'a> {
                             .get("tiered-metadata.max-graduate-refs-per-collapse")
                             .and_then(|v| v.parse::<usize>().ok())
                             .unwrap_or(16);
+                        // TTL retention (Type 1): entries/leaves older than
+                        // `now − tiered-metadata.retention-secs` are DROPPED from
+                        // the tree (not graduated) and their paths tombstoned by
+                        // laminar. Absent property ⇒ TTL off (graduation-only).
+                        // Classified by the SAME ingestion-time field as
+                        // graduation; retention ≫ bucket-window so expired data is
+                        // almost always already in cold. Per-collapse file cap
+                        // keeps the snapshot summary small (eventually consistent).
+                        let retention_cutoff_micros = self
+                            .table
+                            .metadata()
+                            .properties()
+                            .get("tiered-metadata.retention-secs")
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .map(|r| {
+                                chrono::Utc::now().timestamp_micros() - (r as i64) * 1_000_000
+                            });
+                        let max_ttl_drop_files = self
+                            .table
+                            .metadata()
+                            .properties()
+                            .get("tiered-metadata.max-ttl-drop-files-per-collapse")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(256);
                         // Distinct commit_uuid so the fold's cold-leaf manifests
                         // never collide with this commit's own child manifests
                         // (which are named from `self.commit_uuid`).
@@ -1553,6 +1581,8 @@ impl<'a> SnapshotProducer<'a> {
                                 cutoff_micros,
                                 ts_field_id,
                                 Some(max_graduate),
+                                retention_cutoff_micros,
+                                max_ttl_drop_files,
                                 self.snapshot_id,
                                 fold_uuid,
                                 &mut fold_counter,
@@ -1561,6 +1591,9 @@ impl<'a> SnapshotProducer<'a> {
                         entries = kept;
                         if let Some(f) = fold {
                             carried_bucket_index_path = Some(f.bucket_index_path);
+                            if !f.ttl_dropped_paths.is_empty() {
+                                ttl_dropped_paths = f.ttl_dropped_paths;
+                            }
                         }
                     }
                     None => {
@@ -1571,6 +1604,18 @@ impl<'a> SnapshotProducer<'a> {
                     }
                 }
             }
+        }
+
+        // Surface TTL-dropped paths (Type 1 retention) to laminar — the sole
+        // tombstone writer — via the snapshot summary. laminar reads this off the
+        // just-committed snapshot and records them as reason=ttl tombstones.
+        // Newline-joined; bounded by the fold's per-collapse file cap so the
+        // summary stays small. Empty ⇒ key absent (the common, no-TTL case).
+        if !ttl_dropped_paths.is_empty() {
+            summary.additional_properties.insert(
+                "tiered-metadata.ttl-dropped".to_string(),
+                ttl_dropped_paths.join("\n"),
+            );
         }
 
         // Adaptive inline→child flush: when inline count exceeds threshold,

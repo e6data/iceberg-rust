@@ -229,6 +229,11 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // `ts_field_id` value is below the retention cutoff; tombstone its data files
     // and the leaf manifest itself. Bounded by the file budget. ──
     if let Some(retention_cutoff) = retention_cutoff_micros {
+        let cold_total = cold_leaves.len();
+        let mut with_ts_count = 0usize;
+        let mut none_ts_count = 0usize;
+        let mut newest_max_ts: Option<i64> = None;
+        let mut oldest_max_ts: Option<i64> = None;
         let mut surviving: Vec<ManifestFile> = Vec::with_capacity(cold_leaves.len());
         // Coldest-first so the budget reclaims the oldest data before newer.
         let mut with_ts: Vec<(ManifestFile, Option<i64>)> = Vec::with_capacity(cold_leaves.len());
@@ -246,9 +251,18 @@ pub(crate) async fn fold_closed_into_bucket_index(
                     max_ts_of(&files, ts_field_id)
                 }
             };
+            match mx {
+                Some(m) => {
+                    with_ts_count += 1;
+                    newest_max_ts = Some(newest_max_ts.map_or(m, |n| n.max(m)));
+                    oldest_max_ts = Some(oldest_max_ts.map_or(m, |o| o.min(m)));
+                }
+                None => none_ts_count += 1,
+            }
             with_ts.push((leaf, mx));
         }
         with_ts.sort_by_key(|(_, mx)| mx.unwrap_or(i64::MAX));
+        let mut dropped_leaves = 0usize;
         for (leaf, mx) in with_ts {
             let expired = mx.map(|m| m < retention_cutoff).unwrap_or(false);
             if expired && ttl_budget_left(&ttl_dropped_paths) {
@@ -257,10 +271,20 @@ pub(crate) async fn fold_closed_into_bucket_index(
                     ttl_dropped_paths.push(e.data_file().file_path().to_string());
                 }
                 ttl_dropped_paths.push(leaf.manifest_path.clone());
+                dropped_leaves += 1;
             } else {
                 surviving.push(leaf);
             }
         }
+        // Diagnostic: makes the TTL prune self-explaining. If dropped=0 despite
+        // old data, this line disambiguates the cause: ts_field_id resolution
+        // (none_ts high), poisoned bounds (oldest_max_ts recent/future), or an
+        // already-pruned cold tier (cold_total low).
+        log::info!(
+            "ttl cold-leaf prune: ts_field_id={} cutoff_us={} cold_leaves={} with_ts={} none_ts={} oldest_max_ts={:?} newest_max_ts={:?} dropped_leaves={} dropped_paths={}",
+            ts_field_id, retention_cutoff, cold_total, with_ts_count, none_ts_count,
+            oldest_max_ts, newest_max_ts, dropped_leaves, ttl_dropped_paths.len()
+        );
         cold_leaves = surviving;
     }
 

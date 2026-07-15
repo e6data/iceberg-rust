@@ -1589,6 +1589,15 @@ impl<'a> SnapshotProducer<'a> {
                             )
                             .await?;
                         entries = kept;
+                        // Diagnostic: confirms the collapse-fold ran and whether
+                        // TTL was even active (retention_cutoff Some vs None →
+                        // property-loaded vs not) plus how many paths it dropped.
+                        log::info!(
+                            "tiered collapse-fold ran: retention_cutoff={:?} graduated={} ttl_dropped={}",
+                            retention_cutoff_micros,
+                            fold.as_ref().map(|f| f.nodes_moved + f.inline_leaves).unwrap_or(0),
+                            fold.as_ref().map(|f| f.ttl_dropped_paths.len()).unwrap_or(0),
+                        );
                         if let Some(f) = fold {
                             carried_bucket_index_path = Some(f.bucket_index_path);
                             if !f.ttl_dropped_paths.is_empty() {

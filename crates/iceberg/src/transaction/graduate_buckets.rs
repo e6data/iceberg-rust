@@ -102,6 +102,15 @@ fn file_max_ts(df: &DataFile, ts_field_id: i32) -> Option<i64> {
     }
 }
 
+/// Push a dropped data file AND its per-file puffin sidecar into the tombstone
+/// set. A data file `X.parquet` carries a stats sidecar at `X.parquet.stats`
+/// (see merge_puffin); it orphans when the data file is dropped, so tombstone
+/// both. A file with no sidecar → the extra path is an idempotent no-op delete.
+fn push_data_file_and_sidecar(paths: &mut Vec<String>, data_file_path: &str) {
+    paths.push(format!("{data_file_path}.stats"));
+    paths.push(data_file_path.to_string());
+}
+
 fn le_i32(b: &[u8]) -> Option<i64> {
     (b.len() >= 4).then(|| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
 }
@@ -268,7 +277,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
             if expired && ttl_budget_left(&ttl_dropped_paths) {
                 let manifest = leaf.load_manifest(table.file_io()).await?;
                 for e in manifest.entries().iter().filter(|e| e.is_alive()) {
-                    ttl_dropped_paths.push(e.data_file().file_path().to_string());
+                    push_data_file_and_sidecar(&mut ttl_dropped_paths, e.data_file().file_path());
                 }
                 ttl_dropped_paths.push(leaf.manifest_path.clone());
                 dropped_leaves += 1;
@@ -330,7 +339,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
                 if expired && ttl_budget_left(&ttl_dropped_paths) {
                     let manifest = manifest_file.load_manifest(table.file_io()).await?;
                     for e in manifest.entries().iter().filter(|e| e.is_alive()) {
-                        ttl_dropped_paths.push(e.data_file().file_path().to_string());
+                        push_data_file_and_sidecar(&mut ttl_dropped_paths, e.data_file().file_path());
                     }
                     ttl_dropped_paths.push(manifest_file.manifest_path.clone());
                     continue;
@@ -345,7 +354,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
                 let expired = matches!((retention_cutoff_micros, mx),
                     (Some(rc), Some(m)) if m < rc);
                 if expired && ttl_budget_left(&ttl_dropped_paths) {
-                    ttl_dropped_paths.push(me.data_file.file_path().to_string());
+                    push_data_file_and_sidecar(&mut ttl_dropped_paths, me.data_file.file_path());
                     continue;
                 }
                 let closed = mx.map(|m| m < cutoff_micros).unwrap_or(false);

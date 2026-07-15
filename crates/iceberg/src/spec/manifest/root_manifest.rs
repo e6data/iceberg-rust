@@ -1231,6 +1231,35 @@ pub async fn reconstruct_root_filtered(
     ))
 }
 
+/// Collect every root-manifest object path in the L0 delta chain from `head_path`
+/// back to (and including) the base — i.e. every root file a collapse replaces
+/// and thus orphans. Reads only each root's metadata (`prev_root_path`); no entry
+/// or subtree materialization, so it's a cheap sequence of small-object reads.
+/// Used by the collapse path to tombstone orphaned root deltas (metadata GC).
+pub async fn chain_root_paths(
+    file_io: &crate::io::FileIO,
+    head_path: &str,
+) -> Result<Vec<String>> {
+    const MAX_CHAIN_WALK: usize = 100_000;
+    let mut paths: Vec<String> = Vec::new();
+    let mut path = head_path.to_string();
+    for _ in 0..MAX_CHAIN_WALK {
+        let bytes = file_io.new_input(&path)?.read().await?;
+        let (meta, _) = read_root_manifest(bytes)?;
+        paths.push(path.clone());
+        // node_level>0 is a balanced-tree base (no prev). An L0 delta with a
+        // prev continues the chain; the base (prev=None) ends it.
+        match meta.prev_root_path {
+            Some(prev) if meta.node_level == 0 => path = prev,
+            _ => return Ok(paths),
+        }
+    }
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        "chain_root_paths: chain exceeded MAX_CHAIN_WALK (corrupt/cyclic prev-root-path?)",
+    ))
+}
+
 /// Apply the chain's tombstones to the reconstructed entries: drop any INLINE
 /// entry whose data file was removed (materializing the removal), and set
 /// `meta.removed_paths` to the removals that did NOT match an inline entry —

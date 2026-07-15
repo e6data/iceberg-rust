@@ -31,8 +31,8 @@ use crate::spec::{
     StructType, Summary, TableProperties, update_snapshot_summaries,
 };
 use crate::spec::root_manifest::{
-    RootManifestEntry, RootManifestMetadata, build_balanced_tree, read_root_manifest,
-    reconstruct_root, write_root_manifest,
+    RootManifestEntry, RootManifestMetadata, build_balanced_tree, chain_root_paths,
+    read_root_manifest, reconstruct_root, write_root_manifest,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -1307,6 +1307,14 @@ impl<'a> SnapshotProducer<'a> {
             && current_root_path.is_some()
             && current_chain_depth < MAX_CHAIN;
         // Ref-resident tombstones carried forward from the chain on a collapse.
+        // Metadata-orphan GC: metadata objects this collapse REPLACES and thus
+        // orphans — the collapsed root-delta chain (below) and the replaced
+        // bucket-index (after the fold). Tombstoned `reason=metadata`; physical
+        // delete deferred to tessellate past grace (grace ≫ ~28min snapshot
+        // retention, so time-travel over the old snapshots stays safe).
+        let mut metadata_orphan_paths: Vec<String> = Vec::new();
+        let old_bucket_index_path = carried_bucket_index_path.clone();
+
         let mut carried_removed: Vec<String> = Vec::new();
         if do_delta {
             // Delta carries only this commit's new refs; discard the carried head.
@@ -1319,6 +1327,13 @@ impl<'a> SnapshotProducer<'a> {
                 let (recon_meta, full) = reconstruct_root(self.table.file_io(), p).await?;
                 entries = full;
                 carried_removed = recon_meta.removed_paths;
+                // The entire root-delta chain we just collapsed is replaced by the
+                // new base → orphaned. Collect its paths to tombstone. Best-effort:
+                // a walk failure must not fail the commit (metadata just leaks a
+                // cycle, cleaned next time).
+                if let Ok(chain) = chain_root_paths(self.table.file_io(), p).await {
+                    metadata_orphan_paths.extend(chain);
+                }
             }
         }
 
@@ -1639,6 +1654,35 @@ impl<'a> SnapshotProducer<'a> {
             summary
                 .additional_properties
                 .insert("tiered-metadata.ttl-dropped-sidecar".to_string(), sidecar_path);
+        }
+
+        // Metadata-orphan GC (Part B): if the fold replaced the bucket-index, the
+        // previous one is now orphaned — add it to the set collected above (the
+        // collapsed root-delta chain). Surface the whole orphan set to laminar via
+        // a second sidecar, tombstoned reason=metadata (same shape as TTL).
+        if let Some(old) = &old_bucket_index_path {
+            if carried_bucket_index_path.as_deref() != Some(old.as_str()) {
+                metadata_orphan_paths.push(old.clone());
+            }
+        }
+        if !metadata_orphan_paths.is_empty() {
+            let sidecar_path = format!(
+                "{}/{}/metadata-orphan-{}-{}.txt",
+                self.table.metadata().location(),
+                META_ROOT_PATH,
+                self.snapshot_id,
+                Uuid::now_v7(),
+            );
+            let body = metadata_orphan_paths.join("\n");
+            self.table
+                .file_io()
+                .new_output(&sidecar_path)?
+                .write(body.into())
+                .await?;
+            summary.additional_properties.insert(
+                "tiered-metadata.metadata-orphan-sidecar".to_string(),
+                sidecar_path,
+            );
         }
 
         // Adaptive inline→child flush: when inline count exceeds threshold,

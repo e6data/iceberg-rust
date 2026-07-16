@@ -300,6 +300,8 @@ impl Transaction {
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
+        let attempt_started = std::time::Instant::now();
+        let is_retry = !self.first_attempt;
         if self.first_attempt {
             self.first_attempt = false;
         } else {
@@ -312,14 +314,19 @@ impl Transaction {
                 self.table = refreshed.clone();
             }
         }
+        let refresh_ms = attempt_started.elapsed().as_millis() as u64;
 
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
         let mut all_manifest_paths: Vec<String> = Vec::new();
 
+        let actions_started = std::time::Instant::now();
+        let mut action_ms: Vec<u64> = Vec::with_capacity(self.actions.len());
         for action in &self.actions {
+            let action_started = std::time::Instant::now();
             let mut action_commit = Arc::clone(action).commit(&current_table).await?;
+            action_ms.push(action_started.elapsed().as_millis() as u64);
             all_manifest_paths.extend(action_commit.take_manifest_paths());
             // apply action commit to current_table
             current_table = Self::apply(
@@ -329,6 +336,7 @@ impl Transaction {
                 &mut existing_requirements,
             )?;
         }
+        let actions_elapsed_ms = actions_started.elapsed().as_millis() as u64;
 
         self.created_manifest_paths = all_manifest_paths;
 
@@ -338,7 +346,20 @@ impl Transaction {
             .requirements(existing_requirements)
             .build();
 
-        catalog.update_table(table_commit).await
+        let update_started = std::time::Instant::now();
+        let result = catalog.update_table(table_commit).await;
+        log::info!(
+            "commit sub-steps: table={} retry={} refresh_ms={} actions_ms={} per_action_ms={:?} update_table_ms={} total_ms={} ok={}",
+            self.table.identifier(),
+            is_retry,
+            refresh_ms,
+            actions_elapsed_ms,
+            action_ms,
+            update_started.elapsed().as_millis() as u64,
+            attempt_started.elapsed().as_millis() as u64,
+            result.is_ok(),
+        );
+        result
     }
 }
 

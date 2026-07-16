@@ -33,7 +33,7 @@
 //! node's data files — so it is fully partition-spec-agnostic. The caller
 //! computes `cutoff_micros = now − bucket_window`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -174,6 +174,51 @@ pub(crate) struct FoldOutcome {
     pub ttl_dropped_paths: Vec<String>,
 }
 
+/// Per-node graduation decision, accounting for incremental delta path-tombstones
+/// (`removed_paths`). A closed node is only safe to move to cold "by reference"
+/// when none of its files were merged away — otherwise the cold tier keeps a
+/// reference to a file the compaction GC will delete (the 2026-07-16 data-loss
+/// bug). Pure + unit-tested; the caller performs the actual manifest I/O.
+enum GraduatedNodePlan {
+    /// No pending removal touches the node — graduate by cheap reference.
+    ByReference,
+    /// Every alive file was removed — drop the node (nothing enters cold).
+    Skip,
+    /// Some files removed — materialize a clean leaf from these kept entries.
+    Materialize(Vec<ManifestEntry>),
+}
+
+/// Classify a graduating node's manifest entries against the pending removals.
+/// Incremental deletes are delta path-tombstones (not MDVs), so a node can look
+/// "clean" (`mdv == None`) yet still list merged-away files — this catches them.
+fn plan_graduated_node(
+    entries: &[Arc<ManifestEntry>],
+    removed_paths: &HashSet<String>,
+) -> GraduatedNodePlan {
+    let alive: Vec<&Arc<ManifestEntry>> = entries.iter().filter(|e| e.is_alive()).collect();
+    let has_removed = alive
+        .iter()
+        .any(|e| removed_paths.contains(e.data_file().file_path()));
+    if !has_removed {
+        return GraduatedNodePlan::ByReference;
+    }
+    let kept: Vec<ManifestEntry> = alive
+        .iter()
+        .filter(|e| !removed_paths.contains(e.data_file().file_path()))
+        .map(|e| {
+            ManifestEntry::builder()
+                .status(ManifestStatus::Existing)
+                .data_file(e.data_file().clone())
+                .build()
+        })
+        .collect();
+    if kept.is_empty() {
+        GraduatedNodePlan::Skip
+    } else {
+        GraduatedNodePlan::Materialize(kept)
+    }
+}
+
 /// Fold the "closed" entries of a reconstructed live set (those whose max
 /// `ts_field_id` event time is below `cutoff_micros`) into the cold bucket-index,
 /// returning the entries that stay hot (`kept`) and — if anything was moved — a
@@ -194,6 +239,14 @@ pub(crate) struct FoldOutcome {
 pub(crate) async fn fold_closed_into_bucket_index(
     table: &Table,
     entries: Vec<RootManifestEntry>,
+    // Ref-resident pending removals (incremental delta path-tombstones from a
+    // merge's `replace_data_files`). On incremental tables these are NOT recorded
+    // as MDVs, so the `mdv.is_some()` dirty-check below can't see them. A
+    // graduating node that still lists any of these is MATERIALIZED (its leaf
+    // rewritten without them) before it enters cold — otherwise graduation would
+    // carry merged-away, soon-GC-deleted files into the cold tier, leaving
+    // dangling references that 404 after grace (the 2026-07-16 data-loss bug).
+    removed_paths: &HashSet<String>,
     carried_bucket_index_path: Option<&str>,
     cutoff_micros: i64,
     ts_field_id: i32,
@@ -423,8 +476,60 @@ pub(crate) async fn fold_closed_into_bucket_index(
         inline_leaves = new_leaves.len();
         cold_leaves.extend(new_leaves);
     }
-    // Move graduated live nodes into cold by reference (immutable, no rewrite).
-    cold_leaves.extend(graduated_nodes);
+    // Move graduated live nodes into cold. The "a closed node is immutable"
+    // assumption only holds when nothing has been removed from it. On incremental
+    // tables a merge's deletes are delta path-tombstones (`removed_paths`), not
+    // MDVs, so a node whose small files were merged away still lists them and is
+    // NOT caught by the `mdv.is_some()` check above. Moving it by reference would
+    // carry those merged-away (soon-GC-deleted) files into the cold tier ⇒
+    // dangling refs ⇒ 404 after grace. So: a graduating node with any pending
+    // removal is MATERIALIZED here (leaf rewritten keeping only non-removed alive
+    // entries). Nodes with no pending removal still move by cheap reference.
+    if removed_paths.is_empty() {
+        cold_leaves.extend(graduated_nodes);
+    } else {
+        for mf in graduated_nodes {
+            // Best-effort: a load failure (e.g. an already-corrupt/absent
+            // manifest) must not fail the whole collapse commit — fall back to
+            // moving by reference (preserving prior behavior for that node).
+            let manifest = match mf.load_manifest(table.file_io()).await {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!(
+                        "graduation: could not load {} to materialize removals, moving by reference: {e}",
+                        mf.manifest_path
+                    );
+                    cold_leaves.push(mf);
+                    continue;
+                }
+            };
+            match plan_graduated_node(manifest.entries(), removed_paths) {
+                // Clean node → move by reference (fast path preserved).
+                GraduatedNodePlan::ByReference => cold_leaves.push(mf),
+                // Every file merged away → fully orphaned manifest; drop it (its
+                // data files are already tombstoned by the merge). The stale
+                // manifest object leaks; the reachability backstop reclaims it.
+                GraduatedNodePlan::Skip => {}
+                // Mixed → materialize a clean cold leaf without the removed files.
+                GraduatedNodePlan::Materialize(kept) => {
+                    let rewritten = write_entries_clustered(
+                        table,
+                        &schema,
+                        spec.as_ref(),
+                        format_version,
+                        snapshot_id,
+                        commit_uuid,
+                        manifest_counter,
+                        false,
+                        kept,
+                        true,
+                    )
+                    .await?;
+                    cold_leaves.extend(rewritten);
+                }
+            }
+        }
+    }
 
     let bucket_index_path = format!(
         "{}/{}/bucket-index-{}-{}.parquet",
@@ -495,9 +600,12 @@ impl TransactionAction for GraduateBucketsAction {
         // Fold closed entries into the cold bucket-index (shared with the
         // commit_v4 collapse path). Returns the entries that stay hot plus the
         // updated bucket-index; None ⇒ nothing closed this pass.
+        let removed_set: HashSet<String> =
+            rm_metadata.removed_paths.iter().cloned().collect();
         let (kept, fold) = fold_closed_into_bucket_index(
             table,
             entries,
+            &removed_set,
             rm_metadata.bucket_index_path.as_deref(),
             self.cutoff_micros,
             self.ts_field_id,
@@ -611,7 +719,8 @@ impl TransactionAction for GraduateBucketsAction {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use super::*;
     use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Datum, Struct};
@@ -629,6 +738,66 @@ mod tests {
             b.upper_bounds(HashMap::from([(fid, Datum::timestamp_micros(micros))]));
         }
         b.build().unwrap()
+    }
+
+    fn alive_entry(path: &str) -> Arc<ManifestEntry> {
+        Arc::new(
+            ManifestEntry::builder()
+                .status(ManifestStatus::Existing)
+                .data_file(df(path, None))
+                .build(),
+        )
+    }
+
+    fn removed(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    // No pending removal touches the node → cheap by-reference graduation.
+    #[test]
+    fn plan_by_reference_when_nothing_removed() {
+        let entries = vec![alive_entry("a"), alive_entry("b")];
+        // empty removal set, and a non-matching removal set, both → ByReference
+        assert!(matches!(
+            plan_graduated_node(&entries, &removed(&[])),
+            GraduatedNodePlan::ByReference
+        ));
+        assert!(matches!(
+            plan_graduated_node(&entries, &removed(&["x"])),
+            GraduatedNodePlan::ByReference
+        ));
+    }
+
+    // Some files merged away → materialize a leaf with ONLY the survivors. This is
+    // the core 2026-07-16 fix: the removed file must never reach the cold tier.
+    #[test]
+    fn plan_materializes_without_removed_files() {
+        let entries = vec![alive_entry("a"), alive_entry("b"), alive_entry("c")];
+        match plan_graduated_node(&entries, &removed(&["b"])) {
+            GraduatedNodePlan::Materialize(kept) => {
+                let paths: Vec<&str> = kept.iter().map(|e| e.data_file().file_path()).collect();
+                assert_eq!(paths, vec!["a", "c"], "removed file 'b' must be dropped");
+            }
+            other => panic!("expected Materialize, got {:?}", plan_name(&other)),
+        }
+    }
+
+    // Every alive file removed → drop the node entirely (nothing enters cold).
+    #[test]
+    fn plan_skips_when_all_removed() {
+        let entries = vec![alive_entry("a"), alive_entry("b")];
+        assert!(matches!(
+            plan_graduated_node(&entries, &removed(&["a", "b"])),
+            GraduatedNodePlan::Skip
+        ));
+    }
+
+    fn plan_name(p: &GraduatedNodePlan) -> &'static str {
+        match p {
+            GraduatedNodePlan::ByReference => "ByReference",
+            GraduatedNodePlan::Skip => "Skip",
+            GraduatedNodePlan::Materialize(_) => "Materialize",
+        }
     }
 
     #[test]

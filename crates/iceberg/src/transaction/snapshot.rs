@@ -1588,10 +1588,17 @@ impl<'a> SnapshotProducer<'a> {
                         // (which are named from `self.commit_uuid`).
                         let fold_uuid = Uuid::now_v7();
                         let mut fold_counter: u64 = 0;
+                        // Ref-resident pending removals this collapse carries
+                        // forward — the fold must materialize these out of any
+                        // node it graduates so cold never references a
+                        // merged-away, soon-deleted file (2026-07-16 fix).
+                        let fold_removed: HashSet<String> =
+                            node_removed_paths.iter().cloned().collect();
                         let (kept, fold) =
                             crate::transaction::graduate_buckets::fold_closed_into_bucket_index(
                                 &self.table,
                                 std::mem::take(&mut entries),
+                                &fold_removed,
                                 carried_bucket_index_path.as_deref(),
                                 cutoff_micros,
                                 ts_field_id,

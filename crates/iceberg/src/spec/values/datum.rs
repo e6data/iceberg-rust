@@ -359,7 +359,7 @@ impl From<Datum> for PrimitiveLiteral {
 
 impl Datum {
     /// Creates a `Datum` from a `PrimitiveType` and a `PrimitiveLiteral`
-    pub(crate) fn new(r#type: PrimitiveType, literal: PrimitiveLiteral) -> Self {
+    pub fn new(r#type: PrimitiveType, literal: PrimitiveLiteral) -> Self {
         Datum { r#type, literal }
     }
 

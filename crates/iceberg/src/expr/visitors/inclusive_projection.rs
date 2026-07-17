@@ -24,13 +24,15 @@ use crate::expr::{BoundPredicate, BoundReference, Predicate};
 use crate::spec::{Datum, PartitionField, PartitionSpecRef};
 use crate::{Error, ErrorKind};
 
-pub(crate) struct InclusiveProjection {
+/// Inclusive projection of predicates onto partition fields.
+pub struct InclusiveProjection {
     partition_spec: PartitionSpecRef,
     cached_parts: HashMap<i32, Vec<PartitionField>>,
 }
 
 impl InclusiveProjection {
-    pub(crate) fn new(partition_spec: PartitionSpecRef) -> Self {
+    /// Creates a new projection for the given partition spec.
+    pub fn new(partition_spec: PartitionSpecRef) -> Self {
         Self {
             partition_spec,
             cached_parts: HashMap::new(),
@@ -52,7 +54,8 @@ impl InclusiveProjection {
         &self.cached_parts[&field_id]
     }
 
-    pub(crate) fn project(&mut self, predicate: &BoundPredicate) -> crate::Result<Predicate> {
+    /// Projects a bound predicate onto partition fields.
+    pub fn project(&mut self, predicate: &BoundPredicate) -> crate::Result<Predicate> {
         visit(self, predicate)
     }
 

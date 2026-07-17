@@ -23,6 +23,11 @@ pub use term::*;
 pub(crate) mod accessor;
 mod predicate;
 pub(crate) mod visitors;
+
+/// Projects a bound predicate onto partition fields.
+pub use visitors::inclusive_projection::InclusiveProjection;
+/// Evaluates a bound predicate against manifest partition summaries.
+pub use visitors::manifest_evaluator::{ManifestEvaluator, ManifestEvaluatorBuilder};
 use std::fmt::{Display, Formatter};
 
 pub use predicate::*;

@@ -269,6 +269,17 @@ pub(crate) async fn fold_closed_into_bucket_index(
     let partition_type = spec.partition_type(&schema)?;
     let next_seq_num = table.metadata().next_sequence_number();
 
+    // Sub-phase timers so `tiered collapse-fold sub-phase` can attribute the
+    // fold wall-clock across (bi_load / ttl_prune / classify / write_bucket_index).
+    // On sri-olly graduated=0/ttl_dropped=0 folds still spend ~6.5s per commit;
+    // these break out where. `fallback_loads` counts the leaves/refs where
+    // `ref_max_event_micros` returned None and we had to S3-read the manifest to
+    // recover the timestamp — hot signal for "timestamp field isn't a partition
+    // field" cases where the fast path is effectively bypassed on every entry.
+    let fold_started = std::time::Instant::now();
+    let mut ttl_prune_fallback_loads: usize = 0;
+    let mut classify_fallback_loads: usize = 0;
+
     // Accumulates TTL-dropped object paths (data files + the manifest/leaf files
     // that referenced them), bounded by `max_ttl_drop_files`. `ttl_budget_left`
     // returns whether another leaf/entry may still be dropped this fold.
@@ -277,6 +288,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
         |dropped: &Vec<String>| retention_cutoff_micros.is_some() && dropped.len() < max_ttl_drop_files;
 
     // Existing cold leaves (graduated nodes get appended to these).
+    let bi_load_start = std::time::Instant::now();
     let mut cold_leaves: Vec<ManifestFile> = match carried_bucket_index_path {
         Some(path) => {
             let b = table.file_io().new_input(path)?.read().await?;
@@ -284,12 +296,14 @@ pub(crate) async fn fold_closed_into_bucket_index(
         }
         None => Vec::new(),
     };
+    let bi_load_ms = bi_load_start.elapsed().as_millis() as u64;
 
     // ── TTL prune of the cold tier (steady-state path). Data ages into cold via
     // graduation long before it hits retention (retention ≫ bucket-window), so
     // expired data almost always lives here. Drop each cold leaf whose newest
     // `ts_field_id` value is below the retention cutoff; tombstone its data files
     // and the leaf manifest itself. Bounded by the file budget. ──
+    let ttl_prune_start = std::time::Instant::now();
     if let Some(retention_cutoff) = retention_cutoff_micros {
         let cold_total = cold_leaves.len();
         let mut with_ts_count = 0usize;
@@ -303,6 +317,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
             let mx = match ref_max_event_micros(&leaf, &spec, ts_field_id) {
                 Some(m) => Some(m),
                 None => {
+                    ttl_prune_fallback_loads += 1;
                     let manifest = leaf.load_manifest(table.file_io()).await?;
                     let files: Vec<DataFile> = manifest
                         .entries()
@@ -349,11 +364,14 @@ pub(crate) async fn fold_closed_into_bucket_index(
         );
         cold_leaves = surviving;
     }
+    let ttl_prune_ms = ttl_prune_start.elapsed().as_millis() as u64;
 
     // Partition into: closed live nodes (→ cold by reference), closed inline
     // files (→ materialize as cold leaves), and kept (stay hot). `closed_refs`
     // carries each node's newest event time so we can graduate the COLDEST
     // first when the per-collapse cap trims the batch.
+    let classify_start = std::time::Instant::now();
+    let entries_total = entries.len();
     let mut kept: Vec<RootManifestEntry> = Vec::new();
     let mut closed_refs: Vec<(ManifestFile, i64)> = Vec::new();
     let mut closed_inline_files: Vec<DataFile> = Vec::new();
@@ -373,6 +391,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
                 let max_micros = match ref_max_event_micros(&manifest_file, &spec, ts_field_id) {
                     Some(m) => Some(m),
                     None => {
+                        classify_fallback_loads += 1;
                         let manifest = manifest_file.load_manifest(table.file_io()).await?;
                         let files: Vec<DataFile> = manifest
                             .entries()
@@ -437,6 +456,8 @@ pub(crate) async fn fold_closed_into_bucket_index(
     }
     let graduated_nodes: Vec<ManifestFile> = closed_refs.into_iter().map(|(mf, _)| mf).collect();
 
+    let classify_ms = classify_start.elapsed().as_millis() as u64;
+
     // Nothing to do only if no graduation AND no TTL prune happened. A TTL-only
     // fold (cold leaves dropped, nothing graduated) still must persist the
     // pruned bucket-index and return the dropped paths.
@@ -444,6 +465,17 @@ pub(crate) async fn fold_closed_into_bucket_index(
         && closed_inline_files.is_empty()
         && ttl_dropped_paths.is_empty()
     {
+        log::info!(
+            "tiered collapse-fold sub-phase: total_ms={} bi_load_ms={} ttl_prune_ms={} classify_ms={} write_ms=0 entries={} cold_leaves={} ttl_fallback_loads={} classify_fallback_loads={} outcome=none",
+            fold_started.elapsed().as_millis() as u64,
+            bi_load_ms,
+            ttl_prune_ms,
+            classify_ms,
+            entries_total,
+            cold_leaves.len(),
+            ttl_prune_fallback_loads,
+            classify_fallback_loads,
+        );
         return Ok((kept, None));
     }
     let nodes_moved = graduated_nodes.len();
@@ -552,14 +584,30 @@ pub(crate) async fn fold_closed_into_bucket_index(
         node_level: 0,
         removed_paths: Vec::new(),
     };
+    let write_start = std::time::Instant::now();
     let bi_bytes = write_bucket_index(&cold_leaves, &bi_metadata, &partition_type)?;
     table
         .file_io()
         .new_output(&bucket_index_path)?
         .write(bi_bytes.into())
         .await?;
+    let write_ms = write_start.elapsed().as_millis() as u64;
 
     let cold_leaves_total = cold_leaves.len();
+    log::info!(
+        "tiered collapse-fold sub-phase: total_ms={} bi_load_ms={} ttl_prune_ms={} classify_ms={} write_ms={} entries={} cold_leaves={} nodes_moved={} inline_leaves={} ttl_fallback_loads={} classify_fallback_loads={} outcome=changed",
+        fold_started.elapsed().as_millis() as u64,
+        bi_load_ms,
+        ttl_prune_ms,
+        classify_ms,
+        write_ms,
+        entries_total,
+        cold_leaves_total,
+        nodes_moved,
+        inline_leaves,
+        ttl_prune_fallback_loads,
+        classify_fallback_loads,
+    );
     Ok((
         kept,
         Some(FoldOutcome {

@@ -37,7 +37,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::{iter as stream_iter, StreamExt};
 use uuid::Uuid;
+
+/// Concurrency for the parallel `load_manifest` fallback in the collapse-fold
+/// classify + TTL-prune passes. On sri-olly the fold saw ~271 cold leaves +
+/// ~143 hot refs where `ref_max_event_micros` couldn't answer from the
+/// partition summary (because `tiered-metadata.timestamp-field=ingestion_time`
+/// isn't a partition field). Sequential await drove ~18s of critical-path
+/// wall on every no-op fold (271 + 143 × ~45ms S3 GET). Parallel-fetching
+/// bounded by this constant brings that back into the single-digit hundreds
+/// of ms. Matches merge_worker's fanout; well within S3's per-client budget.
+const FOLD_MANIFEST_FETCH_CONCURRENCY: usize = 32;
 
 use super::rebalance_root_manifest::write_entries_clustered;
 use crate::error::Result;
@@ -311,22 +322,53 @@ pub(crate) async fn fold_closed_into_bucket_index(
         let mut newest_max_ts: Option<i64> = None;
         let mut oldest_max_ts: Option<i64> = None;
         let mut surviving: Vec<ManifestFile> = Vec::with_capacity(cold_leaves.len());
+
+        // Pre-fetch pass: parallel-load every cold leaf whose max_ts can't be
+        // answered from the partition summary. Before this change the fallback
+        // was one sequential `.await` per leaf inside the reduce loop below,
+        // driving the entire TTL-prune wall (12.5s of a 18s no-op fold on
+        // sri-olly). buffer_unordered lets S3 answer 32 at once; the resulting
+        // hashmap is a synchronous lookup in the same reduce loop.
+        let prefetch: HashMap<String, Option<i64>> = {
+            let needs_fetch: Vec<ManifestFile> = cold_leaves
+                .iter()
+                .filter(|leaf| ref_max_event_micros(leaf, &spec, ts_field_id).is_none())
+                .cloned()
+                .collect();
+            ttl_prune_fallback_loads = needs_fetch.len();
+            let file_io = table.file_io();
+            let mut map: HashMap<String, Option<i64>> = HashMap::with_capacity(needs_fetch.len());
+            let mut s = stream_iter(needs_fetch.into_iter().map(|leaf| {
+                let file_io = file_io.clone();
+                async move {
+                    let mx_res: Result<Option<i64>> = match leaf.load_manifest(&file_io).await {
+                        Ok(manifest) => {
+                            let files: Vec<DataFile> = manifest
+                                .entries()
+                                .iter()
+                                .filter(|e| e.is_alive())
+                                .map(|e| e.data_file().clone())
+                                .collect();
+                            Ok(max_ts_of(&files, ts_field_id))
+                        }
+                        Err(e) => Err(e),
+                    };
+                    (leaf.manifest_path.clone(), mx_res)
+                }
+            }))
+            .buffer_unordered(FOLD_MANIFEST_FETCH_CONCURRENCY);
+            while let Some((path, mx_res)) = s.next().await {
+                map.insert(path, mx_res?);
+            }
+            map
+        };
+
         // Coldest-first so the budget reclaims the oldest data before newer.
         let mut with_ts: Vec<(ManifestFile, Option<i64>)> = Vec::with_capacity(cold_leaves.len());
         for leaf in std::mem::take(&mut cold_leaves) {
             let mx = match ref_max_event_micros(&leaf, &spec, ts_field_id) {
                 Some(m) => Some(m),
-                None => {
-                    ttl_prune_fallback_loads += 1;
-                    let manifest = leaf.load_manifest(table.file_io()).await?;
-                    let files: Vec<DataFile> = manifest
-                        .entries()
-                        .iter()
-                        .filter(|e| e.is_alive())
-                        .map(|e| e.data_file().clone())
-                        .collect();
-                    max_ts_of(&files, ts_field_id)
-                }
+                None => prefetch.get(&leaf.manifest_path).copied().flatten(),
             };
             match mx {
                 Some(m) => {
@@ -376,6 +418,54 @@ pub(crate) async fn fold_closed_into_bucket_index(
     let mut closed_refs: Vec<(ManifestFile, i64)> = Vec::new();
     let mut closed_inline_files: Vec<DataFile> = Vec::new();
 
+    // Pre-fetch pass (mirrors the TTL-prune prefetch above): parallel-load
+    // manifests for hot ManifestRef entries whose max_ts can't be answered
+    // from the partition summary. Same rationale — sri-olly had 143/153 hot
+    // entries falling back, driving 5.6s of classify wall on a no-op fold.
+    // Inline entries need no S3 and MDV-carrying refs are kept unconditionally,
+    // so we filter to the exact set that needs a manifest load.
+    let classify_prefetch: HashMap<String, Option<i64>> = {
+        let needs_fetch: Vec<ManifestFile> = entries
+            .iter()
+            .filter_map(|e| match e {
+                RootManifestEntry::ManifestRef { manifest_file, mdv } if mdv.is_none() => {
+                    if ref_max_event_micros(manifest_file, &spec, ts_field_id).is_none() {
+                        Some(manifest_file.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        classify_fallback_loads = needs_fetch.len();
+        let file_io = table.file_io();
+        let mut map: HashMap<String, Option<i64>> = HashMap::with_capacity(needs_fetch.len());
+        let mut s = stream_iter(needs_fetch.into_iter().map(|mf| {
+            let file_io = file_io.clone();
+            async move {
+                let mx_res: Result<Option<i64>> = match mf.load_manifest(&file_io).await {
+                    Ok(manifest) => {
+                        let files: Vec<DataFile> = manifest
+                            .entries()
+                            .iter()
+                            .filter(|e| e.is_alive())
+                            .map(|e| e.data_file().clone())
+                            .collect();
+                        Ok(max_ts_of(&files, ts_field_id))
+                    }
+                    Err(e) => Err(e),
+                };
+                (mf.manifest_path.clone(), mx_res)
+            }
+        }))
+        .buffer_unordered(FOLD_MANIFEST_FETCH_CONCURRENCY);
+        while let Some((path, mx_res)) = s.next().await {
+            map.insert(path, mx_res?);
+        }
+        map
+    };
+
     for entry in entries {
         match entry {
             RootManifestEntry::ManifestRef { manifest_file, mdv } => {
@@ -386,21 +476,15 @@ pub(crate) async fn fold_closed_into_bucket_index(
                     continue;
                 }
                 // Fast path: newest event time straight from the partition
-                // summary (no manifest read). Fall back to loading the manifest
-                // only when the ts field isn't partitioned by a time transform.
+                // summary (no manifest read). Fall back to the prefetch
+                // hashmap (parallel-loaded upstream) when the ts field isn't
+                // partitioned by a time transform.
                 let max_micros = match ref_max_event_micros(&manifest_file, &spec, ts_field_id) {
                     Some(m) => Some(m),
-                    None => {
-                        classify_fallback_loads += 1;
-                        let manifest = manifest_file.load_manifest(table.file_io()).await?;
-                        let files: Vec<DataFile> = manifest
-                            .entries()
-                            .iter()
-                            .filter(|e| e.is_alive())
-                            .map(|e| e.data_file().clone())
-                            .collect();
-                        max_ts_of(&files, ts_field_id)
-                    }
+                    None => classify_prefetch
+                        .get(&manifest_file.manifest_path)
+                        .copied()
+                        .flatten(),
                 };
                 // Expired past retention (edge case for hot data: normally it
                 // graduates to cold long before this). Drop + tombstone rather

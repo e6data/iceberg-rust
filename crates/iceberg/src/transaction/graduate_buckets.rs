@@ -50,6 +50,85 @@ use uuid::Uuid;
 /// of ms. Matches merge_worker's fanout; well within S3's per-client budget.
 const FOLD_MANIFEST_FETCH_CONCURRENCY: usize = 32;
 
+/// Suffix appended to a bucket-index path to derive its max-ts sidecar path.
+/// The sidecar caches, for the leaves that particular bucket-index references,
+/// the newest event time each leaf holds under a given `ts_field_id` — the
+/// exact value TTL prune and classification need. Sidecar present + covering
+/// = zero S3 GETs on the fold's ttl_prune pass; sidecar missing/stale = fall
+/// back to the parallel-prefetch loop (which stays exactly as before).
+const BUCKET_INDEX_MAXTS_SIDECAR_SUFFIX: &str = ".max-ts.json";
+
+/// JSON shape of the max-ts sidecar. Reader validates `ts_field_id` and
+/// `format_version` before trusting the map; a mismatch (e.g. someone changed
+/// `tiered-metadata.timestamp-field`) invalidates the whole sidecar and we
+/// fall back to loading manifests. Entries not present in the map on read
+/// still fall back on a per-leaf basis.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MaxTsSidecar {
+    /// Sidecar format version; bump if the on-disk shape changes.
+    format_version: u32,
+    /// The ts_field_id whose max values are cached. Mismatches invalidate.
+    ts_field_id: i32,
+    /// `{leaf.manifest_path → newest ts_field_id upper-bound in micros}`.
+    /// `None` means "we tried to compute and got nothing" (e.g. leaf carries
+    /// no bound for `ts_field_id`) — still useful to cache the negative so
+    /// we don't re-load next fold.
+    entries: HashMap<String, Option<i64>>,
+}
+const MAXTS_SIDECAR_FORMAT_V1: u32 = 1;
+
+fn bucket_index_maxts_sidecar_path(bucket_index_path: &str) -> String {
+    format!("{bucket_index_path}{BUCKET_INDEX_MAXTS_SIDECAR_SUFFIX}")
+}
+
+/// Load a max-ts sidecar for `bucket_index_path`. `None` on any failure
+/// (missing, unreadable, corrupt, wrong ts_field_id, wrong format version)
+/// — the caller falls back to loading manifests, so all failure modes are
+/// non-fatal.
+async fn load_maxts_sidecar(
+    file_io: &crate::io::FileIO,
+    bucket_index_path: &str,
+    ts_field_id: i32,
+) -> Option<HashMap<String, Option<i64>>> {
+    let path = bucket_index_maxts_sidecar_path(bucket_index_path);
+    let input = file_io.new_input(&path).ok()?;
+    let bytes = input.read().await.ok()?;
+    let sidecar: MaxTsSidecar = serde_json::from_slice(&bytes).ok()?;
+    if sidecar.format_version != MAXTS_SIDECAR_FORMAT_V1 {
+        return None;
+    }
+    if sidecar.ts_field_id != ts_field_id {
+        return None;
+    }
+    Some(sidecar.entries)
+}
+
+/// Write a max-ts sidecar for `bucket_index_path`. Non-fatal on failure —
+/// we log and continue, since the sidecar is a pure cache and the next fold
+/// will just fall back to loading manifests until the write eventually
+/// succeeds.
+async fn write_maxts_sidecar(
+    file_io: &crate::io::FileIO,
+    bucket_index_path: &str,
+    ts_field_id: i32,
+    entries: HashMap<String, Option<i64>>,
+) -> crate::error::Result<()> {
+    let sidecar = MaxTsSidecar {
+        format_version: MAXTS_SIDECAR_FORMAT_V1,
+        ts_field_id,
+        entries,
+    };
+    let bytes = serde_json::to_vec(&sidecar).map_err(|e| {
+        crate::error::Error::new(
+            crate::error::ErrorKind::Unexpected,
+            format!("serialize max-ts sidecar: {e}"),
+        )
+    })?;
+    let path = bucket_index_maxts_sidecar_path(bucket_index_path);
+    let output = file_io.new_output(&path)?;
+    output.write(bytes.into()).await
+}
+
 use super::rebalance_root_manifest::write_entries_clustered;
 use crate::error::Result;
 use crate::spec::bucket_index::{read_bucket_index, write_bucket_index};
@@ -290,6 +369,16 @@ pub(crate) async fn fold_closed_into_bucket_index(
     let fold_started = std::time::Instant::now();
     let mut ttl_prune_fallback_loads: usize = 0;
     let mut classify_fallback_loads: usize = 0;
+    // Max-ts sidecar telemetry: how many TTL-prune leaves got their max_ts
+    // from the persisted sidecar (0 S3 GETs) vs had to fall through to the
+    // parallel-prefetch (~9ms/leaf). On a warm sidecar the fold should be
+    // dominated by bi_load + write, with ttl_prune ~ same as bi_load.
+    let mut sidecar_hits: usize = 0;
+    let mut sidecar_misses: usize = 0;
+    // Fresh max_ts values computed this fold — the new sidecar payload.
+    // Populated regardless of outcome, so a no-op fold can also write the
+    // sidecar the first time to warm it.
+    let mut computed_max_ts: HashMap<String, Option<i64>> = HashMap::new();
 
     // Accumulates TTL-dropped object paths (data files + the manifest/leaf files
     // that referenced them), bounded by `max_ttl_drop_files`. `ttl_budget_left`
@@ -309,6 +398,17 @@ pub(crate) async fn fold_closed_into_bucket_index(
     };
     let bi_load_ms = bi_load_start.elapsed().as_millis() as u64;
 
+    // Load the max-ts sidecar (if any) BEFORE the TTL-prune loop, so the
+    // hot loop can hit it directly. Missing sidecar or a hit for a leaf
+    // that's since been graduated-in-then-out remains fine — the caller
+    // just falls through to the parallel fetch.
+    let sidecar_max_ts: HashMap<String, Option<i64>> = match carried_bucket_index_path {
+        Some(path) => load_maxts_sidecar(table.file_io(), path, ts_field_id)
+            .await
+            .unwrap_or_default(),
+        None => HashMap::new(),
+    };
+
     // ── TTL prune of the cold tier (steady-state path). Data ages into cold via
     // graduation long before it hits retention (retention ≫ bucket-window), so
     // expired data almost always lives here. Drop each cold leaf whose newest
@@ -324,15 +424,30 @@ pub(crate) async fn fold_closed_into_bucket_index(
         let mut surviving: Vec<ManifestFile> = Vec::with_capacity(cold_leaves.len());
 
         // Pre-fetch pass: parallel-load every cold leaf whose max_ts can't be
-        // answered from the partition summary. Before this change the fallback
-        // was one sequential `.await` per leaf inside the reduce loop below,
-        // driving the entire TTL-prune wall (12.5s of a 18s no-op fold on
-        // sri-olly). buffer_unordered lets S3 answer 32 at once; the resulting
-        // hashmap is a synchronous lookup in the same reduce loop.
+        // answered from the partition summary OR the max-ts sidecar. Before
+        // the parallel fix this was one sequential `.await` per leaf inside
+        // the reduce loop; before the sidecar it was O(all cold leaves) S3
+        // GETs even in steady state. buffer_unordered lets S3 answer 32 at
+        // once for whatever the sidecar didn't cover; the resulting hashmap
+        // is a synchronous lookup in the same reduce loop.
         let prefetch: HashMap<String, Option<i64>> = {
             let needs_fetch: Vec<ManifestFile> = cold_leaves
                 .iter()
-                .filter(|leaf| ref_max_event_micros(leaf, &spec, ts_field_id).is_none())
+                .filter(|leaf| {
+                    // Order matters — cheapest checks first:
+                    //   sidecar hit → skip;
+                    //   partition summary fast path → skip;
+                    //   otherwise fall into the parallel prefetch.
+                    if sidecar_max_ts.contains_key(&leaf.manifest_path) {
+                        sidecar_hits += 1;
+                        return false;
+                    }
+                    if ref_max_event_micros(leaf, &spec, ts_field_id).is_some() {
+                        return false;
+                    }
+                    sidecar_misses += 1;
+                    true
+                })
                 .cloned()
                 .collect();
             ttl_prune_fallback_loads = needs_fetch.len();
@@ -366,10 +481,19 @@ pub(crate) async fn fold_closed_into_bucket_index(
         // Coldest-first so the budget reclaims the oldest data before newer.
         let mut with_ts: Vec<(ManifestFile, Option<i64>)> = Vec::with_capacity(cold_leaves.len());
         for leaf in std::mem::take(&mut cold_leaves) {
-            let mx = match ref_max_event_micros(&leaf, &spec, ts_field_id) {
-                Some(m) => Some(m),
-                None => prefetch.get(&leaf.manifest_path).copied().flatten(),
+            // Resolution order matches the filter above: sidecar → partition
+            // summary → prefetched load. Record whichever wins into
+            // `computed_max_ts` so the next fold can just hit the sidecar
+            // for this leaf. Leaves resolved via prefetch are the only ones
+            // that "cost" this fold; sidecar hits are pure in-memory.
+            let mx = if let Some(v) = sidecar_max_ts.get(&leaf.manifest_path).copied() {
+                v
+            } else if let Some(m) = ref_max_event_micros(&leaf, &spec, ts_field_id) {
+                Some(m)
+            } else {
+                prefetch.get(&leaf.manifest_path).copied().flatten()
             };
+            computed_max_ts.insert(leaf.manifest_path.clone(), mx);
             match mx {
                 Some(m) => {
                     with_ts_count += 1;
@@ -549,16 +673,53 @@ pub(crate) async fn fold_closed_into_bucket_index(
         && closed_inline_files.is_empty()
         && ttl_dropped_paths.is_empty()
     {
+        // Opportunistically warm the max-ts sidecar for the CURRENT
+        // bucket-index if it's missing / incomplete. Steady-state folds
+        // don't rewrite the bucket-index so the sidecar would otherwise
+        // never populate; this covers the first fold post-deploy and any
+        // fold where the earlier write failed. Skipped when the sidecar
+        // already covers every cold leaf (no work needed).
+        let mut sidecar_write_ms: u64 = 0;
+        if let Some(carried) = carried_bucket_index_path {
+            let covers_all = !cold_leaves.is_empty()
+                && cold_leaves
+                    .iter()
+                    .all(|leaf| sidecar_max_ts.contains_key(&leaf.manifest_path));
+            if !covers_all {
+                let mut new_sidecar: HashMap<String, Option<i64>> =
+                    HashMap::with_capacity(cold_leaves.len());
+                for leaf in &cold_leaves {
+                    let mx = computed_max_ts
+                        .get(&leaf.manifest_path)
+                        .copied()
+                        .or_else(|| Some(ref_max_event_micros(leaf, &spec, ts_field_id)))
+                        .unwrap_or(None);
+                    new_sidecar.insert(leaf.manifest_path.clone(), mx);
+                }
+                let write_start = std::time::Instant::now();
+                if let Err(e) =
+                    write_maxts_sidecar(table.file_io(), carried, ts_field_id, new_sidecar).await
+                {
+                    log::warn!(
+                        "tiered collapse-fold: opportunistic max-ts sidecar warm failed (non-fatal): {e}"
+                    );
+                }
+                sidecar_write_ms = write_start.elapsed().as_millis() as u64;
+            }
+        }
         log::info!(
-            "tiered collapse-fold sub-phase: total_ms={} bi_load_ms={} ttl_prune_ms={} classify_ms={} write_ms=0 entries={} cold_leaves={} ttl_fallback_loads={} classify_fallback_loads={} outcome=none",
+            "tiered collapse-fold sub-phase: total_ms={} bi_load_ms={} ttl_prune_ms={} classify_ms={} write_ms={} entries={} cold_leaves={} ttl_fallback_loads={} classify_fallback_loads={} sidecar_hits={} sidecar_misses={} outcome=none",
             fold_started.elapsed().as_millis() as u64,
             bi_load_ms,
             ttl_prune_ms,
             classify_ms,
+            sidecar_write_ms,
             entries_total,
             cold_leaves.len(),
             ttl_prune_fallback_loads,
             classify_fallback_loads,
+            sidecar_hits,
+            sidecar_misses,
         );
         return Ok((kept, None));
     }
@@ -675,11 +836,34 @@ pub(crate) async fn fold_closed_into_bucket_index(
         .new_output(&bucket_index_path)?
         .write(bi_bytes.into())
         .await?;
+    // Refresh the sidecar to cover the new bucket-index. `computed_max_ts` is
+    // keyed by ORIGINAL cold-leaf paths (those we ran the ttl-prune loop
+    // over); leaves that were dropped by ttl are naturally excluded from the
+    // new cold_leaves so we don't leak stale entries. Fold-in the values for
+    // newly graduated leaves too, computed from their partition summaries
+    // when available. Non-fatal on write failure — next fold will just miss
+    // the sidecar and fall back to the prefetch path.
+    let mut new_sidecar: HashMap<String, Option<i64>> = HashMap::with_capacity(cold_leaves.len());
+    for leaf in &cold_leaves {
+        let mx = computed_max_ts
+            .get(&leaf.manifest_path)
+            .copied()
+            .or_else(|| Some(ref_max_event_micros(leaf, &spec, ts_field_id)))
+            .unwrap_or(None);
+        new_sidecar.insert(leaf.manifest_path.clone(), mx);
+    }
+    if let Err(e) =
+        write_maxts_sidecar(table.file_io(), &bucket_index_path, ts_field_id, new_sidecar).await
+    {
+        log::warn!(
+            "tiered collapse-fold: max-ts sidecar write failed (non-fatal): {e}"
+        );
+    }
     let write_ms = write_start.elapsed().as_millis() as u64;
 
     let cold_leaves_total = cold_leaves.len();
     log::info!(
-        "tiered collapse-fold sub-phase: total_ms={} bi_load_ms={} ttl_prune_ms={} classify_ms={} write_ms={} entries={} cold_leaves={} nodes_moved={} inline_leaves={} ttl_fallback_loads={} classify_fallback_loads={} outcome=changed",
+        "tiered collapse-fold sub-phase: total_ms={} bi_load_ms={} ttl_prune_ms={} classify_ms={} write_ms={} entries={} cold_leaves={} nodes_moved={} inline_leaves={} ttl_fallback_loads={} classify_fallback_loads={} sidecar_hits={} sidecar_misses={} outcome=changed",
         fold_started.elapsed().as_millis() as u64,
         bi_load_ms,
         ttl_prune_ms,
@@ -691,6 +875,8 @@ pub(crate) async fn fold_closed_into_bucket_index(
         inline_leaves,
         ttl_prune_fallback_loads,
         classify_fallback_loads,
+        sidecar_hits,
+        sidecar_misses,
     );
     Ok((
         kept,

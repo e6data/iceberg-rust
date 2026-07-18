@@ -939,10 +939,34 @@ impl<'a> SnapshotProducer<'a> {
                 continue;
             }
 
-            // Read all manifests in this bin, collect their entries
+            // Read all manifests in this bin in parallel, collect their entries.
+            // Sequential .await was O(bin_size × S3 GET) — sri-olly saw
+            // `manifest merge: 129 manifests → 1` cost ~3.8s (129 × ~30ms).
+            // Same fix pattern as fold_closed_into_bucket_index's fallback loads:
+            // buffer_unordered gets S3 to work on many at once. Ordering doesn't
+            // matter — entries carry their own sequence numbers and each is
+            // independently upgraded from Added → Existing below.
+            const MANIFEST_MERGE_LOAD_CONCURRENCY: usize = 32;
+            let file_io = self.table.file_io();
+            let loaded: Vec<(ManifestFile, crate::spec::Manifest)> = {
+                use futures::stream::{StreamExt, iter as stream_iter};
+                let mut out: Vec<(ManifestFile, crate::spec::Manifest)> =
+                    Vec::with_capacity(bin.len());
+                let mut s = stream_iter(bin.iter().cloned().map(|mf| {
+                    let file_io = file_io.clone();
+                    async move {
+                        let manifest = mf.load_manifest(&file_io).await;
+                        (mf, manifest)
+                    }
+                }))
+                .buffer_unordered(MANIFEST_MERGE_LOAD_CONCURRENCY);
+                while let Some((mf, res)) = s.next().await {
+                    out.push((mf, res?));
+                }
+                out
+            };
             let mut all_entries: Vec<ManifestEntry> = Vec::new();
-            for mf in &bin {
-                let manifest = mf.load_manifest(self.table.file_io()).await?;
+            for (mf, manifest) in loaded {
                 for entry_ref in manifest.entries() {
                     let mut entry = entry_ref.as_ref().clone();
                     // Change status: Added → Existing (entries are no longer new

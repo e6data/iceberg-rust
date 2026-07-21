@@ -70,9 +70,11 @@ struct MaxTsSidecar {
     /// The ts_field_id whose max values are cached. Mismatches invalidate.
     ts_field_id: i32,
     /// `{leaf.manifest_path → newest ts_field_id upper-bound in micros}`.
-    /// `None` means "we tried to compute and got nothing" (e.g. leaf carries
-    /// no bound for `ts_field_id`) — still useful to cache the negative so
-    /// we don't re-load next fold.
+    /// Only REAL values are written by current writers; a leaf we can't resolve
+    /// is left ABSENT (never cached as `None`) so the next fold re-derives it.
+    /// The type stays `Option<i64>` for wire-compat with older sidecars that DID
+    /// cache negatives — the reader treats any such `None` as a miss (auto-heal),
+    /// never as an authoritative "no timestamp".
     entries: HashMap<String, Option<i64>>,
 }
 const MAXTS_SIDECAR_FORMAT_V1: u32 = 1;
@@ -188,6 +190,22 @@ fn max_ts_of(files: &[DataFile], ts_field_id: i32) -> Option<i64> {
 fn file_max_ts(df: &DataFile, ts_field_id: i32) -> Option<i64> {
     match df.upper_bounds().get(&ts_field_id).map(|d| d.literal()) {
         Some(PrimitiveLiteral::Long(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Resolve a max-ts sidecar lookup into a trustworthy value. A hit exists ONLY
+/// when the entry holds a REAL value (`Some(Some)`). A present-but-`None` entry
+/// — poison written by an older writer that cached a non-answer — is treated as
+/// a MISS so the caller re-derives the max-ts (partition summary / manifest
+/// load) instead of trusting it. Absent (`None`) is likewise a miss. Pure.
+///
+/// Without this, an all-`None` sidecar permanently suppresses TTL for any table
+/// whose retention ts-field isn't the partition source (e.g. logs on
+/// `ingestion_time`, where `ref_max_event_micros` is structurally always None).
+fn sidecar_hit(entry: Option<&Option<i64>>) -> Option<i64> {
+    match entry {
+        Some(Some(v)) => Some(*v),
         _ => None,
     }
 }
@@ -438,7 +456,9 @@ pub(crate) async fn fold_closed_into_bucket_index(
                     //   sidecar hit → skip;
                     //   partition summary fast path → skip;
                     //   otherwise fall into the parallel prefetch.
-                    if sidecar_max_ts.contains_key(&leaf.manifest_path) {
+                    // Only a REAL cached value is a hit; a cached `None` falls
+                    // through to re-derive (see `sidecar_hit`).
+                    if sidecar_hit(sidecar_max_ts.get(&leaf.manifest_path)).is_some() {
                         sidecar_hits += 1;
                         return false;
                     }
@@ -486,8 +506,8 @@ pub(crate) async fn fold_closed_into_bucket_index(
             // `computed_max_ts` so the next fold can just hit the sidecar
             // for this leaf. Leaves resolved via prefetch are the only ones
             // that "cost" this fold; sidecar hits are pure in-memory.
-            let mx = if let Some(v) = sidecar_max_ts.get(&leaf.manifest_path).copied() {
-                v
+            let mx = if let Some(v) = sidecar_hit(sidecar_max_ts.get(&leaf.manifest_path)) {
+                Some(v)
             } else if let Some(m) = ref_max_event_micros(&leaf, &spec, ts_field_id) {
                 Some(m)
             } else {
@@ -681,20 +701,27 @@ pub(crate) async fn fold_closed_into_bucket_index(
         // already covers every cold leaf (no work needed).
         let mut sidecar_write_ms: u64 = 0;
         if let Some(carried) = carried_bucket_index_path {
+            // A leaf is "covered" only by a REAL cached value; a `None` entry is
+            // poison and must be rewritten with a real value if we now have one.
             let covers_all = !cold_leaves.is_empty()
-                && cold_leaves
-                    .iter()
-                    .all(|leaf| sidecar_max_ts.contains_key(&leaf.manifest_path));
+                && cold_leaves.iter().all(|leaf| {
+                    sidecar_hit(sidecar_max_ts.get(&leaf.manifest_path)).is_some()
+                });
             if !covers_all {
                 let mut new_sidecar: HashMap<String, Option<i64>> =
                     HashMap::with_capacity(cold_leaves.len());
                 for leaf in &cold_leaves {
-                    let mx = computed_max_ts
+                    // Only persist a REAL max-ts. Caching a `None` poisons the
+                    // sidecar (the reader would trust it and never re-derive); an
+                    // absent leaf is correctly re-fetched by the next fold.
+                    if let Some(v) = computed_max_ts
                         .get(&leaf.manifest_path)
                         .copied()
-                        .or_else(|| Some(ref_max_event_micros(leaf, &spec, ts_field_id)))
-                        .unwrap_or(None);
-                    new_sidecar.insert(leaf.manifest_path.clone(), mx);
+                        .flatten()
+                        .or_else(|| ref_max_event_micros(leaf, &spec, ts_field_id))
+                    {
+                        new_sidecar.insert(leaf.manifest_path.clone(), Some(v));
+                    }
                 }
                 let write_start = std::time::Instant::now();
                 if let Err(e) =
@@ -845,12 +872,17 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // the sidecar and fall back to the prefetch path.
     let mut new_sidecar: HashMap<String, Option<i64>> = HashMap::with_capacity(cold_leaves.len());
     for leaf in &cold_leaves {
-        let mx = computed_max_ts
+        // Only persist a REAL max-ts (see the ttl-prune reader): a cached `None`
+        // is a non-answer that would poison the next fold, so skip it and let the
+        // reader re-derive that leaf.
+        if let Some(v) = computed_max_ts
             .get(&leaf.manifest_path)
             .copied()
-            .or_else(|| Some(ref_max_event_micros(leaf, &spec, ts_field_id)))
-            .unwrap_or(None);
-        new_sidecar.insert(leaf.manifest_path.clone(), mx);
+            .flatten()
+            .or_else(|| ref_max_event_micros(leaf, &spec, ts_field_id))
+        {
+            new_sidecar.insert(leaf.manifest_path.clone(), Some(v));
+        }
     }
     if let Err(e) =
         write_maxts_sidecar(table.file_io(), &bucket_index_path, ts_field_id, new_sidecar).await
@@ -1116,6 +1148,20 @@ mod tests {
             GraduatedNodePlan::Skip => "Skip",
             GraduatedNodePlan::Materialize(_) => "Materialize",
         }
+    }
+
+    // The TTL-prune poison-tolerance fix: only a REAL cached value counts as a
+    // sidecar hit. A present-but-`None` entry (poison from an older writer) and
+    // an absent entry both resolve to a MISS so the caller re-derives — this is
+    // what lets an all-`None` logs sidecar self-heal instead of suppressing TTL
+    // forever.
+    #[test]
+    fn sidecar_hit_only_trusts_real_values() {
+        let real = Some(900i64);
+        let poison = None::<i64>;
+        assert_eq!(sidecar_hit(Some(&real)), Some(900), "real value → hit");
+        assert_eq!(sidecar_hit(Some(&poison)), None, "cached None → miss (poison)");
+        assert_eq!(sidecar_hit(None), None, "absent → miss");
     }
 
     #[test]

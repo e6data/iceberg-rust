@@ -50,6 +50,19 @@ use uuid::Uuid;
 /// of ms. Matches merge_worker's fanout; well within S3's per-client budget.
 const FOLD_MANIFEST_FETCH_CONCURRENCY: usize = 32;
 
+/// Bound the TTL-prune auto-heal batch. When a sidecar is fully poisoned
+/// (older writers cached `Some(None)` for every leaf on tables whose
+/// retention ts-field ≠ partition source — e.g. logs on `ingestion_time`),
+/// the poison-tolerance fix (2026-07-21) routes EVERY leaf into the parallel
+/// prefetch on the first fold. On sri-olly that's thousands of manifest
+/// loads on the commit critical path, blowing the 30s commit timeout →
+/// commits drop → sidecar never rewrites → deadlock. Capping the per-fold
+/// prefetch means each fold heals a slice (coldest-first, so TTL drops
+/// oldest data first) and the sidecar warms incrementally over ~ceil(N/cap)
+/// folds. At 32-way concurrency + ~50ms/leaf, this ceiling costs ~400ms of
+/// wall in the worst case — comfortably inside the commit budget.
+const MAX_TTL_PREFETCH_LEAVES: usize = 256;
+
 /// Suffix appended to a bucket-index path to derive its max-ts sidecar path.
 /// The sidecar caches, for the leaves that particular bucket-index references,
 /// the newest event time each leaf holds under a given `ts_field_id` — the
@@ -449,7 +462,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
         // once for whatever the sidecar didn't cover; the resulting hashmap
         // is a synchronous lookup in the same reduce loop.
         let prefetch: HashMap<String, Option<i64>> = {
-            let needs_fetch: Vec<ManifestFile> = cold_leaves
+            let mut needs_fetch: Vec<ManifestFile> = cold_leaves
                 .iter()
                 .filter(|leaf| {
                     // Order matters — cheapest checks first:
@@ -471,6 +484,16 @@ pub(crate) async fn fold_closed_into_bucket_index(
                 .cloned()
                 .collect();
             ttl_prune_fallback_loads = needs_fetch.len();
+            // Cap the auto-heal batch. Coldest-first (oldest sequence_number)
+            // so leaves most likely to be TTL-expired heal first — retention
+            // starts dropping the oldest data immediately, even mid-heal. On
+            // subsequent folds the sidecar has real values for the coldest
+            // slice, so needs_fetch shrinks each cycle and the whole sidecar
+            // converges within a handful of folds.
+            if needs_fetch.len() > MAX_TTL_PREFETCH_LEAVES {
+                needs_fetch.sort_by_key(|l| l.sequence_number);
+                needs_fetch.truncate(MAX_TTL_PREFETCH_LEAVES);
+            }
             let file_io = table.file_io();
             let mut map: HashMap<String, Option<i64>> = HashMap::with_capacity(needs_fetch.len());
             let mut s = stream_iter(needs_fetch.into_iter().map(|leaf| {

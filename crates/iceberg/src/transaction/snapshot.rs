@@ -112,6 +112,34 @@ fn resolve_grouping_positions(field_names: &[&str], grouping_fields: Option<&str
     }
 }
 
+/// Split manifest ENTRIES into partition-tight sub-groups by the same manifest
+/// grouping key the added-files write path uses (`resolve_grouping_positions`,
+/// default `timestamp_hour`). When `partition_scoped` is false, returns the
+/// entries as one group (legacy behavior). Used by the inline→child flush so a
+/// flush of spread-event-time inline entries produces one child manifest PER
+/// event-hour instead of a single wide multi-hour manifest — a wide manifest's
+/// partition-summary upper is its newest hour, which blocks tiered graduation/TTL
+/// of the older rows welded inside it (e.g. a late Jul-17 event pinned by live
+/// rows). Mirrors `write_added_manifest`'s grouping for the inline path.
+fn group_entries_by_manifest_key(
+    spec: &crate::spec::PartitionSpec,
+    entries: Vec<ManifestEntry>,
+    partition_scoped: bool,
+    grouping_fields: Option<&str>,
+) -> Vec<Vec<ManifestEntry>> {
+    if !partition_scoped {
+        return vec![entries];
+    }
+    let names: Vec<&str> = spec.fields().iter().map(|f| f.name.as_str()).collect();
+    let positions = resolve_grouping_positions(&names, grouping_fields);
+    let mut by_key: HashMap<String, Vec<ManifestEntry>> = HashMap::new();
+    for e in entries {
+        let key = partition_grouping_key(&e.data_file.partition, &positions);
+        by_key.entry(key).or_default().push(e);
+    }
+    by_key.into_values().collect()
+}
+
 /// A trait that defines how different table operations produce new snapshots.
 ///
 /// `SnapshotProduceOperation` is used by [`SnapshotProducer`] to customize snapshot creation
@@ -1820,7 +1848,28 @@ impl<'a> SnapshotProducer<'a> {
                 RootManifestEntry::ManifestRef { .. } => true, // keep
             });
 
-            // Flush data entries to child data manifests, one per partition spec.
+            // Partition-scoped grouping config for the flush below — read once and
+            // shared by the data + delete loops. Sub-grouping each spec's inline
+            // entries by the manifest grouping key (default `timestamp_hour`) keeps
+            // every child manifest partition-tight; without it a flush of
+            // spread-event-time inline entries welds many event-hours into one wide
+            // manifest that can't graduate/TTL until its newest hour ages out.
+            let flush_partition_scoped = self
+                .table
+                .metadata()
+                .properties()
+                .get("write.manifest.partition-scoped")
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let flush_grouping_fields = self
+                .table
+                .metadata()
+                .properties()
+                .get("write.manifest.grouping-fields")
+                .cloned();
+
+            // Flush data entries to child data manifests, one per (partition spec,
+            // grouping key). Mirrors write_added_manifest's grouping for the inline path.
             for (spec_id, group) in data_by_spec {
                 let spec = self
                     .table
@@ -1832,42 +1881,50 @@ impl<'a> SnapshotProducer<'a> {
                             format!("partition spec {spec_id} not found"),
                         )
                     })?;
-                let path = format!(
-                    "{}/{}/{}-m{}.parquet",
-                    self.table.metadata().location(),
-                    META_ROOT_PATH,
-                    self.commit_uuid,
-                    self.manifest_counter.next().unwrap_or(0),
-                );
-                let mut writer = ManifestWriterBuilder::new(
-                    self.table.file_io().new_output(&path)?,
-                    Some(self.snapshot_id),
-                    self.key_metadata.clone(),
-                    self.table.metadata().current_schema().clone(),
-                    spec.as_ref().clone(),
-                )
-                .build_v3_data();
+                for sub in group_entries_by_manifest_key(
+                    spec.as_ref(),
+                    group,
+                    flush_partition_scoped,
+                    flush_grouping_fields.as_deref(),
+                ) {
+                    let path = format!(
+                        "{}/{}/{}-m{}.parquet",
+                        self.table.metadata().location(),
+                        META_ROOT_PATH,
+                        self.commit_uuid,
+                        self.manifest_counter.next().unwrap_or(0),
+                    );
+                    let mut writer = ManifestWriterBuilder::new(
+                        self.table.file_io().new_output(&path)?,
+                        Some(self.snapshot_id),
+                        self.key_metadata.clone(),
+                        self.table.metadata().current_schema().clone(),
+                        spec.as_ref().clone(),
+                    )
+                    .build_v3_data();
 
-                for entry in &group {
-                    writer.add_entry(entry.clone())?;
+                    for entry in &sub {
+                        writer.add_entry(entry.clone())?;
+                    }
+                    // V4 child manifests are Parquet -- the path was templated
+                    // with the `.parquet` extension just above, so the underlying
+                    // bytes MUST be Parquet to match. Using the Avro writer
+                    // (`write_manifest_file`) here previously produced
+                    // .parquet-named files with Avro magic, which any reader
+                    // dispatched by extension (tessellate's live-set scan, the
+                    // iceberg-rust scan path) fails on with
+                    // "Invalid Parquet file. Corrupt footer".
+                    // `RebalanceRootManifestAction` already takes the Parquet
+                    // path; this lines commit_v4 up with that convention.
+                    entries.push(RootManifestEntry::ManifestRef {
+                        manifest_file: writer.write_manifest_file_parquet().await?,
+                        mdv: None,
+                    });
                 }
-                // V4 child manifests are Parquet -- the path was templated
-                // with the `.parquet` extension just above, so the underlying
-                // bytes MUST be Parquet to match. Using the Avro writer
-                // (`write_manifest_file`) here previously produced
-                // .parquet-named files with Avro magic, which any reader
-                // dispatched by extension (tessellate's live-set scan, the
-                // iceberg-rust scan path) fails on with
-                // "Invalid Parquet file. Corrupt footer".
-                // `RebalanceRootManifestAction` already takes the Parquet
-                // path; this lines commit_v4 up with that convention.
-                entries.push(RootManifestEntry::ManifestRef {
-                    manifest_file: writer.write_manifest_file_parquet().await?,
-                    mdv: None,
-                });
             }
 
-            // Flush delete entries to child delete manifests, one per partition spec.
+            // Flush delete entries to child delete manifests, one per (partition
+            // spec, grouping key) — same partition-tight grouping as the data path.
             for (spec_id, group) in delete_by_spec {
                 let spec = self
                     .table
@@ -1879,32 +1936,39 @@ impl<'a> SnapshotProducer<'a> {
                             format!("partition spec {spec_id} not found"),
                         )
                     })?;
-                let path = format!(
-                    "{}/{}/{}-m{}.parquet",
-                    self.table.metadata().location(),
-                    META_ROOT_PATH,
-                    self.commit_uuid,
-                    self.manifest_counter.next().unwrap_or(0),
-                );
-                let mut writer = ManifestWriterBuilder::new(
-                    self.table.file_io().new_output(&path)?,
-                    Some(self.snapshot_id),
-                    self.key_metadata.clone(),
-                    self.table.metadata().current_schema().clone(),
-                    spec.as_ref().clone(),
-                )
-                .build_v3_deletes();
+                for sub in group_entries_by_manifest_key(
+                    spec.as_ref(),
+                    group,
+                    flush_partition_scoped,
+                    flush_grouping_fields.as_deref(),
+                ) {
+                    let path = format!(
+                        "{}/{}/{}-m{}.parquet",
+                        self.table.metadata().location(),
+                        META_ROOT_PATH,
+                        self.commit_uuid,
+                        self.manifest_counter.next().unwrap_or(0),
+                    );
+                    let mut writer = ManifestWriterBuilder::new(
+                        self.table.file_io().new_output(&path)?,
+                        Some(self.snapshot_id),
+                        self.key_metadata.clone(),
+                        self.table.metadata().current_schema().clone(),
+                        spec.as_ref().clone(),
+                    )
+                    .build_v3_deletes();
 
-                for entry in &group {
-                    writer.add_entry(entry.clone())?;
+                    for entry in &sub {
+                        writer.add_entry(entry.clone())?;
+                    }
+                    // See the matching note on the data-entry flush above:
+                    // .parquet path => Parquet bytes. Avro here silently writes
+                    // bytes that fail to read.
+                    entries.push(RootManifestEntry::ManifestRef {
+                        manifest_file: writer.write_manifest_file_parquet().await?,
+                        mdv: None,
+                    });
                 }
-                // See the matching note on the data-entry flush above:
-                // .parquet path => Parquet bytes. Avro here silently writes
-                // bytes that fail to read.
-                entries.push(RootManifestEntry::ManifestRef {
-                    manifest_file: writer.write_manifest_file_parquet().await?,
-                    mdv: None,
-                });
             }
         }
 
@@ -2169,6 +2233,80 @@ mod test_v4_commit {
         let flat = ["region", "shard"];
         assert_eq!(resolve_grouping_positions(&flat, None), vec![0]);
         assert_eq!(resolve_grouping_positions(&flat, Some("shard")), vec![1]);
+    }
+
+    #[test]
+    fn inline_flush_grouping_splits_entries_by_hour() {
+        use super::group_entries_by_manifest_key;
+        use crate::spec::{
+            Literal, ManifestEntry, ManifestStatus, PartitionSpec, Transform,
+            UnboundPartitionField,
+        };
+
+        // Spec: signallake_tenant / tenant / timestamp_hour = Hour(timestamp).
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "signallake_tenant", Type::Primitive(PrimitiveType::String))
+                    .into(),
+                NestedField::required(2, "tenant", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "timestamp", Type::Primitive(PrimitiveType::Timestamp))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+        let spec = PartitionSpec::builder(schema)
+            .with_spec_id(0)
+            .add_unbound_fields(vec![
+                UnboundPartitionField::builder()
+                    .source_id(1)
+                    .name("signallake_tenant".to_string())
+                    .transform(Transform::Identity)
+                    .build(),
+                UnboundPartitionField::builder()
+                    .source_id(2)
+                    .name("tenant".to_string())
+                    .transform(Transform::Identity)
+                    .build(),
+                UnboundPartitionField::builder()
+                    .source_id(3)
+                    .name("timestamp_hour".to_string())
+                    .transform(Transform::Hour)
+                    .build(),
+            ])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Three entries under the SAME signallake_tenant/tenant but spanning two
+        // event-hours — the exact shape a spread-event-time inline flush produces
+        // (a late Jul-17 event alongside live rows).
+        let mk = |path: &str, hour: i64| {
+            let mut df = test_data_file(path);
+            df.partition = Struct::from_iter([
+                Some(Literal::string("nishant")),
+                Some(Literal::string("qad")),
+                Some(Literal::long(hour)),
+            ]);
+            ManifestEntry::builder()
+                .status(ManifestStatus::Added)
+                .data_file(df)
+                .build()
+        };
+        let entries = vec![mk("a", 495630), mk("b", 495760), mk("c", 495760)];
+
+        // Partition-scoped, default grouping (timestamp_hour): the two hours split
+        // into separate manifests (1 + 2 entries) instead of welding into one wide
+        // manifest — the fix that lets the older hour graduate/TTL independently.
+        let mut groups = group_entries_by_manifest_key(&spec, entries.clone(), true, None);
+        groups.sort_by_key(|g| g.len());
+        assert_eq!(groups.len(), 2, "distinct timestamp_hours must not weld");
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[1].len(), 2);
+
+        // Not partition-scoped → single group (legacy behavior preserved).
+        let flat = group_entries_by_manifest_key(&spec, entries, false, None);
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].len(), 3);
     }
 
     #[test]

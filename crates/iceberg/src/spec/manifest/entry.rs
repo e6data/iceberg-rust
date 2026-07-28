@@ -74,6 +74,24 @@ impl ManifestEntry {
         )
     }
 
+    /// Alive AND not shadowed by a root-level tombstone. V4 incremental commits
+    /// (e.g. laminar's merge-on-write) record removals in
+    /// `RootManifestMetadata.removed_paths` instead of rewriting the child
+    /// manifest. Readers that walk cold-tier manifests directly (e.g.
+    /// tessellate cold_compact, `CompactColdTierAction`) MUST consult that
+    /// set — the bucket-index tier is MDV-blind by design.
+    ///
+    /// The MDV bitmap (`ManifestList::mdv_for(path)` for root refs) is a
+    /// separate mechanism; this helper covers the `removed_paths`
+    /// dimension only. Row-index MDV filtering still requires an index,
+    /// not just `&self`.
+    pub fn is_alive_and_kept(
+        &self,
+        removed_paths: &std::collections::HashSet<String>,
+    ) -> bool {
+        self.is_alive() && !removed_paths.contains(&self.data_file.file_path)
+    }
+
     /// Status of this manifest entry
     pub fn status(&self) -> ManifestStatus {
         self.status

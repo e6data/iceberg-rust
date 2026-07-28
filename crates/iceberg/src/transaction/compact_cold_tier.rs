@@ -167,12 +167,22 @@ impl TransactionAction for CompactColdTierAction {
         let mut survivors: Vec<ManifestEntry> = Vec::new();
         let mut any_affected = false;
 
+        // V4 incremental commits (laminar merge-on-write, etc.) tombstone
+        // removed files in `RootManifestMetadata.removed_paths` rather than
+        // rewriting the child manifest. Cold bucket-index leaves are MDV-blind
+        // by design, so the ONLY way to see those deletes at this tier is via
+        // this set. Without it, a compaction pass would resurrect the deleted
+        // files into a new leaf (and hit 404s if the tombstone deleter has
+        // already reclaimed them past grace).
+        let removed_paths: std::collections::HashSet<String> =
+            rm_metadata.removed_paths.iter().cloned().collect();
+
         for leaf in leaves {
             let manifest = leaf.load_manifest(table.file_io()).await?;
             let files: Vec<DataFile> = manifest
                 .entries()
                 .iter()
-                .filter(|e| e.is_alive())
+                .filter(|e| e.is_alive_and_kept(&removed_paths))
                 .map(|e| e.data_file().clone())
                 .collect();
             let (leaf_survivors, affected) = apply_removals(files, &self.removed);

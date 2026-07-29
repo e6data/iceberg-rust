@@ -75,6 +75,7 @@ pub struct CompactColdTierAction {
     removed: HashSet<String>,
     added: Vec<DataFile>,
     commit_uuid: Uuid,
+    snapshot_id_override: Option<i64>,
 }
 
 impl CompactColdTierAction {
@@ -84,6 +85,7 @@ impl CompactColdTierAction {
             removed: HashSet::new(),
             added: Vec::new(),
             commit_uuid: Uuid::now_v7(),
+            snapshot_id_override: None,
         }
     }
 
@@ -96,6 +98,22 @@ impl CompactColdTierAction {
     /// Add the merged replacement data files (already written to storage).
     pub fn add_files(mut self, files: impl IntoIterator<Item = DataFile>) -> Self {
         self.added.extend(files);
+        self
+    }
+
+    /// Pre-allocate the new snapshot's id, overriding the random id that
+    /// `commit()` would otherwise generate. Mirror of
+    /// [`super::replace_data_files::ReplaceDataFilesAction::with_snapshot_id`].
+    /// Same use case: referencing the snapshot_id elsewhere in the same
+    /// transaction — most commonly to attach per-output-file `StatisticsFile`
+    /// entries (per-file `.parquet.stats` puffin sidecars) to the new snapshot
+    /// so the executor's `metadata.statistics_for_snapshot(current)` surfaces
+    /// them. Without this, laminar's cold-redirect of a graduation-crossed
+    /// merge cannot register the merged output's carry-forward sidecar in
+    /// the same commit and the executor falls back to path-convention
+    /// (`<parquet>.stats`) lookup for that one merged output.
+    pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id_override = Some(snapshot_id);
         self
     }
 }
@@ -223,7 +241,9 @@ impl TransactionAction for CompactColdTierAction {
 
         // Re-cluster the affected survivors + the merged additions into new,
         // partition-tight leaf manifests.
-        let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
+        let snapshot_id = self
+            .snapshot_id_override
+            .unwrap_or_else(|| SnapshotProducer::generate_unique_snapshot_id_static(table));
         let next_seq_num = table.metadata().next_sequence_number();
         let schema = table.metadata().current_schema().clone();
         let format_version = table.metadata().format_version();

@@ -70,10 +70,77 @@ fn manifest_file_is_wide(mf: &ManifestFile) -> bool {
     }
 }
 
+/// Build an Existing-status ManifestEntry from a source entry. Extracted so the
+/// streaming write paths and the legacy `write_entries_clustered` bulk path share
+/// one canonical conversion. `data_file.clone()` is the unavoidable per-entry
+/// allocation (DataFile owns its column stats + partition tuple).
+fn build_existing_entry(e: &ManifestEntry) -> ManifestEntry {
+    ManifestEntry::builder()
+        .status(ManifestStatus::Existing)
+        .snapshot_id(e.snapshot_id().unwrap_or(0))
+        .sequence_number(e.sequence_number().unwrap_or(0))
+        .file_sequence_number_opt(e.file_sequence_number)
+        .data_file(e.data_file().clone())
+        .build()
+}
+
+/// Write ONE manifest file from a streaming iterator of entries.
+///
+/// Peak memory bounded by the ManifestWriter's internal row-group buffer, NOT by
+/// the total input size — replaces the `Vec<ManifestEntry>` allocation the
+/// bulk-collect callers used to hold (`survivors: Vec<...>` in the rebalance
+/// hot path was ~50 MB per rewritten manifest on sri-olly).
+///
+/// Caller owns the `manifest_counter` and post-increments it after this returns.
+/// `commit_uuid` + `manifest_id` build the deterministic output path.
+#[allow(clippy::too_many_arguments)]
+async fn write_manifest_from_iter(
+    table: &Table,
+    schema: &SchemaRef,
+    spec: &PartitionSpec,
+    format_version: FormatVersion,
+    snapshot_id: i64,
+    commit_uuid: Uuid,
+    manifest_id: u64,
+    is_delete: bool,
+    entries: impl IntoIterator<Item = ManifestEntry>,
+) -> Result<ManifestFile> {
+    let manifest_path = format!(
+        "{}/{}/{}-m{}.parquet",
+        table.metadata().location(),
+        META_ROOT_PATH,
+        commit_uuid,
+        manifest_id,
+    );
+    let output_file = table.file_io().new_output(&manifest_path)?;
+    let builder = ManifestWriterBuilder::new(
+        output_file,
+        Some(snapshot_id),
+        None,
+        schema.clone(),
+        spec.clone(),
+    );
+    let mut writer = match (format_version, is_delete) {
+        (FormatVersion::V1, _) => builder.build_v1(),
+        (FormatVersion::V2, false) => builder.build_v2_data(),
+        (FormatVersion::V2, true) => builder.build_v2_deletes(),
+        (_, false) => builder.build_v3_data(),
+        (_, true) => builder.build_v3_deletes(),
+    };
+    for e in entries {
+        writer.add_entry(e)?;
+    }
+    writer.write_manifest_file_parquet().await
+}
+
 /// Write `entries` (all sharing one content type and partition spec) into child
 /// manifest(s). When `partition_scoped`, one manifest is written per distinct
 /// partition tuple — producing tight (single-partition) summaries the planner
 /// can skip on. Otherwise a single manifest is written (legacy behavior).
+///
+/// Bulk API retained for `graduate_buckets` and other callers that already
+/// materialize a full Vec. New code paths in `RebalanceRootManifestAction`
+/// use `write_manifest_from_iter` directly to avoid the intermediate Vec.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_entries_clustered(
     table: &Table,
@@ -379,8 +446,29 @@ impl TransactionAction for RebalanceRootManifestAction {
                     continue;
                 }
 
-                // Load the child manifest and collect surviving entries (alive,
-                // not MDV-deleted). Rewriting drops the MDV entirely.
+                // Load the child manifest and stream surviving entries (alive,
+                // not MDV-deleted) into new manifest(s). Rewriting drops the MDV
+                // entirely.
+                //
+                // Streaming pattern (replaces the `let survivors: Vec<...>` +
+                // bulk `write_entries_clustered` pair). Two write shapes:
+                //
+                //   * non-partition-scoped: build one filter/map iterator over
+                //     `manifest.entries()` and feed it directly to a single
+                //     writer via `write_manifest_from_iter`. Peak memory = one
+                //     row-group buffer inside the writer (was ~50 MB per
+                //     source manifest for the fully-collected Vec on sri-olly).
+                //
+                //   * partition-scoped: two logical passes over the SAME source
+                //     Manifest (already in RAM):
+                //       pass 1 groups source indices by partition tuple
+                //         into HashMap<Struct, Vec<usize>> (tiny — 8 bytes
+                //         per surviving entry vs ~1-5 KB in the old Vec of
+                //         cloned ManifestEntry),
+                //       pass 2 writes one manifest per partition serially,
+                //         each pulling from source entries by index.
+                //     Only one output writer is live at a time, so peak =
+                //     one row-group buffer + the small indices map.
                 let manifest = manifest_file.load_manifest(table.file_io()).await?;
                 let spec_id = manifest_file.partition_spec_id;
                 let spec = table
@@ -394,41 +482,72 @@ impl TransactionAction for RebalanceRootManifestAction {
                     })?;
                 let is_delete = manifest_file.content == ManifestContentType::Deletes;
 
-                let survivors: Vec<ManifestEntry> = manifest
-                    .entries()
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, e)| {
-                        e.is_alive()
-                            && !mdv_obj
-                                .as_ref()
-                                .is_some_and(|m| m.is_deleted(*idx as u32))
-                    })
-                    .map(|(_, e)| {
-                        ManifestEntry::builder()
-                            .status(ManifestStatus::Existing)
-                            .snapshot_id(e.snapshot_id().unwrap_or(0))
-                            .sequence_number(e.sequence_number().unwrap_or(0))
-                            .file_sequence_number_opt(e.file_sequence_number)
-                            .data_file(e.data_file().clone())
-                            .build()
-                    })
-                    .collect();
+                let is_survivor = |idx: usize, e: &ManifestEntry| -> bool {
+                    e.is_alive()
+                        && !mdv_obj
+                            .as_ref()
+                            .is_some_and(|m| m.is_deleted(idx as u32))
+                };
 
-                let new_manifests = write_entries_clustered(
-                    table,
-                    &schema,
-                    spec.as_ref(),
-                    format_version,
-                    snapshot_id,
-                    commit_uuid,
-                    &mut manifest_counter,
-                    is_delete,
-                    survivors,
-                    self.partition_scoped,
-                )
-                .await?;
-                for mf in new_manifests {
+                if self.partition_scoped {
+                    // Pass 1: index only — HashMap<Struct, Vec<usize>>.
+                    let mut by_part_indices: HashMap<Struct, Vec<usize>> =
+                        HashMap::new();
+                    for (idx, e) in manifest.entries().iter().enumerate() {
+                        if !is_survivor(idx, e) {
+                            continue;
+                        }
+                        by_part_indices
+                            .entry(e.data_file().partition.clone())
+                            .or_default()
+                            .push(idx);
+                    }
+                    // Pass 2: one manifest per partition, streamed.
+                    for (_partition, indices) in by_part_indices {
+                        let entries_iter = indices
+                            .into_iter()
+                            .map(|idx| build_existing_entry(&manifest.entries()[idx]));
+                        let mf = write_manifest_from_iter(
+                            table,
+                            &schema,
+                            spec.as_ref(),
+                            format_version,
+                            snapshot_id,
+                            commit_uuid,
+                            manifest_counter,
+                            is_delete,
+                            entries_iter,
+                        )
+                        .await?;
+                        manifest_counter += 1;
+                        new_entries.push(RootManifestEntry::ManifestRef {
+                            manifest_file: mf,
+                            mdv: None,
+                        });
+                    }
+                } else {
+                    // Non-partition-scoped: single streaming pass into one writer.
+                    let entries_iter =
+                        manifest.entries().iter().enumerate().filter_map(|(idx, e)| {
+                            if is_survivor(idx, e) {
+                                Some(build_existing_entry(e))
+                            } else {
+                                None
+                            }
+                        });
+                    let mf = write_manifest_from_iter(
+                        table,
+                        &schema,
+                        spec.as_ref(),
+                        format_version,
+                        snapshot_id,
+                        commit_uuid,
+                        manifest_counter,
+                        is_delete,
+                        entries_iter,
+                    )
+                    .await?;
+                    manifest_counter += 1;
                     new_entries.push(RootManifestEntry::ManifestRef {
                         manifest_file: mf,
                         mdv: None,
@@ -439,71 +558,114 @@ impl TransactionAction for RebalanceRootManifestAction {
 
         // --- Phase B: Flush inline entries into child manifests ---
         if needs_flush {
-            // Build Existing entries grouped by (content_type, partition_spec_id);
-            // write_entries_clustered then splits each group per partition tuple
-            // when partition-scoped.
-            let mut data_by_spec: HashMap<i32, Vec<ManifestEntry>> = HashMap::new();
-            let mut delete_by_spec: HashMap<i32, Vec<ManifestEntry>> = HashMap::new();
-
-            for entry in root_manifest.entries() {
+            // Group inline entries by (content_type, partition_spec_id) using
+            // ONLY source indices — HashMap<(is_delete, spec_id), Vec<usize>>
+            // is a few bytes per entry vs the old
+            // HashMap<i32, Vec<ManifestEntry>> which held a full ManifestEntry
+            // (with cloned DataFile, ~1-5 KB each). For partition-scoped writes
+            // we build a second-level index inside the flush loop so each
+            // partition's manifest streams from source indices one at a time.
+            let mut inline_by_group: HashMap<(bool, i32), Vec<usize>> = HashMap::new();
+            for (idx, entry) in root_manifest.entries().iter().enumerate() {
                 if let RootManifestEntry::Inline(me) = entry {
-                    let existing = ManifestEntry::builder()
+                    let is_delete = matches!(
+                        me.data_file.content,
+                        DataContentType::EqualityDeletes | DataContentType::PositionDeletes,
+                    );
+                    inline_by_group
+                        .entry((is_delete, me.data_file.partition_spec_id))
+                        .or_default()
+                        .push(idx);
+                }
+            }
+
+            for ((is_delete, spec_id), indices) in inline_by_group {
+                let spec = table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("partition spec {spec_id} not found"),
+                        )
+                    })?;
+
+                // Convert a root-manifest inline `me` at source index `idx`
+                // into an Existing ManifestEntry. Kept as a closure so both
+                // partition-scoped and single-manifest paths use the same
+                // conversion.
+                let make_entry = |idx: usize| -> ManifestEntry {
+                    let me = match &root_manifest.entries()[idx] {
+                        RootManifestEntry::Inline(me) => me,
+                        // Filtered above — this arm is unreachable in
+                        // practice, but return a zeroed placeholder rather
+                        // than panic (the index list is authoritative).
+                        _ => unreachable!("inline_by_group only holds Inline indices"),
+                    };
+                    ManifestEntry::builder()
                         .status(ManifestStatus::Existing)
                         .snapshot_id(me.snapshot_id.unwrap_or(0))
                         .sequence_number(me.sequence_number.unwrap_or(0))
                         .file_sequence_number_opt(me.file_sequence_number)
                         .data_file(me.data_file.clone())
-                        .build();
-                    match me.data_file.content {
-                        DataContentType::Data => {
-                            data_by_spec
-                                .entry(me.data_file.partition_spec_id)
-                                .or_default()
-                                .push(existing);
-                        }
-                        DataContentType::EqualityDeletes
-                        | DataContentType::PositionDeletes => {
-                            delete_by_spec
-                                .entry(me.data_file.partition_spec_id)
-                                .or_default()
-                                .push(existing);
-                        }
-                    }
-                }
-            }
+                        .build()
+                };
 
-            for (is_delete, by_spec) in
-                [(false, data_by_spec), (true, delete_by_spec)]
-            {
-                for (spec_id, group) in by_spec {
-                    let spec = table
-                        .metadata()
-                        .partition_spec_by_id(spec_id)
-                        .ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::DataInvalid,
-                                format!("partition spec {spec_id} not found"),
-                            )
-                        })?;
-                    let manifests = write_entries_clustered(
+                if self.partition_scoped {
+                    // Pass 1: partition-tuple index over the inline slice —
+                    // HashMap<Struct, Vec<usize>> where value is the SAME
+                    // source index space used above (indices into
+                    // `root_manifest.entries()`).
+                    let mut by_part_indices: HashMap<Struct, Vec<usize>> =
+                        HashMap::new();
+                    for idx in &indices {
+                        let part = match &root_manifest.entries()[*idx] {
+                            RootManifestEntry::Inline(me) => me.data_file.partition.clone(),
+                            _ => unreachable!(),
+                        };
+                        by_part_indices.entry(part).or_default().push(*idx);
+                    }
+                    for (_partition, part_indices) in by_part_indices {
+                        let entries_iter = part_indices.into_iter().map(make_entry);
+                        let mf = write_manifest_from_iter(
+                            table,
+                            &schema,
+                            spec.as_ref(),
+                            format_version,
+                            snapshot_id,
+                            commit_uuid,
+                            manifest_counter,
+                            is_delete,
+                            entries_iter,
+                        )
+                        .await?;
+                        manifest_counter += 1;
+                        new_entries.push(RootManifestEntry::ManifestRef {
+                            manifest_file: mf,
+                            mdv: None,
+                        });
+                    }
+                } else {
+                    // Single manifest for this (is_delete, spec_id) — stream
+                    // from indices directly.
+                    let entries_iter = indices.into_iter().map(make_entry);
+                    let mf = write_manifest_from_iter(
                         table,
                         &schema,
                         spec.as_ref(),
                         format_version,
                         snapshot_id,
                         commit_uuid,
-                        &mut manifest_counter,
+                        manifest_counter,
                         is_delete,
-                        group,
-                        self.partition_scoped,
+                        entries_iter,
                     )
                     .await?;
-                    for mf in manifests {
-                        new_entries.push(RootManifestEntry::ManifestRef {
-                            manifest_file: mf,
-                            mdv: None,
-                        });
-                    }
+                    manifest_counter += 1;
+                    new_entries.push(RootManifestEntry::ManifestRef {
+                        manifest_file: mf,
+                        mdv: None,
+                    });
                 }
             }
         } else {

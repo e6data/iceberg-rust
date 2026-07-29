@@ -203,6 +203,24 @@ impl TransactionAction for CompactColdTierAction {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 
+        // Non-empty removal set but no matches ⇒ the paths aren't in the cold
+        // tier (still hot, or already reclaimed). Adding `self.added` in that
+        // state would duplicate rows: the "inputs" stay live in hot manifests
+        // while the compacted "outputs" also land in a new cold leaf, and both
+        // are visible to readers. Refuse. Callers (laminar's cold-redirect of a
+        // graduation-crossed merge, tessellate's cold-compact) should treat this
+        // as "not in the right state" and drop the outputs as orphan.
+        if !any_affected && !self.removed.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "compact_cold_tier: {} removal path(s) matched no cold-leaf entries — refusing to add {} file(s) alone (would duplicate rows if inputs are still hot)",
+                    self.removed.len(),
+                    self.added.len(),
+                ),
+            ));
+        }
+
         // Re-cluster the affected survivors + the merged additions into new,
         // partition-tight leaf manifests.
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);

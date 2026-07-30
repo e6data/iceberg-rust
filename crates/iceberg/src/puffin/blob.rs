@@ -24,6 +24,19 @@ pub const APACHE_DATASKETCHES_THETA_V1: &str = "apache-datasketches-theta-v1";
 /// A serialized form of a deletion vector.
 pub const DELETION_VECTOR_V1: &str = "deletion-vector-v1";
 
+// -----------------------------------------------------------------------------
+// e6-fork extensions. Not part of the upstream Iceberg puffin spec; identified
+// by their string types so any upstream reader that doesn't know them can skip.
+// -----------------------------------------------------------------------------
+
+/// Per-partition label-value inverted index (Lever A). Payload format lives
+/// outside this crate — writer in `laminar`'s puffin_index module, reader in
+/// `e6-native-executor`'s e6-puffin-indexes submodule. The fork only registers
+/// this string so both sides agree on the blob type name. See
+/// `LEVER_A_DESIGN.md` in laminar for the payload spec (roaring-bitmap-per-
+/// (label_key, label_value)) and rollout gates.
+pub const LABEL_VALUE_INDEX_V1: &str = "label-value-index-v1";
+
 /// The blob
 #[derive(Debug, PartialEq, Clone, TypedBuilder)]
 pub struct Blob {

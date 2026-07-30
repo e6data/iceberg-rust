@@ -238,6 +238,33 @@ pub struct RebalanceRootManifestAction {
     /// partition. This produces tight summaries (lower_bound == upper_bound on
     /// every field) so the scan planner can skip manifests by partition prune.
     partition_scoped: bool,
+    /// Optional cap on the number of child manifests rewritten per commit
+    /// invocation. Task #485 (partition-bounded rebalance):
+    ///
+    /// Prior behavior: one atomic commit rewrites ALL manifests-needing-rewrite
+    /// (MDV over threshold OR partition-wide when partition-scoped). Under
+    /// backon retry, the WHOLE working set (loaded child manifests, cloned
+    /// DataFiles, HashMap<Struct, Vec<usize>> indices, output ManifestWriters)
+    /// is pinned across attempts. On sri-olly this held ~2.9 GB of live heap
+    /// even with Fix A (streaming reads) + Fix C-write (chunked parquet write).
+    ///
+    /// New behavior when `Some(n)`: Phase A rewrites at most `n` manifests
+    /// per commit, then Phase C writes a new root with the rewritten refs
+    /// plus the untouched refs carried forward as-is. The caller can invoke
+    /// commit() in a loop; each invocation makes bounded progress and commits
+    /// atomically. Retry state pins only `n` manifests' working set, not
+    /// the total. The remaining manifests carry forward unchanged (kept as
+    /// their existing ManifestRef) and get processed in subsequent invocations.
+    ///
+    /// Phase B (inline flush) still runs to completion within a single
+    /// invocation — inline entries are bounded by `inline_threshold` × entry
+    /// size (typically < 50 MB) so splitting them isn't worth the extra
+    /// commit count.
+    ///
+    /// When `None` (default), preserves the original one-shot behavior for
+    /// callers that need it (e.g. small tables where extra commit round-trips
+    /// dominate the wall clock).
+    max_manifests_per_commit: Option<usize>,
     /// UUID for generating unique file paths in this commit.
     commit_uuid: Uuid,
 }
@@ -249,8 +276,19 @@ impl RebalanceRootManifestAction {
             inline_threshold: DEFAULT_INLINE_THRESHOLD,
             mdv_compaction_threshold: DEFAULT_MDV_COMPACTION_THRESHOLD,
             partition_scoped: false,
+            max_manifests_per_commit: None,
             commit_uuid: Uuid::now_v7(),
         }
+    }
+
+    /// Set the per-commit rewrite cap (task #485). See the field doc on
+    /// `max_manifests_per_commit` for the rationale — this bounds Phase A's
+    /// working set to N manifests per commit invocation. Callers invoking
+    /// commit() in a loop can drain the full rebalance in `total / N`
+    /// commits, each with retry-state pinned to only N manifests' peak.
+    pub fn with_max_manifests_per_commit(mut self, n: usize) -> Self {
+        self.max_manifests_per_commit = if n > 0 { Some(n) } else { None };
+        self
     }
 
     /// Override the inline entry count threshold.
@@ -417,6 +455,15 @@ impl TransactionAction for RebalanceRootManifestAction {
         // Separate entries into manifest refs and inline entries
         let mut new_entries: Vec<RootManifestEntry> = Vec::new();
 
+        // Task #485: track how many manifests Phase A has actually rewritten
+        // this invocation. When `max_manifests_per_commit` is set, we stop
+        // rewriting after `cap` and fall through to carry the remaining
+        // manifest refs forward as-is. Caller loops commit() until the action
+        // returns a no-op (all rewrites done) — each commit is atomic and
+        // pins only up to `cap` manifests' working set in the backon retry
+        // future, instead of the whole rebalance's.
+        let mut rewrites_done: usize = 0;
+
         // --- Phase A: Process existing manifest refs ---
         // A ref is rewritten when its MDV crosses the compaction threshold OR
         // (when partition-scoped) its partition summary is wide. In both cases we
@@ -445,6 +492,21 @@ impl TransactionAction for RebalanceRootManifestAction {
                     new_entries.push(entry.clone());
                     continue;
                 }
+
+                // Task #485 cap: if we've already rewritten `max_manifests_per_commit`
+                // entries this invocation, carry the rest forward unchanged. The
+                // caller's next commit() invocation loads the fresh table view
+                // (post this commit) and picks up where we left off — the still-
+                // needs-rewrite refs are unchanged, so `needs_mdv_compaction` /
+                // `needs_recluster` at the top of commit() will re-trigger for
+                // them and they'll be processed then.
+                if let Some(cap) = self.max_manifests_per_commit {
+                    if rewrites_done >= cap {
+                        new_entries.push(entry.clone());
+                        continue;
+                    }
+                }
+                rewrites_done += 1;
 
                 // Load the child manifest and stream surviving entries (alive,
                 // not MDV-deleted) into new manifest(s). Rewriting drops the MDV

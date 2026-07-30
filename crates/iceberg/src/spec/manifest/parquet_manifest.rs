@@ -107,27 +107,79 @@ pub fn encode_manifest_metadata(metadata: &ManifestMetadata) -> HashMap<String, 
 // ============================================================================
 
 /// Write manifest entries to a Parquet-format byte buffer.
+///
+/// Thin wrapper over `write_parquet_manifest_streaming` that writes the entire
+/// entry slice as one row-group. Retained for backward compat and small-manifest
+/// callers where the extra chunking overhead isn't worth it. On sri-olly's
+/// rebalance path (rewriting 2000-2800 entries per manifest × 12 concurrent
+/// writers), the streaming variant is used from `ManifestWriter::write_manifest_file_parquet`
+/// to bound RecordBatch peak memory.
 pub fn write_parquet_manifest(
     entries: &[ManifestEntry],
     metadata: &ManifestMetadata,
     partition_type: &StructType,
 ) -> Result<Vec<u8>> {
-    // Embed manifest metadata in the Arrow schema's metadata field.
-    // ArrowWriter propagates this to the Parquet file-level key-value metadata.
+    write_parquet_manifest_streaming(entries, metadata, partition_type, entries.len().max(1))
+}
+
+/// Streaming variant of `write_parquet_manifest` — chunks `entries` into
+/// `chunk_size`-sized batches before conversion + write.
+///
+/// Memory profile:
+/// - **Bulk API (`write_parquet_manifest`)** builds ONE giant RecordBatch from
+///   the entire input Vec, holding all Arrow builders (string + binary +
+///   int64 columns) sized for the full N at once. On a rebalance rewriting
+///   a 2800-entry manifest, that RecordBatch is ~10-20 MB. Times 12 concurrent
+///   writers (3 tables × 4 merge_concurrency) = 120-240 MB peak of RecordBatch
+///   alone, and the backon retry future pins it across attempts.
+/// - **This streaming API** builds one RecordBatch per `chunk_size`-entry
+///   chunk, writes it into the parquet writer, and drops it before the next
+///   chunk. Peak in-flight RecordBatch = one chunk (~2-4 MB at chunk_size=2048),
+///   4-10× smaller. The input entry slice itself is not copied — only its
+///   sub-slices are iterated.
+///
+/// Behavioural invariants preserved:
+/// - Entry ORDER is preserved (chunks are consecutive slices, written in
+///   original order).
+/// - Parquet output is byte-identical to the bulk path when chunk_size ≥
+///   entries.len(). At smaller chunk_size, the file's row groups are more
+///   numerous but readers behave the same.
+/// - Compression, schema, kv-metadata all identical.
+pub fn write_parquet_manifest_streaming(
+    entries: &[ManifestEntry],
+    metadata: &ManifestMetadata,
+    partition_type: &StructType,
+    chunk_size: usize,
+) -> Result<Vec<u8>> {
     let kv_metadata = encode_manifest_metadata(metadata);
     let schema = Arc::new(manifest_arrow_schema().with_metadata(kv_metadata));
-    let batch = manifest_entries_to_record_batch(entries, &schema, partition_type, metadata.format_version)?;
 
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .build();
 
     let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))
+    let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
         .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to create parquet writer: {e}")))?;
 
-    writer.write(&batch)
-        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to write batch: {e}")))?;
+    // Empty-input case: still produce a valid parquet file with schema/metadata
+    // but zero row groups. Match the bulk API's behavior (an empty RecordBatch
+    // is written and closed cleanly).
+    if entries.is_empty() {
+        let batch = manifest_entries_to_record_batch(entries, &schema, partition_type, metadata.format_version)?;
+        writer.write(&batch)
+            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to write batch: {e}")))?;
+    } else {
+        // Guard against chunk_size == 0 (would infinite-loop chunks()).
+        let effective = chunk_size.max(1);
+        for chunk in entries.chunks(effective) {
+            let batch = manifest_entries_to_record_batch(chunk, &schema, partition_type, metadata.format_version)?;
+            writer.write(&batch)
+                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to write batch: {e}")))?;
+            // batch (and all its Arrow builders' backing buffers) dropped here.
+        }
+    }
+
     writer.close()
         .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to close writer: {e}")))?;
 

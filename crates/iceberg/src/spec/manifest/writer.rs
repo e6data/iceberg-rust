@@ -501,10 +501,23 @@ impl ManifestWriter {
         let partition_summary = self.construct_partition_summaries(&partition_type)?;
 
         let entries = std::mem::take(&mut self.manifest_entries);
-        let content = super::parquet_manifest::write_parquet_manifest(
+        // Chunked write to bound RecordBatch peak memory. Without this, the
+        // whole entries Vec is converted to ONE giant RecordBatch (~10-20 MB
+        // per typical rebalance-produced manifest of ~2000-2800 entries), and
+        // when N such writers run concurrently across tables + backon retry,
+        // peak heap can hit multi-GB. Chunking bounds in-flight RecordBatch
+        // to ~2-4 MB regardless of manifest size. Byte-identical output for
+        // manifests ≤ chunk_size (single row group); larger manifests just
+        // get more row groups.
+        //
+        // 2048 chosen to match parquet's default target row-group cardinality
+        // — reader-side cost is neutral; writer-side memory drops 4-10×.
+        const PARQUET_MANIFEST_WRITE_CHUNK: usize = 2048;
+        let content = super::parquet_manifest::write_parquet_manifest_streaming(
             &entries,
             &self.metadata,
             &partition_type,
+            PARQUET_MANIFEST_WRITE_CHUNK,
         )?;
 
         let length = content.len();

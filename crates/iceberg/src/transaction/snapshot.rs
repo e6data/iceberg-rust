@@ -1567,7 +1567,18 @@ impl<'a> SnapshotProducer<'a> {
         // produces, so it can never orphan the cold pointer. Skipped on deltas
         // (`do_delta`) to keep hot commits O(1). Cutoff/field come from table
         // properties (no laminar→fork plumbing).
-        if !do_delta {
+        //
+        // 2026-08-03: env gate `LAMINAR_INLINE_GRADUATE_ENABLED` (default on
+        // for backward compat). Set to "0" / "false" when an external maintenance
+        // service (e.g. tessellate v2 Phase 7a `graduate_buckets`) owns graduation
+        // — running both in parallel causes CatalogCommitConflicts at every
+        // hour boundary as they race on the freshly-closed hour's cold-tier
+        // pointer. Same pattern as other `LAMINAR_*` env reads in
+        // `root_manifest_probe.rs`.
+        let inline_graduate_enabled = std::env::var("LAMINAR_INLINE_GRADUATE_ENABLED")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        if !do_delta && inline_graduate_enabled {
             let is_tiered = self
                 .table
                 .metadata()

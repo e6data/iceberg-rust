@@ -265,6 +265,19 @@ pub struct RebalanceRootManifestAction {
     /// callers that need it (e.g. small tables where extra commit round-trips
     /// dominate the wall clock).
     max_manifests_per_commit: Option<usize>,
+    /// Optional (hour_field_idx, max_hour) filter — skip rewriting root entries
+    /// whose partition hour is strictly greater than `max_hour`. Used by
+    /// callers that need to leave the CURRENT hour's entries alone to avoid
+    /// racing an active append stream on CAS: laminar's per-checkpoint appends
+    /// touch the same root entries the rebalance would rewrite; skipping the
+    /// hot hour eliminates that specific OCC conflict source without giving up
+    /// rebalancing of closed hours.
+    ///
+    /// When set, entries whose hour cannot be extracted (invalid idx, non-int
+    /// literal, missing) are conservatively KEPT (not filtered out) — the wrong
+    /// safe default is "rebalance too aggressively", not "silently include".
+    /// When None (default), no filtering — original behaviour.
+    hour_filter: Option<(usize, i64)>,
     /// UUID for generating unique file paths in this commit.
     commit_uuid: Uuid,
 }
@@ -277,8 +290,20 @@ impl RebalanceRootManifestAction {
             mdv_compaction_threshold: DEFAULT_MDV_COMPACTION_THRESHOLD,
             partition_scoped: false,
             max_manifests_per_commit: None,
+            hour_filter: None,
             commit_uuid: Uuid::now_v7(),
         }
+    }
+
+    /// Skip rewriting root entries whose partition hour is strictly greater
+    /// than `max_hour`. See the field doc on `hour_filter` for rationale.
+    /// `hour_field_idx` is the 0-based index of the Hour-transform partition
+    /// field in the table's default partition spec (caller looks it up once
+    /// via `metadata().default_partition_spec().fields().iter().position(...)`).
+    /// Passing `max_hour = i64::MAX` is equivalent to not setting the filter.
+    pub fn with_hour_filter(mut self, hour_field_idx: usize, max_hour: i64) -> Self {
+        self.hour_filter = Some((hour_field_idx, max_hour));
+        self
     }
 
     /// Set the per-commit rewrite cap (task #485). See the field doc on
@@ -308,6 +333,44 @@ impl RebalanceRootManifestAction {
     pub fn with_partition_scoped(mut self, enabled: bool) -> Self {
         self.partition_scoped = enabled;
         self
+    }
+
+    /// Decode a manifest-file's partition-summary upper hour bound. Used when
+    /// the caller sets `hour_filter` — mirror of tessellate's own
+    /// `leaf_summary_hour`. Returns None when the field isn't present or the
+    /// bound bytes don't decode as a 32-bit little-endian int (the Hour
+    /// transform's on-disk shape). None → conservatively KEEP for filter
+    /// purposes (safer default; see field doc).
+    fn manifest_summary_hour(mf: &ManifestFile, idx: usize) -> Option<i64> {
+        let fs = mf.partitions.as_ref()?.get(idx)?;
+        let b = fs.upper_bound.as_ref()?;
+        (b.len() >= 4).then(|| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
+    }
+
+    /// True when `hour_filter` is set and the entry's hour is strictly greater
+    /// than `max_hour` (i.e. the caller told us "don't touch this — active
+    /// writers are appending here"). Entries with an undecodable hour are
+    /// treated as in-range (not filtered) so we never silently skip closed
+    /// hours that happen to have a wonky partition summary.
+    fn entry_above_hour_filter(&self, entry: &RootManifestEntry) -> bool {
+        let Some((idx, max_hour)) = self.hour_filter else {
+            return false;
+        };
+        let h = match entry {
+            RootManifestEntry::ManifestRef { manifest_file, .. } => {
+                Self::manifest_summary_hour(manifest_file, idx)
+            }
+            RootManifestEntry::Inline(me) => match me.data_file.partition.fields().get(idx) {
+                Some(Some(crate::spec::Literal::Primitive(
+                    crate::spec::PrimitiveLiteral::Int(v),
+                ))) => Some(*v as i64),
+                _ => None,
+            },
+        };
+        match h {
+            Some(hour) => hour > max_hour,
+            None => false, // conservative: keep in-range when we can't decode
+        }
     }
 
     /// Whether any manifest ref is "partition-wide" — its partition summary
@@ -493,6 +556,17 @@ impl TransactionAction for RebalanceRootManifestAction {
                     continue;
                 }
 
+                // Hot-hour skip: if the caller set a max_hour and this manifest's
+                // summary hour is above it, carry forward as-is. Same shape as the
+                // `!over_mdv_threshold && !is_wide` early-return above — the
+                // manifest keeps its MDV (if any) and its shape (partition-wide
+                // or not). Point of the filter is exactly to avoid rewriting
+                // entries an active writer is racing us on.
+                if self.entry_above_hour_filter(entry) {
+                    new_entries.push(entry.clone());
+                    continue;
+                }
+
                 // Task #485 cap: if we've already rewritten `max_manifests_per_commit`
                 // entries this invocation, carry the rest forward unchanged. The
                 // caller's next commit() invocation loads the fresh table view
@@ -627,9 +701,19 @@ impl TransactionAction for RebalanceRootManifestAction {
             // (with cloned DataFile, ~1-5 KB each). For partition-scoped writes
             // we build a second-level index inside the flush loop so each
             // partition's manifest streams from source indices one at a time.
+            //
+            // Hot-hour skip: same filter as Phase A above — inline entries whose
+            // partition hour is above `hour_filter.max_hour` are NOT grouped
+            // here; instead they fall through to the trailing carry-forward
+            // block that copies them into `new_entries` unchanged. Rationale
+            // identical: don't race active append writers on the current hour.
             let mut inline_by_group: HashMap<(bool, i32), Vec<usize>> = HashMap::new();
             for (idx, entry) in root_manifest.entries().iter().enumerate() {
                 if let RootManifestEntry::Inline(me) = entry {
+                    if self.entry_above_hour_filter(entry) {
+                        // Skipped here → carried forward by the trailing loop.
+                        continue;
+                    }
                     let is_delete = matches!(
                         me.data_file.content,
                         DataContentType::EqualityDeletes | DataContentType::PositionDeletes,
@@ -728,6 +812,20 @@ impl TransactionAction for RebalanceRootManifestAction {
                         manifest_file: mf,
                         mdv: None,
                     });
+                }
+            }
+
+            // Carry-forward any inline entries the hot-hour filter caused us
+            // to skip during grouping above. Without this, filtered inline
+            // entries silently vanish from the rewritten root (data loss).
+            // No-op when hour_filter is None (nothing was skipped).
+            if self.hour_filter.is_some() {
+                for entry in root_manifest.entries() {
+                    if let RootManifestEntry::Inline(_) = entry
+                        && self.entry_above_hour_filter(entry)
+                    {
+                        new_entries.push(entry.clone());
+                    }
                 }
             }
         } else {
@@ -879,6 +977,43 @@ mod tests {
             manifest_file: mf,
             mdv: None,
         }
+    }
+
+    #[test]
+    fn hour_filter_manifest_ref_skips_current_hour() {
+        // hour_field_idx = 0. Encoding: hour bucket as i32 LE bytes.
+        let hour_hot: i32 = 496200;
+        let hour_cold: i32 = 496195;
+        let max_hour: i64 = 496199; // strictly-greater is skipped
+
+        let hot_mf = mf_with_partitions(Some(vec![fsummary(
+            &hour_hot.to_le_bytes(),
+            &hour_hot.to_le_bytes(),
+        )]));
+        let cold_mf = mf_with_partitions(Some(vec![fsummary(
+            &hour_cold.to_le_bytes(),
+            &hour_cold.to_le_bytes(),
+        )]));
+
+        let action = RebalanceRootManifestAction::new().with_hour_filter(0, max_hour);
+        assert!(action.entry_above_hour_filter(&manifest_ref(hot_mf)));
+        assert!(!action.entry_above_hour_filter(&manifest_ref(cold_mf)));
+
+        // no filter set → nothing above (both keep default = false)
+        let unfiltered = RebalanceRootManifestAction::new();
+        let hot_mf2 = mf_with_partitions(Some(vec![fsummary(
+            &hour_hot.to_le_bytes(),
+            &hour_hot.to_le_bytes(),
+        )]));
+        assert!(!unfiltered.entry_above_hour_filter(&manifest_ref(hot_mf2)));
+
+        // undecodable hour (no partitions) → conservatively KEEP (not above filter)
+        let no_parts = mf_with_partitions(None);
+        assert!(!action.entry_above_hour_filter(&manifest_ref(no_parts)));
+
+        // undecodable hour (upper_bound too short) → conservatively KEEP
+        let short_bound = mf_with_partitions(Some(vec![fsummary(&[0u8], &[0u8])]));
+        assert!(!action.entry_above_hour_filter(&manifest_ref(short_bound)));
     }
 
     #[test]

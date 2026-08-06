@@ -227,38 +227,6 @@ pub(crate) trait ManifestProcess: Send + Sync {
     ) -> Vec<ManifestFile>;
 }
 
-/// Columns the MDV scan projects when loading a child manifest.
-///
-/// The scan needs only `file_path` (membership test against the removal set, and
-/// the guard checksum) and `record_count` (deleted-records summary). The other
-/// five are here because the parquet row decoder is SHARED with the full read and
-/// reads exactly `status`, `content`, `file_path`, `file_format`, `record_count`
-/// and `file_size_in_bytes` with `?` — omitting any of them turns the read into a
-/// hard error rather than a cheaper decode. Every remaining column is accessed
-/// through an `_opt` variant and is safely skipped; that is where the bulk of a
-/// manifest's bytes live (`lower_bounds_json`, `upper_bounds_json`,
-/// `value_counts_json`, `column_sizes_json`, …).
-///
-/// `partition_spec_id` is NOT required — dropping it leaves the suite green. It is
-/// kept deliberately: a single i32 costs nothing beside the blobs being skipped,
-/// and it keeps the decoded entry faithful enough that a future caller of this
-/// projection is not surprised by a defaulted spec id.
-///
-/// Pinned by `test_mdv_scan_projection_matches_full_read` (projected read is
-/// equivalent to the full read for every field the scan consumes, and provably
-/// skipped the heavy blobs) and `test_replace_data_files_mdv_removes_ref_resident_file`
-/// (end-to-end: the right ref-resident file is soft-deleted). Both fail if a
-/// required column is dropped from this list.
-pub(crate) const MDV_SCAN_COLUMNS: &[&str] = &[
-    "status",
-    "content",
-    "file_path",
-    "file_format",
-    "record_count",
-    "file_size_in_bytes",
-    "partition_spec_id",
-];
-
 pub(crate) struct SnapshotProducer<'a> {
     pub(crate) table: &'a Table,
     snapshot_id: i64,
@@ -1484,36 +1452,18 @@ impl<'a> SnapshotProducer<'a> {
                         continue;  // Skip manifests not in the index
                     }
 
-                    // Projected read: this scan touches only `file_path` (to test
-                    // membership in paths_to_remove, and to compute the guard
-                    // checksum) and `record_count` (for the deleted-records
-                    // summary). A full `load_manifest` additionally decodes
-                    // lower_bounds_json / upper_bounds_json / value_counts_json /
-                    // column_sizes_json for EVERY entry, which is where a large
-                    // manifest's decode cost lives. On sri-olly the hot root of
-                    // `metrics` held 16,154 entries across 4 refs and this scan
-                    // ran on every merge commit (~every 4s), pushing actions_ms
-                    // to 10.9-15.6s against the 10s timeout in laminar's
-                    // drain_and_commit_merges — the commit was then discarded
-                    // after doing nearly all the work.
-                    //
-                    // The column set is not arbitrary: the parquet row decoder is
-                    // shared with the full read and hard-errors (`?`) on exactly
-                    // status / content / file_path / file_format / record_count /
-                    // file_size_in_bytes. Every other column is read via an
-                    // `_opt` accessor and tolerates omission. partition_spec_id is
-                    // included because `inherit_data` and downstream entry
-                    // construction expect it.
-                    //
-                    // Projection does not change entry count or ordering, so
-                    // `entries().len()` and the file_path-ordered guard checksum
-                    // below stay identical to the unprojected read.
-                    //
-                    // NOTE: this reduces decode/alloc, NOT S3 bytes —
-                    // load_manifest_projected still reads the whole object and
-                    // only projects the Arrow decode.
+                    // A column-projected read was tried here (2026-08-06) on the
+                    // theory that decoding lower_bounds_json / upper_bounds_json /
+                    // value_counts_json / column_sizes_json for every entry was
+                    // what made commits slow. It was reverted: measurement showed
+                    // this branch does not run on the tables that were slow. They
+                    // set `root-manifest.incremental=true`, so removals become
+                    // path tombstones and this whole block is skipped. The real
+                    // cost was the 1-in-64 chain collapse. If you are here because
+                    // commits are slow, confirm this scan actually executes before
+                    // optimising it: check `root-manifest.incremental` first.
                     let manifest = manifest_file
-                        .load_manifest_projected(self.table.file_io(), MDV_SCAN_COLUMNS)
+                        .load_manifest(self.table.file_io())
                         .await?;
 
                     let mut new_mdv = match mdv.as_ref() {
@@ -3277,178 +3227,11 @@ mod test_v4_commit {
         );
     }
 
-    /// The MDV scan loads child manifests with a COLUMN PROJECTION
-    /// (`MDV_SCAN_COLUMNS`) rather than a full decode. A full decode materialises
-    /// every entry's bounds / value-count / column-size blobs; on sri-olly the
-    /// `metrics` hot root held 16,154 entries and this scan ran on every merge
-    /// commit (~4s apart), driving actions_ms to 10.9-15.6s against the 10s
-    /// timeout in laminar's `drain_and_commit_merges` — so the commit was thrown
-    /// away after doing nearly all the work.
+    /// End-to-end guard for the MDV scan on a NON-incremental V4 table.
     ///
-    /// Substituting the projected read is sound only if it is indistinguishable
-    /// from the full read for what the scan consumes: entry COUNT (the MDV guard
-    /// records `entries().len()`), `file_path` (removal-set membership and the
-    /// guard checksum) and `record_count` (deleted-records summary).
-    ///
-    /// The fourth assertion is the one that keeps this honest: it checks the
-    /// projection actually SKIPPED the heavy columns. A silent fallback to a full
-    /// read — e.g. if the manifest were avro, where projection is unsupported —
-    /// would satisfy the equality checks while buying nothing.
-    #[tokio::test]
-    async fn test_mdv_scan_projection_matches_full_read() {
-        use super::MDV_SCAN_COLUMNS;
-
-        let catalog = new_memory_catalog().await;
-        let ns = NamespaceIdent::new("test_proj".into());
-        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
-        let table = catalog
-            .create_table(
-                &ns,
-                TableCreation::builder()
-                    .name("v4proj".to_string())
-                    .schema(test_schema())
-                    .format_version(FormatVersion::V4)
-                    // Force the inline->child flush so the append lands as
-                    // ManifestRefs. Small V4 appends stay INLINE in the root, and
-                    // the MDV scan only walks refs — an all-inline table would
-                    // exercise nothing.
-                    .properties(HashMap::from([(
-                        "root-manifest.inline-threshold".to_string(),
-                        "1".to_string(),
-                    )]))
-                    .build(),
-            )
-            .await
-            .unwrap();
-
-        // Files must carry REAL stats. With the empty maps `test_data_file` gives,
-        // projected and full reads are trivially equal and the test proves nothing.
-        let with_stats = |path: &str, records: u64| {
-            let mut df = test_data_file(path);
-            df.record_count = records;
-            df.column_sizes = HashMap::from([(1, 4096u64)]);
-            df.value_counts = HashMap::from([(1, records)]);
-            df.null_value_counts = HashMap::from([(1, 0u64)]);
-            df.lower_bounds = HashMap::from([(1, crate::spec::Datum::long(0))]);
-            df.upper_bounds = HashMap::from([(1, crate::spec::Datum::long(999))]);
-            df
-        };
-
-        let tx = Transaction::new(&table);
-        let tx = tx
-            .fast_append()
-            .with_check_duplicate(false)
-            .add_data_files(vec![
-                with_stats("s3://bucket/data/p0.parquet", 100),
-                with_stats("s3://bucket/data/p1.parquet", 250),
-                with_stats("s3://bucket/data/p2.parquet", 375),
-            ])
-            .apply(tx)
-            .unwrap();
-        let table = tx.commit(&catalog).await.unwrap();
-
-        let (_, entries) = read_head_root(&table).await;
-        let refs: Vec<&crate::spec::ManifestFile> = entries
-            .iter()
-            .filter_map(|e| match e {
-                crate::spec::root_manifest::RootManifestEntry::ManifestRef {
-                    manifest_file,
-                    ..
-                } => Some(manifest_file),
-                crate::spec::root_manifest::RootManifestEntry::Inline(_) => None,
-            })
-            .collect();
-        assert!(
-            !refs.is_empty(),
-            "a V4 append must produce at least one manifest ref for the scan to walk"
-        );
-
-        let mut checked_any = false;
-        for mf in refs {
-            // Projection is parquet-only; avro falls back to a full read, which
-            // would make assertion (4) meaningless rather than failing loudly.
-            assert!(
-                mf.manifest_path.ends_with(".parquet"),
-                "V4 child manifests are expected to be parquet, got {}",
-                mf.manifest_path
-            );
-
-            let full = mf.load_manifest(table.file_io()).await.unwrap();
-            let proj = mf
-                .load_manifest_projected(table.file_io(), MDV_SCAN_COLUMNS)
-                .await
-                .unwrap();
-
-            if full.entries().is_empty() {
-                continue;
-            }
-
-            // (1) entry count — the MDV guard records entries().len()
-            assert_eq!(
-                proj.entries().len(),
-                full.entries().len(),
-                "projection must not change entry count"
-            );
-
-            // (2) file_path AND its ordering — the guard checksum is order-sensitive
-            let full_paths: Vec<&str> = full
-                .entries()
-                .iter()
-                .map(|e| e.data_file.file_path.as_str())
-                .collect();
-            let proj_paths: Vec<&str> = proj
-                .entries()
-                .iter()
-                .map(|e| e.data_file.file_path.as_str())
-                .collect();
-            assert_eq!(
-                proj_paths, full_paths,
-                "projection must preserve file_path and its ordering"
-            );
-
-            // (3) record_count — feeds the deleted-records summary
-            let full_counts: Vec<u64> = full
-                .entries()
-                .iter()
-                .map(|e| e.data_file.record_count)
-                .collect();
-            let proj_counts: Vec<u64> = proj
-                .entries()
-                .iter()
-                .map(|e| e.data_file.record_count)
-                .collect();
-            assert_eq!(
-                proj_counts, full_counts,
-                "projection must preserve record_count"
-            );
-
-            // (4) the projection actually skipped the expensive columns.
-            assert!(
-                full.entries()
-                    .iter()
-                    .any(|e| !e.data_file.lower_bounds().is_empty()),
-                "fixture must carry bounds, else the skip assertion is vacuous"
-            );
-            assert!(
-                proj.entries().iter().all(|e| {
-                    e.data_file.lower_bounds().is_empty()
-                        && e.data_file.upper_bounds().is_empty()
-                        && e.data_file.value_counts().is_empty()
-                        && e.data_file.column_sizes().is_empty()
-                }),
-                "projected read must NOT decode bounds / value-count / column-size blobs"
-            );
-            checked_any = true;
-        }
-        assert!(
-            checked_any,
-            "expected at least one non-empty manifest to compare"
-        );
-    }
-
-    /// End-to-end guard for the projected MDV scan on a NON-incremental V4 table
-    /// — the branch `replace_data_files` actually takes in production, and the one
-    /// the projection change touches.
+    /// Kept after the projection experiment was reverted: this is the only test
+    /// `replace_data_files` has, and the branch is live for any table that does
+    /// not set `root-manifest.incremental`.
     ///
     /// The incremental tests do not cover this: on an incremental table removals
     /// become delta path-tombstones and the MDV scan is skipped entirely

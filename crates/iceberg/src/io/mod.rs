@@ -69,6 +69,11 @@
 mod file_io;
 mod storage;
 mod write_through_cache;
+// Local-cache observability. The layer itself is private (installed via
+// `maybe_wrap` from `storage.rs`), but the host process needs the counters to
+// expose them on its own metrics endpoint — without them a cache that has
+// stopped serving is indistinguishable from one that is working.
+pub use write_through_cache::{local_cache_stats, LocalCacheStats};
 
 pub use file_io::*;
 pub(crate) mod object_cache;

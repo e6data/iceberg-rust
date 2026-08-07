@@ -91,6 +91,73 @@ fn config_from_env() -> Option<CacheConfig> {
 /// storage-operator construction.
 static CACHE: OnceLock<Option<Arc<CacheManager>>> = OnceLock::new();
 
+// ---------------------------------------------------------------------------
+// Counters
+//
+// The cache was previously silent: no logs, no metrics. If it stopped serving —
+// wrong path prefix, evicting faster than expected, a permissions problem on the
+// cache dir — every read would quietly fall through to the object store and
+// nothing would say so. Merge latency alone cannot distinguish "served locally"
+// from "30 parallel object-store GETs", so a regression here would be invisible.
+//
+// Plain atomics rather than a metrics crate: this layer sits under FileIO in a
+// library shared by laminar, tessellate and the executor, and must not impose a
+// metrics dependency on any of them. The host process reads these and exposes
+// them however it already exposes metrics.
+// ---------------------------------------------------------------------------
+static HITS: AtomicU64 = AtomicU64::new(0);
+static MISSES: AtomicU64 = AtomicU64::new(0);
+static BYTES_LOCAL: AtomicU64 = AtomicU64::new(0);
+static EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static TEED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of local-cache activity since process start.
+///
+/// `hits` counts reads served from the local copy; `misses` counts cacheable
+/// reads that fell through to the object store (including evicted and truncated
+/// local files). A hit ratio near zero on a merge-heavy workload means the cache
+/// is not doing its job — check the cache dir is writable and that
+/// `LAMINAR_LOCAL_CACHE_MAX_BYTES` is not so small that files evict before they
+/// are re-read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalCacheStats {
+    /// Reads served entirely from the local copy.
+    pub hits: u64,
+    /// Cacheable reads that fell through to the object store — includes files
+    /// evicted under the byte cap and local copies too short to satisfy the
+    /// requested range. Non-cacheable reads (metadata, manifests) are excluded
+    /// so they cannot dilute the ratio.
+    pub misses: u64,
+    /// Bytes returned from local copies rather than the object store.
+    pub bytes_served_local: u64,
+    /// Local copies unlinked to stay under `LAMINAR_LOCAL_CACHE_MAX_BYTES`. A
+    /// rate approaching the tee rate means the cache is churning faster than
+    /// files are re-read, so hits will be rare no matter how large it is.
+    pub evictions: u64,
+    /// Files successfully written to the local copy alongside the authoritative
+    /// object-store write.
+    pub files_teed: u64,
+}
+
+impl LocalCacheStats {
+    /// Fraction of cacheable reads served locally, or `None` before any read.
+    pub fn hit_ratio(&self) -> Option<f64> {
+        let total = self.hits + self.misses;
+        (total > 0).then(|| self.hits as f64 / total as f64)
+    }
+}
+
+/// Read the local-cache counters. Cheap; safe to call from a metrics handler.
+pub fn local_cache_stats() -> LocalCacheStats {
+    LocalCacheStats {
+        hits: HITS.load(Ordering::Relaxed),
+        misses: MISSES.load(Ordering::Relaxed),
+        bytes_served_local: BYTES_LOCAL.load(Ordering::Relaxed),
+        evictions: EVICTIONS.load(Ordering::Relaxed),
+        files_teed: TEED.load(Ordering::Relaxed),
+    }
+}
+
 fn global_cache() -> Option<Arc<CacheManager>> {
     CACHE
         .get_or_init(|| config_from_env().map(|cfg| Arc::new(CacheManager::new(cfg))))
@@ -199,11 +266,13 @@ impl CacheManager {
                 if let Some(old) = st.entries.remove(&old_key) {
                     st.total_bytes = st.total_bytes.saturating_sub(old.size);
                     to_unlink.push(old.file);
+                    EVICTIONS.fetch_add(1, Ordering::Relaxed);
                 }
             }
             if st.total_bytes.saturating_add(size) <= self.max_bytes {
                 st.total_bytes = st.total_bytes.saturating_add(size);
                 st.entries.insert(rel_path.to_string(), Entry { file, size });
+                TEED.fetch_add(1, Ordering::Relaxed);
                 st.order.push_back(rel_path.to_string());
                 true
             } else {
@@ -261,10 +330,18 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
         // Serve from the local cache when we have this data file on disk.
         if let Some(local) = self.mgr.local_for(path) {
             if let Some(buf) = read_local_range(&local, &args).await {
+                HITS.fetch_add(1, Ordering::Relaxed);
+                BYTES_LOCAL.fetch_add(buf.len() as u64, Ordering::Relaxed);
                 let md = Metadata::new(EntryMode::FILE).with_content_length(buf.len() as u64);
                 return Ok((RpRead::new(md), CacheReader::Local(buf)));
             }
             // Evicted / missing / short → fall through to the object store.
+        }
+        // Only cacheable paths count as a miss: a metadata or manifest read was
+        // never a candidate, and counting it would dilute the ratio into
+        // uselessness.
+        if is_cacheable(path) {
+            MISSES.fetch_add(1, Ordering::Relaxed);
         }
         let (rp, r) = self.inner.read(path, args).await?;
         Ok((rp, CacheReader::Pass(r)))
@@ -581,6 +658,33 @@ mod tests {
     /// tee'd; a subsequent read is served from the local copy (proven by
     /// deleting the backing-store object first — the read still succeeds).
     #[cfg(feature = "storage-memory")]
+    /// The counters must move, and a miss must only be counted for a path the
+    /// cache would ever have served. Counting metadata reads as misses would
+    /// bury the signal we added these for.
+    #[test]
+    fn stats_only_count_cacheable_paths_as_misses() {
+        // Same predicate the read path gates the MISSES counter on.
+        assert!(is_cacheable("wh/db/tbl/data/abc.parquet"));
+        assert!(is_cacheable("wh/db/tbl/data/abc.parquet.stats"));
+        // Metadata and manifests are never cached, so a read of one is not a
+        // miss — it was never a candidate.
+        assert!(!is_cacheable("wh/db/tbl/metadata/root-1.parquet"));
+        assert!(!is_cacheable("wh/db/tbl/metadata/snap-1.avro"));
+        assert!(!is_cacheable("wh/db/tbl/data/_stats/p/partition.puffin"));
+    }
+
+    /// hit_ratio is the number an operator actually reads; make sure it is
+    /// None before any traffic rather than a misleading 0.0.
+    #[test]
+    fn hit_ratio_is_none_until_there_is_traffic() {
+        let empty = LocalCacheStats::default();
+        assert_eq!(empty.hit_ratio(), None);
+        let warm = LocalCacheStats { hits: 3, misses: 1, ..Default::default() };
+        assert_eq!(warm.hit_ratio(), Some(0.75));
+        let cold = LocalCacheStats { hits: 0, misses: 8, ..Default::default() };
+        assert_eq!(cold.hit_ratio(), Some(0.0));
+    }
+
     #[tokio::test]
     async fn layer_tees_write_and_serves_read_from_local() {
         let (mgr, _d) = tmp_manager(1 << 20);

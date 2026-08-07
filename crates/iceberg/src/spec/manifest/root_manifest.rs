@@ -2225,6 +2225,63 @@ mod tests {
         assert_eq!(all.len(), 50, "None filter keeps everything (unpruned)");
     }
 
+    // Regression for the tessellate readiness-check wedge (2026-08-07 sri-olly):
+    // callers that mixed `read_root_manifest` (head-only) with a walk built by
+    // `reconstruct_root` (full chain) were checking each data path against ONLY
+    // the head delta's `removed_paths` — ancestor-delta tombstones leaked through
+    // and got counted as live files. The invariant our fix relies on is that
+    // `reconstruct_root`'s returned meta.removed_paths carries every tombstone
+    // from the chain that didn't materialize as an inline entry (i.e. still needs
+    // to filter ManifestRef children). This test locks that in end-to-end:
+    // three chained deltas each remove a distinct manifest-ref-owned path, and
+    // walking the head must surface all three (sorted) in the returned meta.
+    #[tokio::test]
+    async fn reconstruct_root_accumulates_removed_paths_across_delta_chain() {
+        use std::collections::HashSet;
+
+        use crate::io::FileIOBuilder;
+
+        let schema = test_schema();
+        let partition_spec = test_partition_spec(&schema);
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+
+        // Three chained root manifests, each tombstoning one path. No inline
+        // entries → nothing materializes → all three tombstones stay in
+        // meta.removed_paths for the manifest-ref filter to apply downstream.
+        let paths = ["memory:///root-base.parquet", "memory:///root-d1.parquet", "memory:///root-d2.parquet"];
+        let tombstones = ["memory:///data/base_tomb.parquet", "memory:///data/d1_tomb.parquet", "memory:///data/d2_tomb.parquet"];
+
+        for (i, path) in paths.iter().enumerate() {
+            let mut meta = test_metadata(&schema, &partition_spec);
+            meta.prev_root_path = if i == 0 { None } else { Some(paths[i - 1].to_string()) };
+            meta.chain_depth = i as u32;
+            meta.removed_paths = vec![tombstones[i].to_string()];
+            let bytes = write_root_manifest(&[], &meta, &partition_type).unwrap();
+            file_io.new_output(*path).unwrap().write(bytes.into()).await.unwrap();
+        }
+
+        let (merged_meta, entries) = reconstruct_root(&file_io, paths[2]).await.unwrap();
+        assert!(entries.is_empty(), "no entries were written across the chain");
+
+        let got: HashSet<String> = merged_meta.removed_paths.into_iter().collect();
+        let want: HashSet<String> = tombstones.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            got, want,
+            "reconstruct_root must union removed_paths across every ancestor delta so downstream ManifestRef filtering catches tombstones added by prior commits"
+        );
+
+        // Contrast: head-only `read_root_manifest` sees ONLY delta2's set.
+        let head_bytes = file_io.new_input(paths[2]).unwrap().read().await.unwrap();
+        let (head_meta, _) = read_root_manifest(head_bytes).unwrap();
+        assert_eq!(
+            head_meta.removed_paths.len(),
+            1,
+            "head-only read must expose the bug this test guards against: it misses ancestor tombstones"
+        );
+        assert_eq!(head_meta.removed_paths[0], tombstones[2]);
+    }
+
     // Regression for the attribute_index wedge: a collapsed balanced-tree base has
     // `node_level > 0` AND `prev_root_path == None`. The raw single read
     // (`read_root_manifest`) returns the base's DIRECT entries — refs to INTERIOR

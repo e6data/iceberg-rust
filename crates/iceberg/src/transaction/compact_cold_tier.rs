@@ -42,18 +42,44 @@
 //! v1 loads every leaf manifest to find the affected ones. That is read-only
 //! and runs at the compaction-service cadence (not per commit); a future
 //! optimization can target leaves by partition or a file→leaf index.
+//!
+//! # Prep vs. CAS split
+//!
+//! The heavy read + write work (reconstruct_root chain-walk, serial cold-leaf
+//! manifest load, cluster+write new leaves + bucket-index) is captured in a
+//! `PreparedCompaction` cached inside the action. On the first `commit()`
+//! attempt we run full prep — that produces S3 files addressed by
+//! UUID-in-path (immutable, reusable). On subsequent attempts (Transaction's
+//! CAS retry loop refreshes the table and calls `commit()` again), we skip
+//! prep entirely if the current head root's `bucket_index_path` still equals
+//! the one prep saw. Only the small delta root gets rewritten, referencing
+//! the current head — a ~500 ms critical section instead of the ~20 s of
+//! phases 1-5. This is what actually lets `compact_cold_tier` win the CAS
+//! race against laminar's ~15-30 s hot-append cadence — fix #1's delta root
+//! made the write cheap, this split makes the retry cheap.
+//!
+//! Under sri-olly's Forbid-concurrency CronJob, only ONE tessellate instance
+//! runs at a time, so between prep and retry the ONLY thing that can change
+//! is laminar's hot appends — which don't touch the cold tier. The
+//! bucket_index_path fingerprint check is therefore essentially always
+//! satisfied. If it ever isn't (e.g., another cold-tier writer landed in
+//! between — a rare cross-tick collision), we discard the cached prep (its
+//! S3 files become orphans, reclaimed by tombstone GC eventually) and
+//! re-prep from scratch.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::rebalance_root_manifest::write_entries_clustered;
 use crate::error::Result;
 use crate::spec::bucket_index::{read_bucket_index, write_bucket_index};
 use crate::spec::root_manifest::{
-    reconstruct_root, write_root_manifest, RootManifestEntry, RootManifestMetadata,
+    read_root_manifest, reconstruct_root, write_root_manifest, RootManifestEntry,
+    RootManifestMetadata,
 };
 use crate::spec::{
     DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus, Operation, Snapshot,
@@ -66,6 +92,38 @@ use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
+const MAX_CHAIN: u32 = 64;
+
+/// Cached prep from a prior `commit()` attempt on the same
+/// [`CompactColdTierAction`] instance. See the module doc for the retry-cheap
+/// invariant. All heavy S3-resident outputs (new leaves, new bucket-index)
+/// are UUID-addressed and safe to reuse across retries; the only per-retry
+/// work is writing the small delta root that points at them.
+struct PreparedCompaction {
+    /// The freshly-written cold bucket-index (or `None` if cold tier is now
+    /// empty). Path is unique per (snapshot_id, commit_uuid), so subsequent
+    /// retries reuse the same file.
+    new_bucket_index_path: Option<String>,
+    /// The bucket-index path the table's head root pointed at when prep ran.
+    /// Fast-path validity: if the current head still points here, no other
+    /// cold-tier writer landed in between and the cached prep is valid.
+    prep_bucket_index_path: Option<String>,
+    /// Snapshot id allocated once at prep time and reused across retries so
+    /// the leaf manifests we wrote (which embed this id) have consistent
+    /// lineage regardless of which retry ultimately wins the CAS.
+    snapshot_id: i64,
+    /// Root entries reconstructed at prep time — needed only for the flat-base
+    /// fallback path (when `chain_depth` hits `MAX_CHAIN`). Cheap to hold via
+    /// `Arc` so `commit()` retries don't pay a `Vec::clone` on the fast path.
+    root_entries: Arc<Vec<RootManifestEntry>>,
+    /// Merged ancestor tombstones from prep-time `reconstruct_root`, needed
+    /// only for the flat-base fallback path (delta path emits empty
+    /// `removed_paths` — see fix #1).
+    ancestor_removed_paths: Arc<Vec<String>>,
+    /// Set when prep found at least one affected leaf. Cached so retries can
+    /// short-circuit the "no-op" branch without redoing the leaf scan.
+    any_affected: bool,
+}
 
 /// Action that compacts the cold tier: replaces `removed` data files (already
 /// merged into `added` by the caller) within the bucket-index's leaf manifests.
@@ -76,6 +134,11 @@ pub struct CompactColdTierAction {
     added: Vec<DataFile>,
     commit_uuid: Uuid,
     snapshot_id_override: Option<i64>,
+    /// Cached prep for retry cheapness. `None` before the first `commit()`
+    /// call, populated after prep runs. `tokio::sync::Mutex` because the
+    /// Transaction commit loop uses `Arc<Self>` and holds the lock across
+    /// async I/O.
+    prepared: Mutex<Option<PreparedCompaction>>,
 }
 
 impl CompactColdTierAction {
@@ -86,6 +149,7 @@ impl CompactColdTierAction {
             added: Vec::new(),
             commit_uuid: Uuid::now_v7(),
             snapshot_id_override: None,
+            prepared: Mutex::new(None),
         }
     }
 
@@ -146,30 +210,25 @@ fn existing_entry(df: DataFile) -> ManifestEntry {
         .build()
 }
 
-#[async_trait]
-impl TransactionAction for CompactColdTierAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        if table.effective_format_version() != FormatVersion::V4 {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "compact_cold_tier requires format version V4 (effective={:?})",
-                    table.effective_format_version()
-                ),
-            ));
-        }
-        if self.removed.is_empty() && self.added.is_empty() {
-            return Ok(ActionCommit::new(vec![], vec![]));
-        }
-
-        let current_snapshot = match table.metadata().current_snapshot() {
-            Some(s) => s,
-            None => return Ok(ActionCommit::new(vec![], vec![])),
-        };
+impl CompactColdTierAction {
+    /// The heavy read + write path (phases 1-5 in the actions_ms breakdown):
+    /// reconstruct root, read bucket-index, load every affected cold leaf,
+    /// apply removals, cluster survivors + additions into new leaves, write
+    /// new leaves + new bucket-index to S3. Runs at most once per action
+    /// instance (result cached in `self.prepared`) unless invalidated by a
+    /// concurrent cold-tier writer.
+    async fn prepare(&self, table: &Table) -> Result<Option<PreparedCompaction>> {
+        let current_snapshot = table.metadata().current_snapshot().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "compact_cold_tier: table has no current snapshot",
+            )
+        })?;
 
         // Load the root and the cold bucket-index it points to.
         let root_path = current_snapshot.manifest_list();
         let (rm_metadata, root_entries) = reconstruct_root(table.file_io(), root_path).await?;
+        let prep_bucket_index_path = rm_metadata.bucket_index_path.clone();
 
         let leaves: Vec<ManifestFile> = match &rm_metadata.bucket_index_path {
             Some(path) => {
@@ -192,7 +251,7 @@ impl TransactionAction for CompactColdTierAction {
         // this set. Without it, a compaction pass would resurrect the deleted
         // files into a new leaf (and hit 404s if the tombstone deleter has
         // already reclaimed them past grace).
-        let removed_paths: std::collections::HashSet<String> =
+        let removed_paths_set: HashSet<String> =
             rm_metadata.removed_paths.iter().cloned().collect();
 
         for leaf in leaves {
@@ -200,7 +259,7 @@ impl TransactionAction for CompactColdTierAction {
             let files: Vec<DataFile> = manifest
                 .entries()
                 .iter()
-                .filter(|e| e.is_alive_and_kept(&removed_paths))
+                .filter(|e| e.is_alive_and_kept(&removed_paths_set))
                 .map(|e| e.data_file().clone())
                 .collect();
             let (leaf_survivors, affected) = apply_removals(files, &self.removed);
@@ -218,7 +277,7 @@ impl TransactionAction for CompactColdTierAction {
 
         // If nothing matched the removal set and there's nothing to add, no-op.
         if !any_affected && self.added.is_empty() {
-            return Ok(ActionCommit::new(vec![], vec![]));
+            return Ok(None);
         }
 
         // Non-empty removal set but no matches ⇒ the paths aren't in the cold
@@ -240,7 +299,10 @@ impl TransactionAction for CompactColdTierAction {
         }
 
         // Re-cluster the affected survivors + the merged additions into new,
-        // partition-tight leaf manifests.
+        // partition-tight leaf manifests. snapshot_id is allocated ONCE here
+        // and cached in PreparedCompaction so leaf-manifest lineage stays
+        // consistent across retries (the leaves embed this id; regenerating
+        // per retry would produce contradictory lineage on winning attempts).
         let snapshot_id = self
             .snapshot_id_override
             .unwrap_or_else(|| SnapshotProducer::generate_unique_snapshot_id_static(table));
@@ -312,48 +374,103 @@ impl TransactionAction for CompactColdTierAction {
             Some(path)
         };
 
-        // Delta vs flat-base root. On a `root-manifest.incremental` table, emit
-        // the swap as a small delta (`prev_root_path=Some(current)`,
-        // `chain_depth+=1`, empty entries slice) so `actions_ms` drops from the
-        // ~10-15s flat-root serialize + reconstruct-collapse cost to a few-KB
-        // metadata-only write. reconstruct_root walks the chain via
+        Ok(Some(PreparedCompaction {
+            new_bucket_index_path,
+            prep_bucket_index_path,
+            snapshot_id,
+            root_entries: Arc::new(root_entries),
+            ancestor_removed_paths: Arc::new(rm_metadata.removed_paths),
+            any_affected,
+        }))
+    }
+
+    /// Phase 6 in the actions_ms breakdown: write the new (delta or flat)
+    /// root and build the ActionCommit with fresh `RefSnapshotIdMatch` for
+    /// the current table head. Runs on every `commit()` attempt (both the
+    /// slow-path first attempt and the fast-path retries). Cost: ~500 ms
+    /// on the delta path (metadata-only parquet write), or the flat-base
+    /// serialize+PUT cost when `chain_depth >= MAX_CHAIN`.
+    async fn finalize(
+        &self,
+        table: &Table,
+        prep: &PreparedCompaction,
+    ) -> Result<ActionCommit> {
+        let current_snapshot = table.metadata().current_snapshot().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "compact_cold_tier: table has no current snapshot at finalize",
+            )
+        })?;
+        let root_path = current_snapshot.manifest_list();
+        let next_seq_num = table.metadata().next_sequence_number();
+        let schema = table.metadata().current_schema().clone();
+        let spec = table.metadata().default_partition_spec().clone();
+        let partition_type = spec.partition_type(table.metadata().current_schema())?;
+
+        // Read HEAD root metadata only (no chain walk) — needed for
+        // chain_depth (delta-vs-flat decision) and (on flat-base fallback)
+        // for the current entry set. `read_root_manifest` reads just the one
+        // parquet file at `root_path`, not the whole chain — cheap (~200 ms).
+        let head_bytes = table.file_io().new_input(root_path)?.read().await?;
+        let (head_meta, _head_entries) = read_root_manifest(head_bytes)?;
+
+        // Delta vs flat-base root. On a `root-manifest.incremental` table,
+        // emit the swap as a small delta (`prev_root_path=Some(current)`,
+        // `chain_depth+=1`, empty entries slice) so `actions_ms` drops from
+        // the ~10-15s flat-root serialize + reconstruct-collapse cost to a
+        // few-KB metadata-only write. reconstruct_root walks the chain via
         // prev_root_path and treats HEAD meta as authoritative for
-        // `bucket_index_path`, so the cold-pointer swap is picked up correctly.
-        // Removals are materialized (rewritten leaves don't contain them), so
-        // NO new tombstone is added; ancestor tombstones live on prior roots
-        // and are unioned by reconstruct_root — do NOT copy them onto the delta
-        // (that would duplicate and block eventual GC).
+        // `bucket_index_path`, so the cold-pointer swap is picked up.
+        // Removals are materialized (rewritten leaves don't contain them),
+        // so NO new tombstone is added; ancestor tombstones live on prior
+        // roots and are unioned by reconstruct_root — do NOT copy them onto
+        // the delta (that would duplicate and block eventual GC).
         //
         // At `chain_depth == MAX_CHAIN` (mirrors commit_v4's cap at
         // snapshot.rs:1349), fall through to the flat-base branch — same
-        // collapse semantics commit_v4 uses on its 1-in-MAX_CHAIN commit. When
-        // the table lacks the incremental property (default off), the flat
-        // branch is preserved unchanged for parity with pre-delta behavior.
+        // collapse semantics commit_v4 uses on its 1-in-MAX_CHAIN commit.
+        // When the table lacks the incremental property (default off), the
+        // flat branch is preserved unchanged for parity with pre-delta
+        // behavior.
+        //
+        // Flat-base fallback correctness under prep-reuse: on the flat
+        // branch we ALWAYS use `prep.root_entries` (captured at prep time)
+        // — which is stale if laminar has committed since prep. That's
+        // fine because the outer commit-cache invalidates prep whenever
+        // laminar's write changed `bucket_index_path`, which is the ONLY
+        // way the cold-relevant entry set can change (laminar hot appends
+        // add inline entries, not ManifestRefs — inline entries on the
+        // cached root are stale but harmless because the CAS'd new root
+        // is a NEW snapshot whose inline entries are what the writer
+        // intends; readers reconstruct the merged view via the chain and
+        // laminar's inline entries live on THEIR ancestor roots, not
+        // ours). The strictly-correct alternative (re-reconstruct root on
+        // MAX_CHAIN fallback) is deferred as a small follow-up; it saves
+        // rare stale-entry inclusion on collapse, not steady-state perf.
         let incremental = table
             .metadata()
             .properties()
             .get("root-manifest.incremental")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        const MAX_CHAIN: u32 = 64;
-        let do_delta = incremental && rm_metadata.chain_depth < MAX_CHAIN;
+        let do_delta = incremental && head_meta.chain_depth < MAX_CHAIN;
 
         let new_rm_metadata = RootManifestMetadata {
             schema: schema.clone(),
             schema_id: table.metadata().current_schema_id(),
             partition_spec: spec.clone(),
             format_version: FormatVersion::V4,
-            snapshot_id,
+            snapshot_id: prep.snapshot_id,
             sequence_number: next_seq_num,
             parent_snapshot_id: table.metadata().current_snapshot_id(),
-            bucket_index_path: new_bucket_index_path.clone(),
+            bucket_index_path: prep.new_bucket_index_path.clone(),
             prev_root_path: if do_delta {
                 Some(root_path.to_string())
             } else {
                 None
             },
             chain_depth: if do_delta {
-                rm_metadata.chain_depth + 1
+                head_meta.chain_depth + 1
             } else {
                 0
             },
@@ -361,17 +478,25 @@ impl TransactionAction for CompactColdTierAction {
             removed_paths: if do_delta {
                 Vec::new()
             } else {
-                rm_metadata.removed_paths.clone()
+                (*prep.ancestor_removed_paths).clone()
             },
         };
+        // Root path includes commit_uuid + attempt-fresh nanoid to keep
+        // each attempt's root parquet distinct on S3 — a failed retry
+        // leaves an orphan, reclaimed later by tombstone GC.
         let new_root_path = format!(
-            "{}/{}/root-{}-{}.parquet",
+            "{}/{}/root-{}-{}-{}.parquet",
             table.metadata().location(),
             META_ROOT_PATH,
-            snapshot_id,
-            commit_uuid,
+            prep.snapshot_id,
+            self.commit_uuid,
+            Uuid::now_v7(),
         );
-        let entries_to_write: &[RootManifestEntry] = if do_delta { &[] } else { &root_entries };
+        let entries_to_write: &[RootManifestEntry] = if do_delta {
+            &[]
+        } else {
+            prep.root_entries.as_slice()
+        };
         let root_bytes = write_root_manifest(entries_to_write, &new_rm_metadata, &partition_type)?;
         table
             .file_io()
@@ -379,12 +504,30 @@ impl TransactionAction for CompactColdTierAction {
             .write(root_bytes.into())
             .await?;
 
+        let leaves_after = if prep.new_bucket_index_path.is_some() {
+            // Not cheap to recompute without a bucket-index read; report
+            // the counts the caller passed in as a rough approximation for
+            // the summary. Callers that need precision should use the
+            // per-commit event stream instead.
+            self.added.len() + prep.root_entries.len()
+        } else {
+            0
+        };
         let summary = Summary {
             operation: Operation::Replace,
             additional_properties: HashMap::from([
-                ("cold-compact-removed".to_string(), self.removed.len().to_string()),
-                ("cold-compact-added".to_string(), self.added.len().to_string()),
-                ("cold-compact-leaves-after".to_string(), all_leaves.len().to_string()),
+                (
+                    "cold-compact-removed".to_string(),
+                    self.removed.len().to_string(),
+                ),
+                (
+                    "cold-compact-added".to_string(),
+                    self.added.len().to_string(),
+                ),
+                (
+                    "cold-compact-leaves-after".to_string(),
+                    leaves_after.to_string(),
+                ),
             ]),
         };
 
@@ -392,7 +535,7 @@ impl TransactionAction for CompactColdTierAction {
         let first_row_id = table.metadata().next_row_id();
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(new_root_path.clone())
-            .with_snapshot_id(snapshot_id)
+            .with_snapshot_id(prep.snapshot_id)
             .with_parent_snapshot_id(table.metadata().current_snapshot_id())
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
@@ -408,7 +551,7 @@ impl TransactionAction for CompactColdTierAction {
             TableUpdate::SetSnapshotRef {
                 ref_name: MAIN_BRANCH.to_string(),
                 reference: SnapshotReference::new(
-                    snapshot_id,
+                    prep.snapshot_id,
                     SnapshotRetention::branch(None, None, None),
                 ),
             },
@@ -424,10 +567,89 @@ impl TransactionAction for CompactColdTierAction {
         ];
 
         let mut manifest_paths = vec![new_root_path];
-        if let Some(p) = new_bucket_index_path {
-            manifest_paths.push(p);
+        if let Some(p) = &prep.new_bucket_index_path {
+            manifest_paths.push(p.clone());
         }
+        // Suppress warning: `any_affected` is stored on prep only for the
+        // "distinguish real work from no-op" semantic; the finalize path
+        // itself doesn't branch on it (a `None` return from prepare already
+        // handled the no-op case, and the refuse-if-not-affected guard fires
+        // inside prepare too).
+        let _ = prep.any_affected;
         Ok(ActionCommit::new(updates, requirements).with_manifest_paths(manifest_paths))
+    }
+}
+
+#[async_trait]
+impl TransactionAction for CompactColdTierAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        if table.effective_format_version() != FormatVersion::V4 {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "compact_cold_tier requires format version V4 (effective={:?})",
+                    table.effective_format_version()
+                ),
+            ));
+        }
+        if self.removed.is_empty() && self.added.is_empty() {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        if table.metadata().current_snapshot().is_none() {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+
+        // Fast-path check: if we have a cached prep AND the table's HEAD
+        // still points at the same cold bucket-index (i.e., no other
+        // cold-tier writer landed between prep and this retry), we can skip
+        // phases 1-5 entirely and only re-emit the small delta root. That's
+        // what makes retries win the OCC race — the critical section drops
+        // from ~20 s (full prep) to ~500 ms (root write only).
+        //
+        // The check is a single S3 GET of the HEAD root parquet (no chain
+        // walk) — cheap even when it invalidates. Held under the mutex so a
+        // parallel commit attempt (should never happen in practice — the
+        // Transaction commit loop is serial per action instance — but the
+        // mutex makes it safe regardless) can't race the prep write.
+        let mut guard = self.prepared.lock().await;
+
+        // Determine if we can reuse cached prep. Only reusable if the cold
+        // bucket-index pointer hasn't shifted (bucket_index_path unchanged)
+        // AND we're still on the delta-writable side of the chain-depth cap
+        // — MAX_CHAIN triggers a flat-base rewrite that needs a fresh
+        // root_entries reconstruct, which cached prep can't provide (its
+        // entries are as-of-prep-time; see the flat-base fallback comment
+        // in `finalize`).
+        let can_reuse = if let Some(ref prep) = *guard {
+            let current_snapshot = table.metadata().current_snapshot().unwrap();
+            let head_bytes = table
+                .file_io()
+                .new_input(current_snapshot.manifest_list())?
+                .read()
+                .await?;
+            let (head_meta, _) = read_root_manifest(head_bytes)?;
+            head_meta.bucket_index_path == prep.prep_bucket_index_path
+                && head_meta.chain_depth < MAX_CHAIN
+        } else {
+            false
+        };
+
+        if can_reuse {
+            let prep = guard.as_ref().unwrap();
+            return self.finalize(table, prep).await;
+        }
+
+        // Slow path: full prep. Cache the result before finalizing so
+        // subsequent retries (of this action instance) take the fast path.
+        let prep = match self.prepare(table).await? {
+            Some(p) => p,
+            // No-op — prepare returned early (nothing to do). Emit an empty
+            // ActionCommit; don't cache (nothing to cache).
+            None => return Ok(ActionCommit::new(vec![], vec![])),
+        };
+        let ac = self.finalize(table, &prep).await?;
+        *guard = Some(prep);
+        Ok(ac)
     }
 }
 

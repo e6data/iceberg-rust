@@ -2154,10 +2154,12 @@ mod test_v4_commit {
         Schema, Struct, Type,
     };
     use super::{partition_grouping_key, resolve_grouping_positions};
+    use crate::TableUpdate;
     use crate::transaction::Transaction;
-    use crate::transaction::action::ApplyTransactionAction;
+    use crate::transaction::action::{ApplyTransactionAction, TransactionAction};
     use futures::TryStreamExt;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     fn test_schema() -> Schema {
         Schema::builder()
@@ -3001,6 +3003,151 @@ mod test_v4_commit {
                 "collapsed base carries no prev pointer"
             );
         }
+    }
+
+    /// e2e for fix #2 (read-outside-CAS): calling `commit()` twice on the
+    /// same `CompactColdTierAction` instance — with a laminar-style hot
+    /// append landed in between — must REUSE cached prep on the second
+    /// call. The invariants are:
+    ///
+    ///   1. Both `ActionCommit`s reference the SAME `snapshot_id` in
+    ///      `AddSnapshot` — the id is allocated once at prep time and
+    ///      cached in `PreparedCompaction`.
+    ///   2. Both reference the SAME cold-tier `bucket-index-*.parquet`
+    ///      path in `manifest_paths` — the bucket-index parquet is
+    ///      written once at prep time and reused across retries.
+    ///   3. The two root manifest paths DIFFER — each attempt writes a
+    ///      fresh delta root with the current head as `prev_root_path`,
+    ///      because `parent_snapshot_id` must reflect the current table
+    ///      state per attempt.
+    ///
+    /// This is the invariant that turns per-retry cost from ~20 s (full
+    /// prep) into ~500 ms (root-write only) — the reason compact_cold_tier
+    /// can actually win the CAS race against laminar's ingest cadence.
+    #[tokio::test]
+    async fn test_v4_compact_cold_tier_reuses_prep_across_retries() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_cold_prep_reuse".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let mut table = catalog
+            .create_table(&ns, tiered_table_creation("v4prepreuse", 3600))
+            .await
+            .unwrap();
+
+        // Populate the cold tier via the tiered pipeline (66 fast_appends →
+        // graduation → bucket-index build).
+        const N: usize = 66;
+        let small: Vec<String> = (0..N)
+            .map(|i| format!("s3://bucket/data/small{i}.parquet"))
+            .collect();
+        for p in &small {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![ts_data_file(p, 1000)])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+        let cold = cold_paths(&table).await;
+        assert!(!cold.is_empty(), "graduation put some files in the cold tier");
+        let target_cold = cold.iter().next().cloned().unwrap();
+        let merged_path = "s3://bucket/data/compacted-prepreuse.parquet";
+
+        // Build the action as Arc so we can call commit twice on the same
+        // instance — mirrors what Transaction::do_commit does across retries.
+        let action = Arc::new(
+            crate::transaction::compact_cold_tier::CompactColdTierAction::new()
+                .remove_files([target_cold.clone()])
+                .add_files(vec![ts_data_file(merged_path, 1000)]),
+        );
+
+        // First commit() — runs full prep. Grabs prep's snapshot_id + the
+        // cold-tier bucket-index path from the returned ActionCommit's
+        // manifest_paths list. We DO NOT submit to catalog — that would move
+        // the head bucket_index_path and invalidate the fast-path check.
+        let mut ac1 = Arc::clone(&action).commit(&table).await.unwrap();
+        let ac1_updates = ac1.take_updates();
+        let snap1_id = ac1_updates
+            .iter()
+            .find_map(|u| match u {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot.snapshot_id()),
+                _ => None,
+            })
+            .expect("first commit added a snapshot");
+        let ac1_paths = ac1.take_manifest_paths();
+        let bi_path_1 = ac1_paths
+            .iter()
+            .find(|p| p.contains("bucket-index-"))
+            .cloned()
+            .expect("first commit wrote a bucket-index");
+        let root_path_1 = ac1_paths
+            .iter()
+            .find(|p| p.contains("/root-"))
+            .cloned()
+            .expect("first commit wrote a root");
+
+        // Simulate a laminar concurrent hot-append landing in the catalog.
+        // fast_append goes through commit_v4's hot path which carries the
+        // cold `bucket_index_path` UNCHANGED (see snapshot.rs:2036-2040), so
+        // the fast-path prep-reuse check should be satisfied on the second
+        // commit.
+        let hot_append_path = "s3://bucket/data/laminar-hot-append.parquet";
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(vec![ts_data_file(hot_append_path, 1000)])
+            .apply(tx)
+            .unwrap();
+        let table_after_hot = tx.commit(&catalog).await.unwrap();
+
+        // Second commit() on the SAME action instance — mirrors what
+        // Transaction::do_commit does on OCC retry: reload the fresh table
+        // from catalog, call action.commit(&fresh_table). This must take
+        // the FAST path (cached prep reused) because the cold-tier
+        // bucket_index_path in the fresh head is still what prep saw.
+        let mut ac2 = Arc::clone(&action)
+            .commit(&table_after_hot)
+            .await
+            .unwrap();
+        let ac2_updates = ac2.take_updates();
+        let snap2_id = ac2_updates
+            .iter()
+            .find_map(|u| match u {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot.snapshot_id()),
+                _ => None,
+            })
+            .expect("second commit added a snapshot");
+        let ac2_paths = ac2.take_manifest_paths();
+        let bi_path_2 = ac2_paths
+            .iter()
+            .find(|p| p.contains("bucket-index-"))
+            .cloned()
+            .expect("second commit references a bucket-index");
+        let root_path_2 = ac2_paths
+            .iter()
+            .find(|p| p.contains("/root-"))
+            .cloned()
+            .expect("second commit wrote a root");
+
+        // Invariant 1 — snapshot_id is stable across retries (cached in prep).
+        assert_eq!(
+            snap1_id, snap2_id,
+            "cached prep reused → same snapshot_id across retries"
+        );
+        // Invariant 2 — bucket-index parquet is reused (written once at prep).
+        assert_eq!(
+            bi_path_1, bi_path_2,
+            "cached prep reused → same cold bucket-index across retries"
+        );
+        // Invariant 3 — root manifest is re-written per attempt (its
+        // parent_snapshot_id and prev_root_path change with the head).
+        assert_ne!(
+            root_path_1, root_path_2,
+            "root manifest is rewritten per attempt with fresh parent snapshot"
+        );
     }
 
     /// e2e: a merge-on-write (remove the small inputs, add the merged output) on

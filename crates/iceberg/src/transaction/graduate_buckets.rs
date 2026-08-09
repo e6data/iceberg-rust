@@ -144,11 +144,14 @@ async fn write_maxts_sidecar(
     output.write(bytes.into()).await
 }
 
+use tokio::sync::Mutex;
+
 use super::rebalance_root_manifest::write_entries_clustered;
 use crate::error::Result;
 use crate::spec::bucket_index::{read_bucket_index, write_bucket_index};
 use crate::spec::root_manifest::{
-    reconstruct_root, write_root_manifest, RootManifestEntry, RootManifestMetadata,
+    read_root_manifest, reconstruct_root, write_root_manifest, RootManifestEntry,
+    RootManifestMetadata,
 };
 use crate::spec::{
     DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus, Operation,
@@ -162,6 +165,50 @@ use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
+/// Chain-depth cap for the incremental delta path. Mirrors `commit_v4`'s
+/// constant at `snapshot.rs:1349` and the identical cap in `compact_cold_tier`
+/// — beyond MAX_CHAIN we fall back to a flat-base collapse.
+const MAX_CHAIN: u32 = 64;
+
+/// Cached prep from a prior `commit()` attempt on the same
+/// [`GraduateBucketsAction`] instance. Same retry-cheap invariant as
+/// `compact_cold_tier`'s `PreparedCompaction`: the heavy S3-resident outputs
+/// (the new bucket-index parquet + new cold-tier leaves inside it) are
+/// UUID-addressed and safe to reuse across CAS retries. The only per-retry
+/// work is writing the small delta root that points at them.
+///
+/// Under sri-olly's Forbid-concurrency CronJob only ONE tessellate instance
+/// runs at a time, so between prep and retry the only thing that can change
+/// is laminar's hot appends — which don't touch the cold tier. The
+/// bucket_index_path fingerprint check is therefore essentially always
+/// satisfied. If it isn't (rare cross-tick collision), the cached prep is
+/// invalidated (its S3 outputs become orphans, reclaimed by tombstone GC)
+/// and re-prep runs.
+struct PreparedGraduation {
+    /// Reconstructed hot-root entries that stay hot after graduation. Cached
+    /// so the flat-base fallback (chain_depth >= MAX_CHAIN) doesn't need a
+    /// re-reconstruct.
+    kept: Vec<RootManifestEntry>,
+    /// Freshly-written bucket-index containing existing cold leaves +
+    /// newly-graduated ones. Path is unique per (snapshot_id, commit_uuid).
+    bucket_index_path: String,
+    /// Bucket-index path the head root pointed at when prep ran. Fast-path
+    /// validity: if the current head still points here, no other cold-tier
+    /// writer landed in between and the cached prep is valid.
+    prep_bucket_index_path: Option<String>,
+    /// Merged ancestor tombstones from prep-time `reconstruct_root`; needed
+    /// only for the flat-base fallback (delta path emits empty `removed_paths`
+    /// so ancestor tombstones stay live via chain walk).
+    ancestor_removed_paths: Vec<String>,
+    /// Snapshot id allocated once at prep and reused across retries so leaves
+    /// have consistent lineage regardless of which retry wins the CAS.
+    snapshot_id: i64,
+    /// Summary counters from the fold — carried into the new snapshot's
+    /// Summary regardless of which retry ultimately wins.
+    nodes_moved: usize,
+    inline_leaves: usize,
+    cold_leaves_total: usize,
+}
 
 /// Action that relocates closed live nodes (and any closed inline files) into
 /// the cold bucket-index. Use via `Transaction::graduate_buckets(ts_field_id,
@@ -170,6 +217,11 @@ pub struct GraduateBucketsAction {
     ts_field_id: i32,
     cutoff_micros: i64,
     commit_uuid: Uuid,
+    /// Cached prep for retry cheapness. `None` before the first `commit()`
+    /// call, populated after prep runs. `tokio::sync::Mutex` because the
+    /// Transaction commit loop uses `Arc<Self>` and holds the lock across
+    /// async I/O.
+    prepared: Mutex<Option<PreparedGraduation>>,
 }
 
 impl GraduateBucketsAction {
@@ -181,6 +233,7 @@ impl GraduateBucketsAction {
             ts_field_id,
             cutoff_micros,
             commit_uuid: Uuid::now_v7(),
+            prepared: Mutex::new(None),
         }
     }
 }
@@ -945,34 +998,34 @@ pub(crate) async fn fold_closed_into_bucket_index(
     ))
 }
 
-#[async_trait]
-impl TransactionAction for GraduateBucketsAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        if table.effective_format_version() != FormatVersion::V4 {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "graduate_buckets requires format version V4 (effective={:?})",
-                    table.effective_format_version()
-                ),
-            ));
-        }
-
-        let current_snapshot = match table.metadata().current_snapshot() {
-            Some(s) => s,
-            None => return Ok(ActionCommit::new(vec![], vec![])),
-        };
+impl GraduateBucketsAction {
+    /// Heavy read + write path (equivalent of phases 1-5 in the
+    /// compact_cold_tier breakdown): reconstruct root, fold closed entries
+    /// into the cold bucket-index (which reads existing cold leaves +
+    /// writes new leaves + writes new bucket-index parquet). Runs at most
+    /// once per action instance (result cached in `self.prepared`) unless
+    /// invalidated by a concurrent cold-tier writer.
+    async fn prepare(&self, table: &Table) -> Result<Option<PreparedGraduation>> {
+        let current_snapshot = table.metadata().current_snapshot().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "graduate_buckets: table has no current snapshot",
+            )
+        })?;
 
         let root_path = current_snapshot.manifest_list();
         let (rm_metadata, entries) = reconstruct_root(table.file_io(), root_path).await?;
+        let prep_bucket_index_path = rm_metadata.bucket_index_path.clone();
 
+        // Allocate ONCE at prep — reused across retries so the leaf manifests
+        // (which embed snapshot_id) keep consistent lineage.
         let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
         let commit_uuid = self.commit_uuid;
         let mut manifest_counter: u64 = 0;
 
-        // Fold closed entries into the cold bucket-index (shared with the
-        // commit_v4 collapse path). Returns the entries that stay hot plus the
-        // updated bucket-index; None ⇒ nothing closed this pass.
+        // Fold closed entries into the cold bucket-index. Returns the entries
+        // that stay hot plus the updated bucket-index; None ⇒ nothing closed
+        // this pass.
         let removed_set: HashSet<String> =
             rm_metadata.removed_paths.iter().cloned().collect();
         let (kept, fold) = fold_closed_into_bucket_index(
@@ -992,40 +1045,119 @@ impl TransactionAction for GraduateBucketsAction {
         .await?;
         let fold = match fold {
             Some(f) => f,
-            None => return Ok(ActionCommit::new(vec![], vec![])),
+            None => return Ok(None),
         };
 
-        let schema = table.metadata().current_schema().clone();
+        Ok(Some(PreparedGraduation {
+            kept,
+            bucket_index_path: fold.bucket_index_path,
+            prep_bucket_index_path,
+            ancestor_removed_paths: rm_metadata.removed_paths,
+            snapshot_id,
+            nodes_moved: fold.nodes_moved,
+            inline_leaves: fold.inline_leaves,
+            cold_leaves_total: fold.cold_leaves_total,
+        }))
+    }
+
+    /// Phase 6 equivalent: write the new (delta or flat) root and build the
+    /// ActionCommit with fresh `RefSnapshotIdMatch` for the current table
+    /// head. Runs on every `commit()` attempt. Cost: ~500 ms on the delta
+    /// path (metadata-only parquet write), or flat-base serialize+PUT when
+    /// `chain_depth >= MAX_CHAIN`.
+    async fn finalize(
+        &self,
+        table: &Table,
+        prep: &PreparedGraduation,
+    ) -> Result<ActionCommit> {
+        let current_snapshot = table.metadata().current_snapshot().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "graduate_buckets: table has no current snapshot at finalize",
+            )
+        })?;
+        let root_path = current_snapshot.manifest_list();
         let next_seq_num = table.metadata().next_sequence_number();
+        let schema = table.metadata().current_schema().clone();
         let spec = table.metadata().default_partition_spec().clone();
         let partition_type = spec.partition_type(&schema)?;
 
-        // Standalone base root (this action resets the chain to a base). NOTE:
-        // the durable path is commit_v4's collapse, which folds graduation
-        // atomically with the chain rewrite; this standalone action is retained
-        // for manual / maintenance-window use where no concurrent appends race it.
+        // Read HEAD root metadata only (no chain walk) — needed for
+        // chain_depth (delta-vs-flat decision). `read_root_manifest` reads
+        // just the one parquet file at `root_path`, not the whole chain.
+        let head_bytes = table.file_io().new_input(root_path)?.read().await?;
+        let (head_meta, _head_entries) = read_root_manifest(head_bytes)?;
+
+        // Delta vs flat-base root. On a `root-manifest.incremental` table,
+        // emit the swap as a small delta (`prev_root_path=Some(current)`,
+        // `chain_depth+=1`, empty entries slice) so `actions_ms` drops from
+        // the flat-root serialize + reconstruct-collapse cost to a few-KB
+        // metadata-only write. This is what stops the retry loop from losing
+        // every CAS race vs. laminar's hot-append cadence — the mirror of
+        // the compact_cold_tier fix in commits c7c8ffc + 6d64deb.
+        //
+        // At `chain_depth == MAX_CHAIN`, fall through to the flat-base
+        // branch — same collapse semantics commit_v4 uses at the cap. When
+        // the table lacks the incremental property (default off), the flat
+        // branch is preserved for parity with pre-delta behavior.
+        let incremental = table
+            .metadata()
+            .properties()
+            .get("root-manifest.incremental")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let do_delta = incremental && head_meta.chain_depth < MAX_CHAIN;
+
         let new_rm_metadata = RootManifestMetadata {
             schema: schema.clone(),
             schema_id: table.metadata().current_schema_id(),
             partition_spec: spec.clone(),
             format_version: FormatVersion::V4,
-            snapshot_id,
+            snapshot_id: prep.snapshot_id,
             sequence_number: next_seq_num,
             parent_snapshot_id: table.metadata().current_snapshot_id(),
-            bucket_index_path: Some(fold.bucket_index_path.clone()),
-            prev_root_path: None,
-            chain_depth: 0,
+            bucket_index_path: Some(prep.bucket_index_path.clone()),
+            prev_root_path: if do_delta {
+                Some(root_path.to_string())
+            } else {
+                None
+            },
+            chain_depth: if do_delta {
+                head_meta.chain_depth + 1
+            } else {
+                0
+            },
             node_level: 0,
-            removed_paths: rm_metadata.removed_paths.clone(),
+            // Delta: no new tombstones from this action (graduation only moves
+            // refs into the cold tier, doesn't remove data files). Ancestor
+            // tombstones live on prior roots and are unioned by
+            // reconstruct_root — do NOT copy them onto the delta.
+            //
+            // Flat-base fallback: carry forward the merged ancestor set from
+            // prep, same as pre-fix behavior. (Slight staleness under
+            // prep-reuse — ancestor tombstones added by concurrent writers
+            // between prep and this collapse won't be captured — but the
+            // fast-path only activates when bucket_index_path is unchanged,
+            // which under laminar-only writes matches the tombstone-add
+            // invariant too.)
+            removed_paths: if do_delta {
+                Vec::new()
+            } else {
+                prep.ancestor_removed_paths.clone()
+            },
         };
+        // Fresh root path per attempt (retries write their own delta root;
+        // failed attempts leave orphans reclaimed later by tombstone GC).
         let new_root_path = format!(
-            "{}/{}/root-{}-{}.parquet",
+            "{}/{}/root-{}-{}-{}.parquet",
             table.metadata().location(),
             META_ROOT_PATH,
-            snapshot_id,
-            commit_uuid,
+            prep.snapshot_id,
+            self.commit_uuid,
+            Uuid::now_v7(),
         );
-        let root_bytes = write_root_manifest(&kept, &new_rm_metadata, &partition_type)?;
+        let entries_to_write: &[RootManifestEntry] = if do_delta { &[] } else { &prep.kept };
+        let root_bytes = write_root_manifest(entries_to_write, &new_rm_metadata, &partition_type)?;
         table
             .file_io()
             .new_output(&new_root_path)?
@@ -1037,15 +1169,15 @@ impl TransactionAction for GraduateBucketsAction {
             additional_properties: HashMap::from([
                 (
                     "graduate-nodes-moved".to_string(),
-                    fold.nodes_moved.to_string(),
+                    prep.nodes_moved.to_string(),
                 ),
                 (
                     "graduate-inline-leaves".to_string(),
-                    fold.inline_leaves.to_string(),
+                    prep.inline_leaves.to_string(),
                 ),
                 (
                     "graduate-cold-leaves-total".to_string(),
-                    fold.cold_leaves_total.to_string(),
+                    prep.cold_leaves_total.to_string(),
                 ),
             ]),
         };
@@ -1054,7 +1186,7 @@ impl TransactionAction for GraduateBucketsAction {
         let first_row_id = table.metadata().next_row_id();
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(new_root_path.clone())
-            .with_snapshot_id(snapshot_id)
+            .with_snapshot_id(prep.snapshot_id)
             .with_parent_snapshot_id(table.metadata().current_snapshot_id())
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
@@ -1070,7 +1202,7 @@ impl TransactionAction for GraduateBucketsAction {
             TableUpdate::SetSnapshotRef {
                 ref_name: MAIN_BRANCH.to_string(),
                 reference: SnapshotReference::new(
-                    snapshot_id,
+                    prep.snapshot_id,
                     SnapshotRetention::branch(None, None, None),
                 ),
             },
@@ -1086,7 +1218,71 @@ impl TransactionAction for GraduateBucketsAction {
         ];
 
         Ok(ActionCommit::new(updates, requirements)
-            .with_manifest_paths(vec![new_root_path, fold.bucket_index_path]))
+            .with_manifest_paths(vec![new_root_path, prep.bucket_index_path.clone()]))
+    }
+}
+
+#[async_trait]
+impl TransactionAction for GraduateBucketsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        if table.effective_format_version() != FormatVersion::V4 {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "graduate_buckets requires format version V4 (effective={:?})",
+                    table.effective_format_version()
+                ),
+            ));
+        }
+        if table.metadata().current_snapshot().is_none() {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+
+        // Fast-path check: if we have a cached prep AND the table's HEAD
+        // still points at the same cold bucket-index (i.e., no other
+        // cold-tier writer landed between prep and this retry), we can skip
+        // phases 1-5 entirely and only re-emit the small delta root. That's
+        // what makes retries win the OCC race — the critical section drops
+        // from ~20 s (full prep) to ~500 ms (root write only).
+        //
+        // The check is a single S3 GET of the HEAD root parquet (no chain
+        // walk) — cheap even when it invalidates.
+        let mut guard = self.prepared.lock().await;
+
+        // Reusable only if the cold bucket-index pointer hasn't shifted
+        // AND we're still on the delta-writable side of the chain-depth cap
+        // — MAX_CHAIN triggers a flat-base rewrite that needs a fresh
+        // `kept` reconstruct; cached prep's `kept` is as-of-prep-time.
+        let can_reuse = if let Some(ref prep) = *guard {
+            let current_snapshot = table.metadata().current_snapshot().unwrap();
+            let head_bytes = table
+                .file_io()
+                .new_input(current_snapshot.manifest_list())?
+                .read()
+                .await?;
+            let (head_meta, _) = read_root_manifest(head_bytes)?;
+            head_meta.bucket_index_path == prep.prep_bucket_index_path
+                && head_meta.chain_depth < MAX_CHAIN
+        } else {
+            false
+        };
+
+        if can_reuse {
+            let prep = guard.as_ref().unwrap();
+            return self.finalize(table, prep).await;
+        }
+
+        // Slow path: full prep. Cache the result before finalizing so
+        // subsequent retries (of this action instance) take the fast path.
+        let prep = match self.prepare(table).await? {
+            Some(p) => p,
+            // Nothing to graduate this pass — emit an empty ActionCommit;
+            // don't cache (nothing to cache).
+            None => return Ok(ActionCommit::new(vec![], vec![])),
+        };
+        let ac = self.finalize(table, &prep).await?;
+        *guard = Some(prep);
+        Ok(ac)
     }
 }
 

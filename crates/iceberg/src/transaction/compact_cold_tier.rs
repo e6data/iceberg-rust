@@ -312,7 +312,32 @@ impl TransactionAction for CompactColdTierAction {
             Some(path)
         };
 
-        // New root = the live entries unchanged + the new bucket-index pointer.
+        // Delta vs flat-base root. On a `root-manifest.incremental` table, emit
+        // the swap as a small delta (`prev_root_path=Some(current)`,
+        // `chain_depth+=1`, empty entries slice) so `actions_ms` drops from the
+        // ~10-15s flat-root serialize + reconstruct-collapse cost to a few-KB
+        // metadata-only write. reconstruct_root walks the chain via
+        // prev_root_path and treats HEAD meta as authoritative for
+        // `bucket_index_path`, so the cold-pointer swap is picked up correctly.
+        // Removals are materialized (rewritten leaves don't contain them), so
+        // NO new tombstone is added; ancestor tombstones live on prior roots
+        // and are unioned by reconstruct_root — do NOT copy them onto the delta
+        // (that would duplicate and block eventual GC).
+        //
+        // At `chain_depth == MAX_CHAIN` (mirrors commit_v4's cap at
+        // snapshot.rs:1349), fall through to the flat-base branch — same
+        // collapse semantics commit_v4 uses on its 1-in-MAX_CHAIN commit. When
+        // the table lacks the incremental property (default off), the flat
+        // branch is preserved unchanged for parity with pre-delta behavior.
+        let incremental = table
+            .metadata()
+            .properties()
+            .get("root-manifest.incremental")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        const MAX_CHAIN: u32 = 64;
+        let do_delta = incremental && rm_metadata.chain_depth < MAX_CHAIN;
+
         let new_rm_metadata = RootManifestMetadata {
             schema: schema.clone(),
             schema_id: table.metadata().current_schema_id(),
@@ -322,10 +347,22 @@ impl TransactionAction for CompactColdTierAction {
             sequence_number: next_seq_num,
             parent_snapshot_id: table.metadata().current_snapshot_id(),
             bucket_index_path: new_bucket_index_path.clone(),
-            prev_root_path: None,
-            chain_depth: 0,
+            prev_root_path: if do_delta {
+                Some(root_path.to_string())
+            } else {
+                None
+            },
+            chain_depth: if do_delta {
+                rm_metadata.chain_depth + 1
+            } else {
+                0
+            },
             node_level: 0,
-            removed_paths: rm_metadata.removed_paths.clone(),
+            removed_paths: if do_delta {
+                Vec::new()
+            } else {
+                rm_metadata.removed_paths.clone()
+            },
         };
         let new_root_path = format!(
             "{}/{}/root-{}-{}.parquet",
@@ -334,7 +371,8 @@ impl TransactionAction for CompactColdTierAction {
             snapshot_id,
             commit_uuid,
         );
-        let root_bytes = write_root_manifest(&root_entries, &new_rm_metadata, &partition_type)?;
+        let entries_to_write: &[RootManifestEntry] = if do_delta { &[] } else { &root_entries };
+        let root_bytes = write_root_manifest(entries_to_write, &new_rm_metadata, &partition_type)?;
         table
             .file_io()
             .new_output(&new_root_path)?

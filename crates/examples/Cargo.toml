@@ -43,6 +43,13 @@ name = "oss-backend"
 path = "src/oss_backend.rs"
 required-features = ["storage-oss"]
 
+[[example]]
+name = "count-files-per-partition"
+path = "src/count_files_per_partition.rs"
+# Without this, `cargo test` compiles the example but never runs its
+# `#[cfg(test)]` module, so the arg-parsing tests would silently not execute.
+test = true
+
 [features]
 default = []
 storage-oss = ["iceberg/storage-oss"]

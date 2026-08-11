@@ -4390,4 +4390,70 @@ mod test_v4_commit {
             );
         }
     }
+
+    /// The sweep reads EVERY manifest in the tree, so below the threshold it
+    /// must not run at all — the tombstones are simply carried forward.
+    ///
+    /// Gating only on "non-empty" (the first cut) meant that once the backlog
+    /// was drained, any rebalance triggered for some other reason still paid a
+    /// full ~4.3k-manifest scan to retire ~180 paths, inside the CAS window and
+    /// repeated per attempt. Observed live before this gate landed.
+    #[tokio::test]
+    async fn rebalance_skips_the_sweep_below_the_threshold() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("tomb_rebal_gate".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let creation = TableCreation::builder()
+            .name("v4tombgate".to_string())
+            .schema(test_schema())
+            .format_version(FormatVersion::V4)
+            .properties(HashMap::from([
+                ("root-manifest.incremental".to_string(), "true".to_string()),
+                ("tiered-metadata.enabled".to_string(), "true".to_string()),
+                // One pending tombstone is far below this, so no sweep.
+                (
+                    "root-manifest.tombstone-sweep-min-paths".to_string(),
+                    "10000".to_string(),
+                ),
+            ]))
+            .build();
+        let mut table = catalog.create_table(&ns, creation).await.unwrap();
+
+        for f in ["g1", "g2", "g3"] {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://b/{f}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .replace_data_files()
+            .delete_files(vec![test_data_file("s3://b/g1.parquet")])
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .rebalance_root_manifest()
+            .with_partition_scoped(true)
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        let (meta, _) = read_head_root(&table).await;
+        assert!(
+            meta.removed_paths.contains(&"s3://b/g1.parquet".to_string()),
+            "below the threshold the tombstone is carried forward, not swept"
+        );
+        // Carrying it forward must still suppress the file.
+        assert!(
+            !visible_paths(&table).await.contains("s3://b/g1.parquet"),
+            "a carried tombstone must keep g1 invisible"
+        );
+    }
 }

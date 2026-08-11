@@ -869,10 +869,18 @@ impl TransactionAction for RebalanceRootManifestAction {
         // resets laminar's chain so it never reaches MAX_CHAIN and its collapse —
         // and therefore its sweep — never fires. Whoever writes the base sweeps.
         //
+        // Cost gate. A sweep reads EVERY manifest in the tree, so it is only
+        // worth doing against a real backlog — `needs_tombstone_sweep` above uses
+        // the same threshold to decide whether a backlog alone justifies a
+        // commit. Gating only on non-empty (the first cut) meant that once the
+        // backlog was drained, every rebalance triggered for some OTHER reason
+        // still paid a full ~4.3k-manifest scan to retire a handful of paths —
+        // seconds of S3 reads inside the CAS window, repeated per attempt.
+        //
         // Fail-open: a sweep error must not fail the rebalance. Worst case we
         // carry the tombstones forward exactly as before.
         let mut swept_removed = rm_metadata.removed_paths.clone();
-        if !swept_removed.is_empty() {
+        if swept_removed.len() >= sweep_min_paths {
             let max_manifests = table
                 .metadata()
                 .properties()

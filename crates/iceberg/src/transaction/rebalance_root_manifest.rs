@@ -501,8 +501,19 @@ impl TransactionAction for RebalanceRootManifestAction {
             || total_entries >= flush_entries;
         let needs_mdv_compact = self.needs_mdv_compaction(root_manifest.entries());
         let needs_recluster = self.needs_recluster(root_manifest.entries());
+        // A backlog of carried path tombstones is itself work worth a commit.
+        // Without this the sweep below could never run on a table where nothing
+        // else needs rebalancing, and the set would grow forever — which is how
+        // sri-olly reached 430k paths / ~108 MB of a 132 MB root.
+        let sweep_min_paths = table
+            .metadata()
+            .properties()
+            .get("root-manifest.tombstone-sweep-min-paths")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1000);
+        let needs_tombstone_sweep = rm_metadata.removed_paths.len() >= sweep_min_paths;
 
-        if !needs_flush && !needs_mdv_compact && !needs_recluster {
+        if !needs_flush && !needs_mdv_compact && !needs_recluster && !needs_tombstone_sweep {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 
@@ -843,6 +854,56 @@ impl TransactionAction for RebalanceRootManifestAction {
             .default_partition_spec()
             .partition_type(table.metadata().current_schema())?;
 
+        // Sweep the carried path tombstones before writing the root.
+        //
+        // This used to be `rm_metadata.removed_paths.clone()` — an unconditional
+        // carry-forward. Combined with `is_survivor` consulting only
+        // `e.is_alive()` and the MDV (never `removed_paths`), and with removals
+        // on an incremental table never becoming MDVs, nothing here ever retired
+        // a tombstone: the set grew monotonically to 430k paths / ~108 MB of a
+        // 132 MB root on sri-olly.
+        //
+        // The sweep also has to live HERE, not only in laminar's collapse. Once
+        // the root shrank enough for this action to start winning its CAS again,
+        // it began writing a fresh base (`chain_depth: 0`) every ~10 min, which
+        // resets laminar's chain so it never reaches MAX_CHAIN and its collapse —
+        // and therefore its sweep — never fires. Whoever writes the base sweeps.
+        //
+        // Fail-open: a sweep error must not fail the rebalance. Worst case we
+        // carry the tombstones forward exactly as before.
+        let mut swept_removed = rm_metadata.removed_paths.clone();
+        if !swept_removed.is_empty() {
+            let max_manifests = table
+                .metadata()
+                .properties()
+                .get("root-manifest.tombstone-materialize-max-manifests")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(8192);
+            let before = swept_removed.len();
+            match crate::transaction::snapshot::materialize_carried_tombstones(
+                table.file_io(),
+                &mut new_entries,
+                &mut swept_removed,
+                rm_metadata.bucket_index_path.as_deref(),
+                max_manifests,
+            )
+            .await
+            {
+                Ok((retired, scanned)) => log::info!(
+                    "rebalance: swept carried tombstones: before={} retired={} \
+                     remaining={} manifests_scanned={}",
+                    before,
+                    retired,
+                    swept_removed.len(),
+                    scanned
+                ),
+                Err(e) => {
+                    log::warn!("rebalance: tombstone sweep failed, carrying forward: {e:#}");
+                    swept_removed = rm_metadata.removed_paths.clone();
+                }
+            }
+        }
+
         let new_rm_metadata = RootManifestMetadata {
             schema: schema.clone(),
             schema_id: table.metadata().current_schema_id(),
@@ -857,7 +918,7 @@ impl TransactionAction for RebalanceRootManifestAction {
             prev_root_path: None,
             chain_depth: 0,
             node_level: 0,
-            removed_paths: rm_metadata.removed_paths.clone(),
+            removed_paths: swept_removed,
         };
 
         let new_root_manifest_path = format!(

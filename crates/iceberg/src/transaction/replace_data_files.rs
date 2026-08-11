@@ -38,7 +38,16 @@ static REWRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Action to replace data files in a table (overwrite operation).
 pub struct ReplaceDataFilesAction {
-    files_to_delete: Vec<DataFile>,
+    /// Arc-wrapped for cheap sharing across the commit path (see 2026-07-31
+    /// heap profile: `DataFile::clone` from `spawn_root_manifest_tasks` was
+    /// holding ~1.15 GB across in-flight commits; Vec::clone was deep-cloning
+    /// every DataFile including its 6 internal HashMaps). Arc lets us hand
+    /// the same underlying Vec to the SnapshotProducer's removed_data_files
+    /// slot (via `with_removed_data_files`) and to the ReplaceOperation's
+    /// filter cache without a Vec::clone. `with_removed_data_files` still
+    /// materialises owned Vec for now — Step B (Arc<Vec> through
+    /// SnapshotProducer) collapses that last clone in a follow-up.
+    files_to_delete: Arc<Vec<DataFile>>,
     files_to_add: Vec<DataFile>,
     delete_manifests: Vec<String>,
     commit_uuid: Option<Uuid>,
@@ -67,7 +76,7 @@ pub struct ReplaceDataFilesAction {
 impl ReplaceDataFilesAction {
     pub(crate) fn new() -> Self {
         Self {
-            files_to_delete: Vec::new(),
+            files_to_delete: Arc::new(Vec::new()),
             files_to_add: Vec::new(),
             delete_manifests: Vec::new(),
             commit_uuid: None,
@@ -85,7 +94,7 @@ impl ReplaceDataFilesAction {
 
     /// Set the data files to delete.
     pub fn delete_files(mut self, files: Vec<DataFile>) -> Self {
-        self.files_to_delete = files;
+        self.files_to_delete = Arc::new(files);
         self
     }
 
@@ -186,7 +195,12 @@ impl TransactionAction for ReplaceDataFilesAction {
             self.files_to_add.clone(),
             self.added_delete_files.clone(),
         )
-        .with_removed_data_files(self.files_to_delete.clone())
+        // Vec::clone here still deep-clones every DataFile. Step B
+        // (SnapshotProducer.with_removed_data_files accepts Arc<Vec>) will
+        // collapse this into an Arc::clone. Not shipped yet: the change
+        // touches ~15 sites in snapshot.rs across added/removed_data_files
+        // and added_delete_files and can't be safely rushed.
+        .with_removed_data_files((*self.files_to_delete).clone())
         .with_data_sequence_number(self.data_sequence_number);
 
         if let Some(id) = self.snapshot_id_override {
@@ -210,7 +224,10 @@ impl TransactionAction for ReplaceDataFilesAction {
                 .iter()
                 .map(|f| f.file_path.clone())
                 .collect(),
-            data_files_to_delete: self.files_to_delete.clone(),
+            // Arc::clone — no deep DataFile copy. Was the largest per-commit
+            // deep clone in the 2026-07-31 heap profile (DataFile::clone
+            // dominant self-bytes allocator via spawn_root_manifest_tasks).
+            data_files_to_delete: Arc::clone(&self.files_to_delete),
             commit_uuid: self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             key_metadata: self.key_metadata.clone(),
             cached_manifests: Arc::clone(&self.cached_manifests),
@@ -306,8 +323,10 @@ fn manifest_could_contain_target_files(
 
 struct ReplaceOperation {
     files_to_delete: HashSet<String>,
-    /// Full DataFile objects for computing partition-level filters.
-    data_files_to_delete: Vec<DataFile>,
+    /// Full DataFile objects for computing partition-level filters. Arc so
+    /// this is a cheap handle-share from `ReplaceDataFilesAction` — see the
+    /// heap-profile note on that field.
+    data_files_to_delete: Arc<Vec<DataFile>>,
     commit_uuid: Uuid,
     key_metadata: Option<Vec<u8>>,
     /// Shared cache for manifest computation results, tagged with the
@@ -441,7 +460,7 @@ impl SnapshotProduceOperation for ReplaceOperation {
                     metadata
                         .partition_spec_by_id(spec_id)
                         .and_then(|spec| spec.partition_type(schema).ok())
-                        .map(|pt| build_target_partition_bytes(&self.data_files_to_delete, &pt))
+                        .map(|pt| build_target_partition_bytes(self.data_files_to_delete.as_slice(), &pt))
                         .unwrap_or_default()
                 });
 

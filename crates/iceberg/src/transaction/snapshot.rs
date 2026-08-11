@@ -2268,11 +2268,22 @@ const DEFAULT_TOMBSTONE_SWEEP_MIN_PATHS: usize = 1_000;
 /// ~108 MB of the 132 MB root, which is what made every root write (and hence
 /// every lifecycle op) take ~18 s and lose its CAS.
 ///
-/// **What it does.** On a collapse — where the full live set is materialized and
-/// laminar is the single writer, so there is no CAS race to lose — scan a
-/// bounded window of manifest refs and, for each tombstoned path found inside,
-/// mark that row in the manifest's MDV instead. A ~250-byte path string becomes
-/// one bit. The path is then retired from the carried tombstone set.
+/// **What it does.** Given a materialized live set, read EVERY manifest in the
+/// tree — hot-root refs plus cold-tier bucket-index leaves — and either convert
+/// each tombstoned path into a delete bit on the manifest that lists it, or, if
+/// it is listed nowhere, drop it outright. A ~250-byte path string becomes one
+/// bit, or nothing at all.
+///
+/// **Callers.** Two, because neither alone is sufficient:
+/// - laminar's chain collapse (`SnapshotProducer`), and
+/// - tessellate's Phase 2 rebalance (`rebalance_root_manifest`).
+///
+/// Collapse was the original home: it materializes the live set anyway and rides
+/// on the primary writer's commit, so it never has to win a CAS. But once the
+/// root shrank enough for rebalance to start committing again, rebalance began
+/// writing a fresh base (`chain_depth: 0`) every ~10 min, which resets the chain
+/// so laminar never reaches `MAX_CHAIN` and the collapse never fires. Whichever
+/// of the two actually writes the base must therefore be able to sweep.
 ///
 /// **Why this is read-equivalent.** The V4 read path passes BOTH `mdv_bitmaps`
 /// and `removed_paths` to the scan (see `Snapshot::load_manifest_list`), and
@@ -2282,15 +2293,16 @@ const DEFAULT_TOMBSTONE_SWEEP_MIN_PATHS: usize = 1_000;
 /// a manifest rewritten underneath a stale bitmap errors instead of silently
 /// dropping the wrong rows.
 ///
-/// **Why retirement cannot resurrect a file.** A path is retired ONLY when this
-/// call observed it inside a manifest it scanned AND recorded a delete bit for
-/// it there. Tombstones whose manifest fell outside the window are left in
-/// `carried_removed` untouched, so they keep suppressing their file exactly as
-/// before. Coverage is achieved over successive collapses via `rotation`, not by
-/// widening any single commit.
+/// **Why retirement cannot resurrect a file.** Dropping an unmatched tombstone is
+/// only sound if we looked EVERYWHERE, so the sweep is all-or-nothing: past
+/// `max_manifests` it declines entirely, and any manifest load failure aborts it
+/// via `?` rather than retiring on partial knowledge. Cold leaves cannot carry an
+/// MDV (they live inside the bucket index, not the root), so a cold match vetoes
+/// retirement in both directions — the path tombstone is the only thing
+/// suppressing that file there.
 ///
 /// Returns `(paths_retired, manifests_scanned)` for the commit summary.
-async fn materialize_carried_tombstones(
+pub(crate) async fn materialize_carried_tombstones(
     file_io: &crate::io::FileIO,
     entries: &mut [RootManifestEntry],
     carried_removed: &mut Vec<String>,
@@ -4291,6 +4303,91 @@ mod test_v4_commit {
         }
         for i in 0..66 {
             assert!(visible.contains(&format!("s3://b/x{i}.parquet")));
+        }
+    }
+
+    /// Phase 2 rebalance must sweep too, not just laminar's collapse.
+    ///
+    /// This is the case the collapse cannot cover. Rebalance writes a BASE root
+    /// (`chain_depth: 0`), so once it starts committing regularly it resets the
+    /// chain and laminar never reaches MAX_CHAIN — its collapse, and with it its
+    /// sweep, stops firing entirely. Observed live on sri-olly: as soon as the
+    /// root shrank enough for rebalance to win its CAS again, laminar went 95
+    /// minutes and ~250 commits without a single collapse.
+    ///
+    /// Rebalance previously did `removed_paths: rm_metadata.removed_paths.clone()`
+    /// — an unconditional carry-forward that retired nothing, ever.
+    #[tokio::test]
+    async fn rebalance_sweeps_carried_tombstones_instead_of_cloning_them() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("tomb_rebal".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let creation = TableCreation::builder()
+            .name("v4tombrebal".to_string())
+            .schema(test_schema())
+            .format_version(FormatVersion::V4)
+            .properties(HashMap::from([
+                ("root-manifest.incremental".to_string(), "true".to_string()),
+                ("tiered-metadata.enabled".to_string(), "true".to_string()),
+                // A single pending tombstone is enough to make the sweep worth a
+                // commit here; production defaults this to 1000.
+                (
+                    "root-manifest.tombstone-sweep-min-paths".to_string(),
+                    "1".to_string(),
+                ),
+            ]))
+            .build();
+        let mut table = catalog.create_table(&ns, creation).await.unwrap();
+
+        for f in ["g1", "g2", "g3"] {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://b/{f}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+
+        // g1 is ref-resident, so its removal becomes a path tombstone.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .replace_data_files()
+            .delete_files(vec![test_data_file("s3://b/g1.parquet")])
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        let (meta, _) = read_head_root(&table).await;
+        assert!(
+            meta.removed_paths.contains(&"s3://b/g1.parquet".to_string()),
+            "precondition: g1 is carried as a path tombstone"
+        );
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .rebalance_root_manifest()
+            .with_partition_scoped(true)
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        let (meta, _) = read_head_root(&table).await;
+        assert!(
+            !meta.removed_paths.contains(&"s3://b/g1.parquet".to_string()),
+            "rebalance must retire the tombstone, not clone it forward"
+        );
+        let visible = visible_paths(&table).await;
+        assert!(
+            !visible.contains("s3://b/g1.parquet"),
+            "and retiring it must not resurrect g1"
+        );
+        for f in ["g2", "g3"] {
+            assert!(
+                visible.contains(&format!("s3://b/{f}.parquet")),
+                "{f} was never removed and must survive the rebalance"
+            );
         }
     }
 }

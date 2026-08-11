@@ -1389,6 +1389,50 @@ impl<'a> SnapshotProducer<'a> {
             }
         }
 
+        // Retire carried path tombstones into per-manifest delete vectors. Only
+        // on a collapse: the live set is materialized here, and a collapse is
+        // driven by the primary writer's own commit, so unlike a standalone
+        // lifecycle op it never has to win a CAS against the append stream.
+        // Without this, `removed_paths` on a TIERED incremental table grows
+        // without bound (nothing ever matches inline), and the root manifest
+        // becomes mostly dead path strings. See
+        // `materialize_carried_tombstones` for the read-equivalence and
+        // no-resurrection arguments.
+        if !do_delta && incremental && !carried_removed.is_empty() {
+            let max_manifests = self
+                .table
+                .metadata()
+                .properties()
+                .get("root-manifest.tombstone-materialize-max-manifests")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_TOMBSTONE_MATERIALIZE_MAX_MANIFESTS);
+            let before = carried_removed.len();
+            let (retired, scanned) = materialize_carried_tombstones(
+                self.table.file_io(),
+                &mut entries,
+                &mut carried_removed,
+                max_manifests,
+                next_seq_num as u64,
+            )
+            .await?;
+            if retired > 0 {
+                summary
+                    .additional_properties
+                    .insert("tombstones-materialized".to_string(), retired.to_string());
+                summary.additional_properties.insert(
+                    "tombstones-remaining".to_string(),
+                    carried_removed.len().to_string(),
+                );
+            }
+            log::info!(
+                "v4 collapse: materialized carried tombstones into MDVs: before={} retired={} remaining={} manifests_scanned={}",
+                before,
+                retired,
+                carried_removed.len(),
+                scanned
+            );
+        }
+
         // Handle file removals (compaction / overwrite operations).
         let removed_data_files = std::mem::take(&mut self.removed_data_files);
         let paths_to_remove: HashSet<String> = removed_data_files
@@ -2143,6 +2187,153 @@ impl<'a> SnapshotProducer<'a> {
             .with_manifest_paths(vec![root_manifest_path])
             .with_root_manifest_entries(Some(self.snapshot_id), entries))
     }
+}
+
+/// Default number of manifest refs a single collapse will scan when
+/// materializing carried tombstones. Each scan is one manifest read; the
+/// window is bounded so a collapse stays a bounded-latency commit.
+const DEFAULT_TOMBSTONE_MATERIALIZE_MAX_MANIFESTS: usize = 256;
+/// Concurrency for those manifest reads (S3-bound, not CPU-bound).
+const TOMBSTONE_MATERIALIZE_CONCURRENCY: usize = 16;
+
+/// Convert ref-resident path tombstones into per-manifest delete vectors.
+///
+/// **Why this exists.** On an incremental (log-structured) root, a removal that
+/// does not match an INLINE entry is recorded as a path string in
+/// `removed_paths` — that keeps the hot delta commit O(1), because it avoids
+/// loading any manifest. `finalize_reconstruct` retires such a tombstone only
+/// when it matches an inline entry. On a **tiered** table the reconstructed live
+/// set is almost entirely `ManifestRef`s, so essentially no tombstone ever
+/// matched inline and the set grew without bound — on sri-olly to 430k paths,
+/// ~108 MB of the 132 MB root, which is what made every root write (and hence
+/// every lifecycle op) take ~18 s and lose its CAS.
+///
+/// **What it does.** On a collapse — where the full live set is materialized and
+/// laminar is the single writer, so there is no CAS race to lose — scan a
+/// bounded window of manifest refs and, for each tombstoned path found inside,
+/// mark that row in the manifest's MDV instead. A ~250-byte path string becomes
+/// one bit. The path is then retired from the carried tombstone set.
+///
+/// **Why this is read-equivalent.** The V4 read path passes BOTH `mdv_bitmaps`
+/// and `removed_paths` to the scan (see `Snapshot::load_manifest_list`), and
+/// `scan::context` applies both. A file skipped via a path tombstone and a file
+/// skipped via an MDV bit are indistinguishable to a reader. The MDV also
+/// carries a guard (entry count + path checksum) that a later scan validates, so
+/// a manifest rewritten underneath a stale bitmap errors instead of silently
+/// dropping the wrong rows.
+///
+/// **Why retirement cannot resurrect a file.** A path is retired ONLY when this
+/// call observed it inside a manifest it scanned AND recorded a delete bit for
+/// it there. Tombstones whose manifest fell outside the window are left in
+/// `carried_removed` untouched, so they keep suppressing their file exactly as
+/// before. Coverage is achieved over successive collapses via `rotation`, not by
+/// widening any single commit.
+///
+/// Returns `(paths_retired, manifests_scanned)` for the commit summary.
+async fn materialize_carried_tombstones(
+    file_io: &crate::io::FileIO,
+    entries: &mut [RootManifestEntry],
+    carried_removed: &mut Vec<String>,
+    max_manifests: usize,
+    rotation: u64,
+) -> Result<(usize, usize)> {
+    use futures::StreamExt;
+
+    use crate::spec::root_manifest::ManifestDeleteVector;
+
+    if carried_removed.is_empty() || max_manifests == 0 {
+        return Ok((0, 0));
+    }
+    let tombstones: HashSet<&str> = carried_removed.iter().map(|s| s.as_str()).collect();
+
+    // Positions of the manifest refs, in root order.
+    let ref_positions: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            RootManifestEntry::ManifestRef { .. } => Some(i),
+            RootManifestEntry::Inline(_) => None,
+        })
+        .collect();
+    if ref_positions.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Rotating window: successive collapses start at a different offset so the
+    // whole ref set is covered over time without persisting a cursor. Wrapping
+    // (rather than clamping) keeps every ref reachable when the set is larger
+    // than one window.
+    let total = ref_positions.len();
+    let take = max_manifests.min(total);
+    let start = (rotation as usize) % total;
+    let window: Vec<usize> = (0..take).map(|k| ref_positions[(start + k) % total]).collect();
+
+    // Load the window concurrently — these are S3 reads. `&*entries` is only
+    // borrowed immutably here; the mutable application happens after the loads
+    // have all completed.
+    let to_load: Vec<(usize, ManifestFile)> = window
+        .iter()
+        .filter_map(|&pos| match &entries[pos] {
+            RootManifestEntry::ManifestRef { manifest_file, .. } => {
+                Some((pos, manifest_file.clone()))
+            }
+            RootManifestEntry::Inline(_) => None,
+        })
+        .collect();
+
+    let loaded: Vec<Result<(usize, crate::spec::Manifest)>> = futures::stream::iter(
+        to_load.into_iter().map(|(pos, mf)| async move {
+            let m = mf.load_manifest(file_io).await?;
+            Ok((pos, m))
+        }),
+    )
+    .buffer_unordered(TOMBSTONE_MATERIALIZE_CONCURRENCY)
+    .collect()
+    .await;
+
+    let mut retired: HashSet<String> = HashSet::new();
+    let mut scanned = 0usize;
+    for res in loaded {
+        let (pos, manifest) = res?;
+        scanned += 1;
+
+        let mut matched: Vec<(u32, String)> = Vec::new();
+        for (idx, me) in manifest.entries().iter().enumerate() {
+            let path = me.data_file.file_path.as_str();
+            if tombstones.contains(path) {
+                matched.push((idx as u32, path.to_string()));
+            }
+        }
+        if matched.is_empty() {
+            continue;
+        }
+
+        let RootManifestEntry::ManifestRef { mdv, .. } = &mut entries[pos] else {
+            continue;
+        };
+        let mut new_mdv = match mdv.as_ref() {
+            Some(existing) => ManifestDeleteVector::deserialize(existing)?,
+            None => ManifestDeleteVector::new(),
+        };
+        for (idx, path) in matched {
+            new_mdv.mark_deleted(idx);
+            retired.insert(path);
+        }
+        // Same guard the non-incremental MDV path sets: bind the positional
+        // bitmap to the manifest snapshot it was computed against.
+        new_mdv.set_guard(
+            manifest.entries().len() as u32,
+            ManifestDeleteVector::compute_checksum(
+                manifest.entries().iter().map(|e| e.data_file.file_path.as_str()),
+            ),
+        );
+        *mdv = Some(new_mdv.serialize()?);
+    }
+
+    if !retired.is_empty() {
+        carried_removed.retain(|p| !retired.contains(p));
+    }
+    Ok((retired.len(), scanned))
 }
 
 #[cfg(test)]
@@ -3716,6 +3907,241 @@ mod test_v4_commit {
             ]),
             "the MDV scan must soft-delete exactly the removed ref-resident file \
              and leave its siblings intact"
+        );
+    }
+
+    // ---- Carried-tombstone materialization -------------------------------
+    //
+    // These drive `materialize_carried_tombstones` directly rather than through
+    // a full collapse. An e2e attempt is not usable here: on a table this small
+    // the inline flush consolidates every ref into a single manifest and
+    // materializes the tombstone itself, so the collapse never sees one — which
+    // is exactly the condition that does NOT hold at sri-olly scale (3,889
+    // manifests, 430k surviving tombstones). Driving the helper directly tests
+    // the real code under the real condition.
+    //
+    // End-to-end read equivalence — that an MDV bit suppresses a ref-resident
+    // file just as a path tombstone does — is already covered by
+    // `test_replace_data_files_mdv_removes_ref_resident_file` above.
+
+    /// Build a tiered+incremental table holding `n` files, each flushed into its
+    /// own child manifest, and return the reconstructed root entries.
+    async fn refs_fixture(
+        ns_name: &str,
+        table_name: &str,
+        n: usize,
+    ) -> (
+        crate::table::Table,
+        Vec<crate::spec::root_manifest::RootManifestEntry>,
+    ) {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new(ns_name.into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let creation = TableCreation::builder()
+            .name(table_name.to_string())
+            .schema(test_schema())
+            .format_version(FormatVersion::V4)
+            .properties(HashMap::from([
+                ("root-manifest.incremental".to_string(), "true".to_string()),
+                ("tiered-metadata.enabled".to_string(), "true".to_string()),
+            ]))
+            .build();
+        let mut table = catalog.create_table(&ns, creation).await.unwrap();
+
+        for i in 0..n {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://b/r{i}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+
+        let head = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .manifest_list()
+            .to_string();
+        let (_, entries) = crate::spec::root_manifest::reconstruct_root(table.file_io(), &head)
+            .await
+            .unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                crate::spec::root_manifest::RootManifestEntry::ManifestRef { .. }
+            )),
+            "fixture must produce at least one manifest ref"
+        );
+        (table, entries)
+    }
+
+    fn mdv_count(entries: &[crate::spec::root_manifest::RootManifestEntry]) -> usize {
+        entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::spec::root_manifest::RootManifestEntry::ManifestRef { mdv, .. }
+                        if mdv.is_some()
+                )
+            })
+            .count()
+    }
+
+    /// The core claim: a tombstone whose file lives inside a manifest ref is
+    /// converted into an MDV bit on that manifest and retired from the carried
+    /// set. This is what stops `removed_paths` growing without bound on a tiered
+    /// incremental table (sri-olly: 430k paths, ~108 MB of a 132 MB root).
+    #[tokio::test]
+    async fn materialize_carried_tombstones_retires_and_sets_mdv() {
+        let (table, mut entries) = refs_fixture("tomb_mat", "v4tombmat", 3).await;
+        let mut carried = vec!["s3://b/r1.parquet".to_string()];
+
+        let (retired, scanned) = super::materialize_carried_tombstones(
+            table.file_io(),
+            &mut entries,
+            &mut carried,
+            256,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(retired, 1, "the tombstoned file was found and materialized");
+        assert!(scanned >= 1, "at least the manifest holding it was scanned");
+        assert!(
+            carried.is_empty(),
+            "a materialized path must be retired from the carried set"
+        );
+        assert_eq!(
+            mdv_count(&entries),
+            1,
+            "exactly the ref holding the file gains a delete vector"
+        );
+    }
+
+    /// A tombstone that matches nothing in the scanned manifests must be kept.
+    /// Retirement is driven by what was OBSERVED, never by assumption — this is
+    /// the property that makes it impossible to resurrect a file.
+    #[tokio::test]
+    async fn materialize_carried_tombstones_keeps_unmatched_paths() {
+        let (table, mut entries) = refs_fixture("tomb_unmatched", "v4tombunm", 3).await;
+        let mut carried = vec!["s3://b/not-in-any-manifest.parquet".to_string()];
+
+        let (retired, _) = super::materialize_carried_tombstones(
+            table.file_io(),
+            &mut entries,
+            &mut carried,
+            256,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(retired, 0, "nothing matched, so nothing may be retired");
+        assert_eq!(
+            carried,
+            vec!["s3://b/not-in-any-manifest.parquet".to_string()],
+            "an unmatched tombstone must be carried forward untouched"
+        );
+        assert_eq!(mdv_count(&entries), 0, "no delete vector is written");
+    }
+
+    /// A zero budget must be a strict no-op: no manifest read, no retirement.
+    /// This is the knob an operator can reach for if materialization ever needs
+    /// to be switched off in the field.
+    #[tokio::test]
+    async fn materialize_carried_tombstones_zero_budget_is_a_noop() {
+        let (table, mut entries) = refs_fixture("tomb_zero", "v4tombzero", 3).await;
+        let mut carried = vec!["s3://b/r1.parquet".to_string()];
+
+        let (retired, scanned) = super::materialize_carried_tombstones(
+            table.file_io(),
+            &mut entries,
+            &mut carried,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((retired, scanned), (0, 0), "zero budget scans nothing");
+        assert_eq!(carried.len(), 1, "the tombstone is left in place");
+        assert_eq!(mdv_count(&entries), 0);
+    }
+
+    /// Partial progress must be safe and bounded. With three tombstones spread
+    /// across three manifests and a budget of one, at most one may be retired —
+    /// the rest stay tombstoned and keep suppressing their files. Full coverage
+    /// is a convergence property across collapses, not a precondition for the
+    /// correctness of any single one.
+    #[tokio::test]
+    async fn materialize_carried_tombstones_respects_the_budget() {
+        let (table, mut entries) = refs_fixture("tomb_partial", "v4tombpart", 5).await;
+        let mut carried = vec![
+            "s3://b/r0.parquet".to_string(),
+            "s3://b/r1.parquet".to_string(),
+            "s3://b/r2.parquet".to_string(),
+        ];
+
+        let (retired, scanned) = super::materialize_carried_tombstones(
+            table.file_io(),
+            &mut entries,
+            &mut carried,
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scanned, 1, "the budget caps manifest reads at one");
+        assert!(
+            retired <= 1,
+            "at most one tombstone can be retired; got {retired}"
+        );
+        assert_eq!(
+            carried.len(),
+            3 - retired,
+            "every tombstone not materialized this round must be carried forward"
+        );
+    }
+
+    /// The rotation offset must move the window, so successive collapses reach
+    /// different manifests and the backlog drains instead of rescanning the same
+    /// prefix forever.
+    #[tokio::test]
+    async fn materialize_carried_tombstones_rotates_the_window() {
+        let (table, base_entries) = refs_fixture("tomb_rotate", "v4tombrot", 4).await;
+
+        // Same single-manifest budget, different rotations: collect which file
+        // each round manages to retire.
+        let mut seen: HashSet<String> = HashSet::new();
+        for rotation in 0..4u64 {
+            let mut entries = base_entries.clone();
+            let mut carried = (0..4)
+                .map(|i| format!("s3://b/r{i}.parquet"))
+                .collect::<Vec<_>>();
+            let before: HashSet<String> = carried.iter().cloned().collect();
+            super::materialize_carried_tombstones(
+                table.file_io(),
+                &mut entries,
+                &mut carried,
+                1,
+                rotation,
+            )
+            .await
+            .unwrap();
+            let after: HashSet<String> = carried.into_iter().collect();
+            seen.extend(before.difference(&after).cloned());
+        }
+
+        assert!(
+            seen.len() > 1,
+            "rotating the start offset must reach more than one manifest across \
+             rounds, otherwise the backlog can never drain; reached {seen:?}"
         );
     }
 }

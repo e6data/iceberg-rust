@@ -823,7 +823,11 @@ impl<'a> SnapshotProducer<'a> {
         //
         // This eliminates the need for external manifest rewriting (Tessellate)
         // and keeps the manifest count bounded regardless of commit frequency.
-        let manifest_files = self.merge_manifests_if_needed(manifest_files).await?;
+        // Flat (non-V4-root) path: delete vectors live on V4 root refs, so there
+        // are none to apply here.
+        let manifest_files = self
+            .merge_manifests_if_needed(manifest_files, &HashMap::new())
+            .await?;
 
         Ok(manifest_files)
     }
@@ -840,9 +844,16 @@ impl<'a> SnapshotProducer<'a> {
     ///
     /// Cost: O(small_manifests) S3 reads + O(bins) S3 writes per merge cycle.
     /// Amortized per commit: ~9ms (merge triggers every ~8 commits).
+    /// `mdvs` maps manifest path → delete vector for refs that carry one. Rows
+    /// marked deleted are dropped as the bin is rewritten, so the merged output
+    /// needs no bitmap and the caller attaches none to it. This is what keeps an
+    /// MDV-stamped ref mergeable: without it, stamping a ref would exclude it
+    /// from ref-count merging permanently (the bitmap indexes row positions in
+    /// the original manifest, so merging blind would misalign it).
     async fn merge_manifests_if_needed(
         &mut self,
         manifests: Vec<ManifestFile>,
+        mdvs: &HashMap<String, Vec<u8>>,
     ) -> Result<Vec<ManifestFile>> {
         let merge_enabled = self
             .table
@@ -995,7 +1006,29 @@ impl<'a> SnapshotProducer<'a> {
             };
             let mut all_entries: Vec<ManifestEntry> = Vec::new();
             for (mf, manifest) in loaded {
-                for entry_ref in manifest.entries() {
+                // Apply this manifest's delete vector as we rewrite it: tombstoned
+                // rows are simply not carried into the merged output, which turns
+                // the bitmap into a physical removal and frees the ref to merge.
+                // Guard-check first, exactly as the scan does — a manifest
+                // rewritten under a stale MDV must error, not drop wrong rows.
+                let dv = match mdvs.get(&mf.manifest_path) {
+                    Some(bytes) => {
+                        use crate::spec::root_manifest::ManifestDeleteVector;
+                        let dv = ManifestDeleteVector::deserialize(bytes)?;
+                        dv.validate_against(
+                            manifest.entries().len() as u32,
+                            ManifestDeleteVector::compute_checksum(
+                                manifest.entries().iter().map(|e| e.data_file.file_path.as_str()),
+                            ),
+                        )?;
+                        Some(dv)
+                    }
+                    None => None,
+                };
+                for (idx, entry_ref) in manifest.entries().iter().enumerate() {
+                    if dv.as_ref().is_some_and(|d| d.is_deleted(idx as u32)) {
+                        continue;
+                    }
                     let mut entry = entry_ref.as_ref().clone();
                     // Change status: Added → Existing (entries are no longer new
                     // after being merged into a consolidated manifest)
@@ -1398,7 +1431,14 @@ impl<'a> SnapshotProducer<'a> {
         // becomes mostly dead path strings. See
         // `materialize_carried_tombstones` for the read-equivalence and
         // no-resurrection arguments.
-        if !do_delta && incremental && !carried_removed.is_empty() {
+        let sweep_min_paths = self
+            .table
+            .metadata()
+            .properties()
+            .get("root-manifest.tombstone-sweep-min-paths")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_TOMBSTONE_SWEEP_MIN_PATHS);
+        if !do_delta && incremental && carried_removed.len() >= sweep_min_paths {
             let max_manifests = self
                 .table
                 .metadata()
@@ -1411,8 +1451,8 @@ impl<'a> SnapshotProducer<'a> {
                 self.table.file_io(),
                 &mut entries,
                 &mut carried_removed,
+                carried_bucket_index_path.as_deref(),
                 max_manifests,
-                next_seq_num as u64,
             )
             .await?;
             if retired > 0 {
@@ -2038,32 +2078,44 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         // Merge small manifest refs to keep ref count bounded.
-        // Only merge refs without MDVs — MDV bitmaps reference row indices
-        // in the original manifest, so merging would invalidate them.
+        // Refs WITH an MDV are included: `merge_manifests_if_needed` applies the
+        // bitmap while rewriting the bin, so tombstoned rows are dropped
+        // physically and the merged output carries no MDV. Excluding them (the
+        // prior behaviour) made every ref the tombstone sweep stamps permanently
+        // unmergeable, so ref count grew without bound.
         // Skipped on a delta write: a delta holds only this commit's new ref(s);
         // merging carried refs is a base/collapse concern.
         if !do_delta {
+            let mut mdv_by_path: HashMap<String, Vec<u8>> = HashMap::new();
             let mergeable_refs: Vec<ManifestFile> = entries
                 .iter()
                 .filter_map(|e| match e {
-                    RootManifestEntry::ManifestRef { manifest_file, mdv } if mdv.is_none() => {
+                    RootManifestEntry::ManifestRef { manifest_file, mdv } => {
+                        if let Some(bytes) = mdv {
+                            mdv_by_path
+                                .insert(manifest_file.manifest_path.clone(), bytes.clone());
+                        }
                         Some(manifest_file.clone())
                     }
                     _ => None,
                 })
                 .collect();
 
-            let merged = self.merge_manifests_if_needed(mergeable_refs).await?;
+            let merged = self
+                .merge_manifests_if_needed(mergeable_refs, &mdv_by_path)
+                .await?;
 
-            // Replace mergeable refs with merged result
-            entries.retain(|e| match e {
-                RootManifestEntry::ManifestRef { mdv, .. } => mdv.is_some(),
-                RootManifestEntry::Inline(_) => true,
-            });
+            // Replace ALL refs with the merge result. A manifest the merger kept
+            // as-is comes back under its original path, so it reclaims its MDV
+            // from the map; a newly written merged manifest has a fresh UUID
+            // path, is absent from the map, and correctly gets `None` — its
+            // deletions are already materialized into its rows.
+            entries.retain(|e| matches!(e, RootManifestEntry::Inline(_)));
             for mf in merged {
+                let mdv = mdv_by_path.get(&mf.manifest_path).cloned();
                 entries.push(RootManifestEntry::ManifestRef {
                     manifest_file: mf,
-                    mdv: None,
+                    mdv,
                 });
             }
         }
@@ -2189,12 +2241,20 @@ impl<'a> SnapshotProducer<'a> {
     }
 }
 
-/// Default number of manifest refs a single collapse will scan when
-/// materializing carried tombstones. Each scan is one manifest read; the
-/// window is bounded so a collapse stays a bounded-latency commit.
-const DEFAULT_TOMBSTONE_MATERIALIZE_MAX_MANIFESTS: usize = 256;
-/// Concurrency for those manifest reads (S3-bound, not CPU-bound).
-const TOMBSTONE_MATERIALIZE_CONCURRENCY: usize = 16;
+/// Ceiling on how many manifests a tombstone sweep will read in one collapse.
+/// The sweep is all-or-nothing (see `materialize_carried_tombstones`), so this
+/// is not a window — it is the point past which we decline to sweep at all
+/// rather than reason from partial knowledge. sri-olly's `logs` sits at ~4.9k
+/// manifests, so 8192 leaves headroom while still refusing an unbounded read.
+const DEFAULT_TOMBSTONE_MATERIALIZE_MAX_MANIFESTS: usize = 8192;
+/// Concurrency for those manifest reads (S3-bound, not CPU-bound). Matches the
+/// manifest-merge loader.
+const TOMBSTONE_MATERIALIZE_CONCURRENCY: usize = 32;
+/// Only sweep when the carried set is at least this large. A sweep reads every
+/// manifest in the tree, so it is worth doing to drain a backlog but not on
+/// every collapse; below this the set is small enough that its contribution to
+/// root size is negligible.
+const DEFAULT_TOMBSTONE_SWEEP_MIN_PATHS: usize = 1_000;
 
 /// Convert ref-resident path tombstones into per-manifest delete vectors.
 ///
@@ -2234,8 +2294,8 @@ async fn materialize_carried_tombstones(
     file_io: &crate::io::FileIO,
     entries: &mut [RootManifestEntry],
     carried_removed: &mut Vec<String>,
+    bucket_index_path: Option<&str>,
     max_manifests: usize,
-    rotation: u64,
 ) -> Result<(usize, usize)> {
     use futures::StreamExt;
 
@@ -2255,23 +2315,33 @@ async fn materialize_carried_tombstones(
             RootManifestEntry::Inline(_) => None,
         })
         .collect();
-    if ref_positions.is_empty() {
+
+    // Cold-tier leaves, if this table has a bucket index. These are read-only
+    // here: a leaf lives inside the bucket index, not in the root, so it cannot
+    // carry an MDV without rewriting the index. We load them purely to learn
+    // which paths are still reachable — a tombstone matching a cold entry MUST
+    // be kept.
+    let cold_leaves: Vec<ManifestFile> = match bucket_index_path {
+        Some(bp) => {
+            let bytes = file_io.new_input(bp)?.read().await?;
+            crate::spec::bucket_index::read_bucket_index(bytes)?
+                .leaves()
+                .to_vec()
+        }
+        None => Vec::new(),
+    };
+
+    // Refuse a partial sweep. Retiring an unmatched tombstone is only sound if
+    // we looked EVERYWHERE — miss one manifest and we could drop the tombstone
+    // guarding a file that manifest still lists, resurrecting it. If the tree is
+    // larger than we are willing to read in one commit, do nothing at all.
+    let total_manifests = ref_positions.len() + cold_leaves.len();
+    if total_manifests == 0 || total_manifests > max_manifests {
         return Ok((0, 0));
     }
 
-    // Rotating window: successive collapses start at a different offset so the
-    // whole ref set is covered over time without persisting a cursor. Wrapping
-    // (rather than clamping) keeps every ref reachable when the set is larger
-    // than one window.
-    let total = ref_positions.len();
-    let take = max_manifests.min(total);
-    let start = (rotation as usize) % total;
-    let window: Vec<usize> = (0..take).map(|k| ref_positions[(start + k) % total]).collect();
-
-    // Load the window concurrently — these are S3 reads. `&*entries` is only
-    // borrowed immutably here; the mutable application happens after the loads
-    // have all completed.
-    let to_load: Vec<(usize, ManifestFile)> = window
+    // --- Hot root: materialize matches into MDVs, and record what is present.
+    let to_load: Vec<(usize, ManifestFile)> = ref_positions
         .iter()
         .filter_map(|&pos| match &entries[pos] {
             RootManifestEntry::ManifestRef { manifest_file, .. } => {
@@ -2291,7 +2361,10 @@ async fn materialize_carried_tombstones(
     .collect()
     .await;
 
-    let mut retired: HashSet<String> = HashSet::new();
+    // `?` here aborts the whole sweep on any load failure — which is the point:
+    // partial knowledge must never retire anything.
+    let mut hot_present: HashSet<String> = HashSet::new();
+    let mut hot_materialized: HashSet<String> = HashSet::new();
     let mut scanned = 0usize;
     for res in loaded {
         let (pos, manifest) = res?;
@@ -2300,6 +2373,7 @@ async fn materialize_carried_tombstones(
         let mut matched: Vec<(u32, String)> = Vec::new();
         for (idx, me) in manifest.entries().iter().enumerate() {
             let path = me.data_file.file_path.as_str();
+            hot_present.insert(path.to_string());
             if tombstones.contains(path) {
                 matched.push((idx as u32, path.to_string()));
             }
@@ -2317,7 +2391,7 @@ async fn materialize_carried_tombstones(
         };
         for (idx, path) in matched {
             new_mdv.mark_deleted(idx);
-            retired.insert(path);
+            hot_materialized.insert(path);
         }
         // Same guard the non-incremental MDV path sets: bind the positional
         // bitmap to the manifest snapshot it was computed against.
@@ -2328,6 +2402,45 @@ async fn materialize_carried_tombstones(
             ),
         );
         *mdv = Some(new_mdv.serialize()?);
+    }
+
+    // --- Cold tier: presence only.
+    let cold_loaded: Vec<Result<crate::spec::Manifest>> = futures::stream::iter(
+        cold_leaves
+            .into_iter()
+            .map(|mf| async move { mf.load_manifest(file_io).await }),
+    )
+    .buffer_unordered(TOMBSTONE_MATERIALIZE_CONCURRENCY)
+    .collect()
+    .await;
+
+    let mut cold_present: HashSet<String> = HashSet::new();
+    for res in cold_loaded {
+        let manifest = res?;
+        scanned += 1;
+        for me in manifest.entries() {
+            cold_present.insert(me.data_file.file_path.clone());
+        }
+    }
+
+    // A tombstone may be retired when either:
+    //   (a) we materialized it into a hot MDV — the bit now does the suppressing;
+    //   (b) it matches nothing anywhere — it guards a file no manifest lists, so
+    //       it is pure dead weight (on sri-olly this was ~252k of ~255k paths,
+    //       ~64 MB of root, left behind by graduation, TTL drops and manifest
+    //       rewrites that removed entries without ever retiring their tombstone).
+    // In BOTH cases a cold match vetoes retirement: the cold leaf still lists the
+    // file and only the path tombstone is suppressing it there.
+    let mut retired: HashSet<String> = HashSet::new();
+    for path in hot_materialized {
+        if !cold_present.contains(&path) {
+            retired.insert(path);
+        }
+    }
+    for path in carried_removed.iter() {
+        if !hot_present.contains(path) && !cold_present.contains(path) {
+            retired.insert(path.clone());
+        }
     }
 
     if !retired.is_empty() {
@@ -3910,19 +4023,17 @@ mod test_v4_commit {
         );
     }
 
-    // ---- Carried-tombstone materialization -------------------------------
+    // ---- Carried-tombstone sweep -----------------------------------------
     //
     // These drive `materialize_carried_tombstones` directly rather than through
-    // a full collapse. An e2e attempt is not usable here: on a table this small
-    // the inline flush consolidates every ref into a single manifest and
-    // materializes the tombstone itself, so the collapse never sees one — which
-    // is exactly the condition that does NOT hold at sri-olly scale (3,889
-    // manifests, 430k surviving tombstones). Driving the helper directly tests
-    // the real code under the real condition.
+    // a full collapse. An e2e attempt is not usable for the unit-level claims:
+    // on a table small enough to build in a test the inline flush consolidates
+    // every ref into a single manifest and materializes the tombstone itself, so
+    // the collapse never sees one — exactly the condition that does NOT hold at
+    // sri-olly scale (~4.9k manifests, ~255k surviving tombstones).
     //
-    // End-to-end read equivalence — that an MDV bit suppresses a ref-resident
-    // file just as a path tombstone does — is already covered by
-    // `test_replace_data_files_mdv_removes_ref_resident_file` above.
+    // The resurrection-safety property that spans sweep + merge IS covered e2e,
+    // by `tombstoned_file_stays_invisible_across_mdv_merge` at the end.
 
     /// Build a tiered+incremental table holding `n` files, each flushed into its
     /// own child manifest, and return the reconstructed root entries.
@@ -3991,12 +4102,10 @@ mod test_v4_commit {
             .count()
     }
 
-    /// The core claim: a tombstone whose file lives inside a manifest ref is
-    /// converted into an MDV bit on that manifest and retired from the carried
-    /// set. This is what stops `removed_paths` growing without bound on a tiered
-    /// incremental table (sri-olly: 430k paths, ~108 MB of a 132 MB root).
+    /// A tombstone whose file is still listed in a hot manifest is converted into
+    /// an MDV bit on that manifest and retired from the carried set.
     #[tokio::test]
-    async fn materialize_carried_tombstones_retires_and_sets_mdv() {
+    async fn sweep_materializes_hot_match_into_mdv_and_retires() {
         let (table, mut entries) = refs_fixture("tomb_mat", "v4tombmat", 3).await;
         let mut carried = vec!["s3://b/r1.parquet".to_string()];
 
@@ -4004,18 +4113,15 @@ mod test_v4_commit {
             table.file_io(),
             &mut entries,
             &mut carried,
-            256,
-            0,
+            None,
+            8192,
         )
         .await
         .unwrap();
 
         assert_eq!(retired, 1, "the tombstoned file was found and materialized");
         assert!(scanned >= 1, "at least the manifest holding it was scanned");
-        assert!(
-            carried.is_empty(),
-            "a materialized path must be retired from the carried set"
-        );
+        assert!(carried.is_empty(), "a materialized path is retired");
         assert_eq!(
             mdv_count(&entries),
             1,
@@ -4023,11 +4129,13 @@ mod test_v4_commit {
         );
     }
 
-    /// A tombstone that matches nothing in the scanned manifests must be kept.
-    /// Retirement is driven by what was OBSERVED, never by assumption — this is
-    /// the property that makes it impossible to resurrect a file.
+    /// The 252k case: a tombstone matching NOTHING anywhere in the tree guards a
+    /// file no manifest lists, so a complete sweep may drop it outright. This is
+    /// the bulk of sri-olly's root — ~64 MB of paths left behind by graduation,
+    /// TTL drops and manifest rewrites that removed entries without ever
+    /// retiring their tombstone.
     #[tokio::test]
-    async fn materialize_carried_tombstones_keeps_unmatched_paths() {
+    async fn sweep_retires_tombstones_that_match_nothing() {
         let (table, mut entries) = refs_fixture("tomb_unmatched", "v4tombunm", 3).await;
         let mut carried = vec!["s3://b/not-in-any-manifest.parquet".to_string()];
 
@@ -4035,113 +4143,154 @@ mod test_v4_commit {
             table.file_io(),
             &mut entries,
             &mut carried,
-            256,
-            0,
+            None,
+            8192,
         )
         .await
         .unwrap();
 
-        assert_eq!(retired, 0, "nothing matched, so nothing may be retired");
+        assert_eq!(retired, 1, "an unreachable tombstone is pure dead weight");
+        assert!(carried.is_empty(), "and is dropped from the carried set");
         assert_eq!(
-            carried,
-            vec!["s3://b/not-in-any-manifest.parquet".to_string()],
-            "an unmatched tombstone must be carried forward untouched"
+            mdv_count(&entries),
+            0,
+            "nothing was suppressed, so no delete vector is written"
         );
-        assert_eq!(mdv_count(&entries), 0, "no delete vector is written");
     }
 
-    /// A zero budget must be a strict no-op: no manifest read, no retirement.
-    /// This is the knob an operator can reach for if materialization ever needs
-    /// to be switched off in the field.
+    /// All-or-nothing. If the tree is larger than we are willing to read in one
+    /// commit we must sweep NOTHING — retiring an unmatched tombstone is only
+    /// sound if we looked everywhere, and a partial look could drop the
+    /// tombstone guarding a file an unread manifest still lists.
     #[tokio::test]
-    async fn materialize_carried_tombstones_zero_budget_is_a_noop() {
-        let (table, mut entries) = refs_fixture("tomb_zero", "v4tombzero", 3).await;
-        let mut carried = vec!["s3://b/r1.parquet".to_string()];
+    async fn sweep_refuses_rather_than_reason_from_partial_knowledge() {
+        let (table, mut entries) = refs_fixture("tomb_cap", "v4tombcap", 5).await;
+        let mut carried = vec![
+            "s3://b/r0.parquet".to_string(),
+            "s3://b/nowhere.parquet".to_string(),
+        ];
 
+        // Cap below the number of manifests in the tree.
         let (retired, scanned) = super::materialize_carried_tombstones(
             table.file_io(),
             &mut entries,
             &mut carried,
-            0,
-            0,
+            None,
+            1,
         )
         .await
         .unwrap();
 
-        assert_eq!((retired, scanned), (0, 0), "zero budget scans nothing");
-        assert_eq!(carried.len(), 1, "the tombstone is left in place");
+        assert_eq!(
+            (retired, scanned),
+            (0, 0),
+            "a tree over the cap must not be swept at all"
+        );
+        assert_eq!(carried.len(), 2, "every tombstone is left in place");
         assert_eq!(mdv_count(&entries), 0);
     }
 
-    /// Partial progress must be safe and bounded. With three tombstones spread
-    /// across three manifests and a budget of one, at most one may be retired —
-    /// the rest stay tombstoned and keep suppressing their files. Full coverage
-    /// is a convergence property across collapses, not a precondition for the
-    /// correctness of any single one.
+    /// Nothing carried → nothing to do, and no manifest is read.
     #[tokio::test]
-    async fn materialize_carried_tombstones_respects_the_budget() {
-        let (table, mut entries) = refs_fixture("tomb_partial", "v4tombpart", 5).await;
-        let mut carried = vec![
-            "s3://b/r0.parquet".to_string(),
-            "s3://b/r1.parquet".to_string(),
-            "s3://b/r2.parquet".to_string(),
-        ];
+    async fn sweep_is_a_noop_with_an_empty_carried_set() {
+        let (table, mut entries) = refs_fixture("tomb_empty", "v4tombempty", 3).await;
+        let mut carried: Vec<String> = Vec::new();
 
         let (retired, scanned) = super::materialize_carried_tombstones(
             table.file_io(),
             &mut entries,
             &mut carried,
-            1,
-            0,
+            None,
+            8192,
         )
         .await
         .unwrap();
 
-        assert_eq!(scanned, 1, "the budget caps manifest reads at one");
-        assert!(
-            retired <= 1,
-            "at most one tombstone can be retired; got {retired}"
-        );
-        assert_eq!(
-            carried.len(),
-            3 - retired,
-            "every tombstone not materialized this round must be carried forward"
-        );
+        assert_eq!((retired, scanned), (0, 0));
+        assert_eq!(mdv_count(&entries), 0);
     }
 
-    /// The rotation offset must move the window, so successive collapses reach
-    /// different manifests and the backlog drains instead of rescanning the same
-    /// prefix forever.
+    /// Regression guard for the merge change. Stamping an MDV on a ref used to
+    /// exclude it from ref-count merging forever; it is now merged, with the
+    /// bitmap applied as the bin is rewritten. The danger in doing that is
+    /// resurrection — if the merge carried the tombstoned row through, or if the
+    /// merged output silently inherited a stale bitmap, the deleted file would
+    /// come back. It must stay invisible across the whole append → remove →
+    /// collapse → merge cycle.
     #[tokio::test]
-    async fn materialize_carried_tombstones_rotates_the_window() {
-        let (table, base_entries) = refs_fixture("tomb_rotate", "v4tombrot", 4).await;
+    async fn tombstoned_file_stays_invisible_across_mdv_merge() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("tomb_merge".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let creation = TableCreation::builder()
+            .name("v4tombmerge".to_string())
+            .schema(test_schema())
+            .format_version(FormatVersion::V4)
+            .properties(HashMap::from([
+                ("root-manifest.incremental".to_string(), "true".to_string()),
+                ("tiered-metadata.enabled".to_string(), "true".to_string()),
+                // Merge aggressively so the MDV-bearing ref is actually picked up.
+                (
+                    "commit.manifest-merge.enabled".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "commit.manifest.min-count-to-merge".to_string(),
+                    "2".to_string(),
+                ),
+            ]))
+            .build();
+        let mut table = catalog.create_table(&ns, creation).await.unwrap();
 
-        // Same single-manifest budget, different rotations: collect which file
-        // each round manages to retire.
-        let mut seen: HashSet<String> = HashSet::new();
-        for rotation in 0..4u64 {
-            let mut entries = base_entries.clone();
-            let mut carried = (0..4)
-                .map(|i| format!("s3://b/r{i}.parquet"))
-                .collect::<Vec<_>>();
-            let before: HashSet<String> = carried.iter().cloned().collect();
-            super::materialize_carried_tombstones(
-                table.file_io(),
-                &mut entries,
-                &mut carried,
-                1,
-                rotation,
-            )
-            .await
-            .unwrap();
-            let after: HashSet<String> = carried.into_iter().collect();
-            seen.extend(before.difference(&after).cloned());
+        for i in 0..6 {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://b/m{i}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
         }
 
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .replace_data_files()
+            .delete_files(vec![test_data_file("s3://b/m2.parquet")])
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
         assert!(
-            seen.len() > 1,
-            "rotating the start offset must reach more than one manifest across \
-             rounds, otherwise the backlog can never drain; reached {seen:?}"
+            !visible_paths(&table).await.contains("s3://b/m2.parquet"),
+            "precondition: m2 is gone before any collapse/merge runs"
         );
+
+        // Drive past MAX_CHAIN so a collapse — and with it the sweep and the
+        // manifest merge — actually runs.
+        for i in 0..66 {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![test_data_file(&format!("s3://b/x{i}.parquet"))])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+
+        let visible = visible_paths(&table).await;
+        assert!(
+            !visible.contains("s3://b/m2.parquet"),
+            "a tombstoned file must not be resurrected by MDV-aware merging"
+        );
+        for i in [0usize, 1, 3, 4, 5] {
+            assert!(
+                visible.contains(&format!("s3://b/m{i}.parquet")),
+                "m{i} was never removed and must survive the merge"
+            );
+        }
+        for i in 0..66 {
+            assert!(visible.contains(&format!("s3://b/x{i}.parquet")));
+        }
     }
 }

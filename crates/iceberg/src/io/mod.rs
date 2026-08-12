@@ -91,6 +91,8 @@ mod storage_memory;
 #[cfg(feature = "storage-oss")]
 mod storage_oss;
 #[cfg(feature = "storage-s3")]
+mod s3_credential_cache;
+#[cfg(feature = "storage-s3")]
 mod storage_s3;
 
 #[cfg(feature = "storage-azdls")]

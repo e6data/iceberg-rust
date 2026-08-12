@@ -37,7 +37,7 @@ storage-fs = ["opendal/services-fs"]
 storage-gcs = ["opendal/services-gcs"]
 storage-memory = ["opendal/services-memory"]
 storage-oss = ["opendal/services-oss"]
-storage-s3 = ["opendal/services-s3"]
+storage-s3 = ["opendal/services-s3", "dep:reqsign-aws-v4", "dep:reqsign-core"]
 
 
 [dependencies]
@@ -85,7 +85,12 @@ serde_json = { workspace = true }
 serde_repr = { workspace = true }
 serde_with = { workspace = true }
 strum = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, optional = false, features = ["sync", "fs", "io-util"] }
+# reqsign types are shared with opendal-service-s3; see io::s3_credential_cache.
+reqsign-aws-v4 = { workspace = true, optional = true }
+reqsign-core = { workspace = true, optional = true }
+# "time" is required by io::s3_credential_cache for the refresh timeout and
+# retry backoff.
+tokio = { workspace = true, optional = false, features = ["sync", "fs", "io-util", "time"] }
 typed-builder = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }

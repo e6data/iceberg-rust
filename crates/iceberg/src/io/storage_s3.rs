@@ -19,9 +19,12 @@ use std::collections::HashMap;
 
 use opendal::services::S3Config;
 use opendal::{Configurator, Operator};
+use reqsign_aws_v4::DefaultCredentialProvider;
+use reqsign_core::ProvideCredentialChain;
 use url::Url;
 
 use crate::io::is_truthy;
+use crate::io::s3_credential_cache::SharedCachedCredentialProvider;
 use crate::{Error, ErrorKind, Result};
 
 /// Following are arguments for [s3 file io](https://py.iceberg.apache.org/configuration/#s3).
@@ -191,7 +194,14 @@ pub(crate) fn s3_config_build(cfg: &S3Config, path: &str) -> Result<Operator> {
         .clone()
         .into_builder()
         // Set bucket name.
-        .bucket(&bucket);
+        .bucket(&bucket)
+        // Wrap opendal's default chain so concurrent signers coalesce into a
+        // single request at the pod-identity agent and a 429 is retried
+        // rather than failing the S3 op. See `s3_credential_cache` for the
+        // measured failure this addresses.
+        .credential_provider_chain(ProvideCredentialChain::new().push(
+            SharedCachedCredentialProvider::new(DefaultCredentialProvider::builder().build()),
+        ));
 
     Ok(Operator::new(builder)?.finish())
 }

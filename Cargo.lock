@@ -3521,6 +3521,8 @@ dependencies = [
  "pretty_assertions",
  "rand 0.8.5",
  "regex",
+ "reqsign-aws-v4",
+ "reqsign-core",
  "reqwest 0.12.28",
  "roaring",
  "rust_decimal",

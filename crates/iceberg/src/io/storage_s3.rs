@@ -149,6 +149,25 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
     Ok(cfg)
 }
 
+/// Extract the bucket name from an `s3[a]://<bucket>/<path>` URL. Kept
+/// separate from `s3_config_build` so callers that want to key a cache by
+/// bucket don't have to construct an `Operator` (and therefore a full
+/// credential-provider chain) just to read `.info().name()`. That
+/// construction is what stampeded 169.254.170.23 on sri-olly's
+/// 2026-08-12 metrics_1m tumble wedge — see `Storage::S3::operators` in
+/// storage.rs for the cache that consumes this.
+pub(crate) fn s3_bucket_from_path(path: &str) -> Result<String> {
+    let url = Url::parse(path)?;
+    url.host_str()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Invalid s3 url: {path}, missing bucket"),
+            )
+        })
+}
+
 /// Build new opendal operator from given path.
 ///
 /// opendal 0.57's built-in `credential_provider_chain` covers IRSA, EKS Pod
@@ -159,20 +178,63 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
 /// module has been removed; consumers that previously plugged a loader in
 /// via `FileIOBuilder::with_file_io_extension` should drop that call and
 /// rely on the native chain.
+///
+/// The Operator returned here should be cached and reused across file
+/// operations targeting the same bucket — see `Storage::S3::operators`.
+/// Each call re-constructs opendal's provider chain and wastes the
+/// intra-chain credential TTL, and on synchronized-flush workloads that
+/// pattern will 429 the pod-identity endpoint.
 pub(crate) fn s3_config_build(cfg: &S3Config, path: &str) -> Result<Operator> {
-    let url = Url::parse(path)?;
-    let bucket = url.host_str().ok_or_else(|| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            format!("Invalid s3 url: {path}, missing bucket"),
-        )
-    })?;
+    let bucket = s3_bucket_from_path(path)?;
 
     let builder = cfg
         .clone()
         .into_builder()
         // Set bucket name.
-        .bucket(bucket);
+        .bucket(&bucket);
 
     Ok(Operator::new(builder)?.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_from_s3_scheme() {
+        assert_eq!(
+            s3_bucket_from_path("s3://my-bucket/data/foo.parquet").unwrap(),
+            "my-bucket"
+        );
+    }
+
+    #[test]
+    fn bucket_from_s3a_scheme() {
+        assert_eq!(
+            s3_bucket_from_path("s3a://another-bucket/x/y/z").unwrap(),
+            "another-bucket"
+        );
+    }
+
+    #[test]
+    fn bucket_from_path_with_no_key() {
+        // Bare `s3://bucket/` still parses — host is present.
+        assert_eq!(s3_bucket_from_path("s3://only-bucket/").unwrap(), "only-bucket");
+    }
+
+    #[test]
+    fn bucket_missing_returns_data_invalid() {
+        // Missing host — url::Url parses `s3:///path` with empty host_str().
+        let err = s3_bucket_from_path("s3:///no/bucket").unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::DataInvalid), "got {err:?}");
+    }
+
+    #[test]
+    fn malformed_url_returns_error() {
+        // Genuinely unparseable URL should fail (not panic).
+        let err = s3_bucket_from_path("::: not a url :::").unwrap_err();
+        // url::ParseError → whatever ErrorKind Url conversion assigns;
+        // point is the fn doesn't panic.
+        let _ = err;
+    }
 }

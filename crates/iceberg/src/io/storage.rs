@@ -22,6 +22,8 @@
     feature = "storage-azdls",
 ))]
 use std::sync::Arc;
+#[cfg(feature = "storage-s3")]
+use std::{collections::HashMap, sync::RwLock};
 
 use opendal::layers::RetryLayer;
 #[cfg(feature = "storage-azdls")]
@@ -54,12 +56,25 @@ pub(crate) enum Storage {
     /// `credential_provider_chain` natively (IRSA, EKS Pod Identity, EC2
     /// instance metadata, env vars — all auto-refreshing), so this struct
     /// no longer needs the loader field.
+    ///
+    /// `operators` caches one built `Operator` per bucket. Rebuilding an
+    /// Operator every call re-constructs opendal's provider chain, which
+    /// re-probes the pod-identity / IMDS endpoints on cold cache and
+    /// defeats the intra-Operator credential TTL. On sri-olly 2026-08-12,
+    /// a synchronized metrics_1m tumble minted hundreds of chains inside
+    /// one wall-clock ms and drove `169.254.170.23` into 429, cascading
+    /// into wedged sink checkpoints. `RwLock` (not `Mutex`) so hot-path
+    /// gets are contention-free; misses take the write lock briefly to
+    /// insert. Keyed by bucket because a single `Storage::S3` variant
+    /// is API-allowed to serve multiple buckets even though laminar's
+    /// production path is single-bucket per catalog.
     #[cfg(feature = "storage-s3")]
     S3 {
         /// s3 storage could have `s3://` and `s3a://`.
         /// Storing the scheme string here to return the correct path.
         configured_scheme: String,
         config: Arc<S3Config>,
+        operators: Arc<RwLock<HashMap<String, Operator>>>,
     },
     #[cfg(feature = "storage-gcs")]
     Gcs { config: Arc<GcsConfig> },
@@ -96,6 +111,7 @@ impl Storage {
             "s3" => Ok(Self::S3 {
                 configured_scheme: scheme_str,
                 config: super::s3_config_parse(props)?.into(),
+                operators: Arc::new(RwLock::new(HashMap::new())),
             }),
             #[cfg(feature = "storage-gcs")]
             "gcs" => Ok(Self::Gcs {
@@ -162,12 +178,45 @@ impl Storage {
             Storage::S3 {
                 configured_scheme,
                 config,
+                operators,
             } => {
-                let op = super::s3_config_build(config, path)?;
-                let op_info = op.info();
+                // Extract bucket from `s3://<bucket>/...` (or `s3a://...`)
+                // without building a fresh Operator just to read `.info()`.
+                // Parsing here matches what `s3_config_build` does internally.
+                let bucket = super::s3_bucket_from_path(path)?;
 
-                // Check prefix of s3 path.
-                let prefix = format!("{}://{}/", configured_scheme, op_info.name());
+                // Fast path: cache hit — clone the Arc-backed Operator.
+                // `Operator` is cheaply cloneable (internal Arc).
+                let op = {
+                    let guard = operators.read().map_err(|_| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "S3 operator cache RwLock poisoned",
+                        )
+                    })?;
+                    guard.get(&bucket).cloned()
+                };
+
+                let op = match op {
+                    Some(op) => op,
+                    None => {
+                        // Slow path: build once, install under write lock.
+                        // A second concurrent inserter is possible but
+                        // benign — the newer build is functionally
+                        // equivalent and gets discarded when we take the
+                        // existing entry.
+                        let built = super::s3_config_build(config, path)?;
+                        let mut guard = operators.write().map_err(|_| {
+                            Error::new(
+                                ErrorKind::Unexpected,
+                                "S3 operator cache RwLock poisoned",
+                            )
+                        })?;
+                        guard.entry(bucket.clone()).or_insert(built).clone()
+                    }
+                };
+
+                let prefix = format!("{}://{}/", configured_scheme, bucket);
                 if path.starts_with(&prefix) {
                     Ok((op, &path[prefix.len()..]))
                 } else {
@@ -250,5 +299,88 @@ impl Storage {
             other => other,
         };
         Ok(canon.to_string())
+    }
+
+    /// Number of distinct buckets currently cached under `Storage::S3`.
+    /// Test-only introspection so cache-hit vs cache-insert behavior can
+    /// be asserted without going through `.info().name()`.
+    #[cfg(all(test, feature = "storage-s3"))]
+    fn s3_cache_len(&self) -> Option<usize> {
+        match self {
+            Storage::S3 { operators, .. } => Some(operators.read().unwrap().len()),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "storage-s3"))]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+
+    fn build_s3_storage() -> Storage {
+        // Minimal config; region + bucket-in-URL are enough to exercise
+        // create_operator's cache path without hitting the network.
+        let builder = FileIOBuilder::new("s3")
+            .with_prop("s3.region", "us-east-1")
+            .with_prop("s3.access-key-id", "test-key")
+            .with_prop("s3.secret-access-key", "test-secret")
+            .with_prop("s3.disable-ec2-metadata", "true");
+        Storage::build(builder).expect("storage build")
+    }
+
+    #[test]
+    fn s3_create_operator_caches_same_bucket() {
+        let storage = build_s3_storage();
+        assert_eq!(storage.s3_cache_len(), Some(0), "cache starts empty");
+
+        // Two calls with same bucket → one cache entry, second is a hit.
+        let _ = storage
+            .create_operator(&"s3://my-bucket/data/foo.parquet".to_string())
+            .expect("first call");
+        assert_eq!(storage.s3_cache_len(), Some(1), "one bucket inserted");
+
+        let _ = storage
+            .create_operator(&"s3://my-bucket/data/bar.parquet".to_string())
+            .expect("second call same bucket");
+        assert_eq!(
+            storage.s3_cache_len(),
+            Some(1),
+            "same bucket must not double-insert (this is the sri-olly 429 fix)"
+        );
+    }
+
+    #[test]
+    fn s3_create_operator_caches_per_bucket() {
+        let storage = build_s3_storage();
+
+        for bucket in ["alpha", "beta", "gamma"] {
+            let path = format!("s3://{bucket}/x.parquet");
+            let _ = storage.create_operator(&path).expect("call");
+        }
+
+        assert_eq!(
+            storage.s3_cache_len(),
+            Some(3),
+            "each distinct bucket gets its own cached Operator"
+        );
+    }
+
+    #[test]
+    fn s3_create_operator_accepts_s3a_scheme() {
+        // The `s3a` alias goes through the same cache as `s3://`.
+        // configured_scheme is `s3a` so the returned relative-path prefix
+        // check uses the alias, but the cache key is still the bucket.
+        let builder = FileIOBuilder::new("s3a")
+            .with_prop("s3.region", "us-east-1")
+            .with_prop("s3.access-key-id", "test-key")
+            .with_prop("s3.secret-access-key", "test-secret")
+            .with_prop("s3.disable-ec2-metadata", "true");
+        let storage = Storage::build(builder).unwrap();
+
+        let path = "s3a://bucket-x/dir/f.parquet".to_string();
+        let (_op, rel) = storage.create_operator(&path).expect("s3a call");
+        assert_eq!(rel, "dir/f.parquet");
+        assert_eq!(storage.s3_cache_len(), Some(1));
     }
 }

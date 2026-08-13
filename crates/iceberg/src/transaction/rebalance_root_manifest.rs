@@ -753,6 +753,24 @@ impl TransactionAction for RebalanceRootManifestAction {
             }
         }
 
+        // Diagnostics for the cap decision. `cache_hits` is the number of
+        // Phase-A rewrites served from a previous CAS attempt instead of
+        // re-reading and re-writing the source manifest. This is the number to
+        // watch before raising TESSELLATE_V2_REBALANCE_MAX_MANIFESTS_PER_COMMIT:
+        // the cap exists to bound RETRY redo, so if hits are high the redo cost
+        // is gone and the cap can rise. If `retries` stay ~0 the cache will
+        // rarely be exercised, and the cap can rise for a different reason —
+        // there was never much redo to bound.
+        log::info!(
+            "rebalance phase A: rewrites_done={} cache_hits={} cap={} entries_in_root={}",
+            rewrites_done,
+            cache_hits,
+            self.max_manifests_per_commit
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            root_manifest.entries().len()
+        );
+
         // --- Phase B: Flush inline entries into child manifests ---
         if needs_flush {
             // Group inline entries by (content_type, partition_spec_id) using

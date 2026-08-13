@@ -1303,6 +1303,14 @@ impl<'a> SnapshotProducer<'a> {
             // the cache is stale and must be discarded.
             *cached_sid == current_snapshot_id
         });
+        // Timed from the TOP of commit_v4. The previous placement started
+        // AFTER this root-read block and reported v4_ms=34ms p50 / 59ms max
+        // while actions_ms reached 33,075ms — i.e. it measured 1% of the
+        // commit and missed the part that matters. This block reads and parses
+        // the current root manifest from S3, which is the only substantial
+        // work between the action's entry and the point the old timer began.
+        let v4_total_start = std::time::Instant::now();
+
         // Load the previous entries AND the previous bucket-index pointer. The
         // pointer MUST be carried forward: the hot commit only rewrites the live
         // tier, so dropping it here would orphan the cold bucket-index (tiered
@@ -1412,6 +1420,13 @@ impl<'a> SnapshotProducer<'a> {
         // bucket-index (after the fold). Tombstoned `reason=metadata`; physical
         // delete deferred to tessellate past grace (grace ≫ ~28min snapshot
         // retention, so time-travel over the old snapshots stays safe).
+        log::info!(
+            "v4 root load: entries={} chain_depth={} root_load_ms={}",
+            entries.len(),
+            current_chain_depth,
+            v4_total_start.elapsed().as_millis() as u64
+        );
+
         let mut metadata_orphan_paths: Vec<String> = Vec::new();
         let old_bucket_index_path = carried_bucket_index_path.clone();
 
@@ -2186,8 +2201,9 @@ impl<'a> SnapshotProducer<'a> {
                 tiered
             );
             log::info!(
-                "v4 elapsed at flush end: v4_ms={}",
-                v4_start.elapsed().as_millis() as u64
+                "v4 elapsed at flush end: v4_ms={} v4_total_ms={}",
+                v4_start.elapsed().as_millis() as u64,
+                v4_total_start.elapsed().as_millis() as u64
             );
         }
 

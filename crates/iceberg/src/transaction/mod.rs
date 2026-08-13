@@ -924,6 +924,79 @@ mod test_row_lineage {
         );
     }
 
+    /// M4 real-code — a SEEDED DST (not a fixed scenario) over random real append
+    /// schedules. Each step appends 1..=3 data files through the real commit path;
+    /// after every commit the real scan planner must return EXACTLY the cumulative
+    /// appended set — no loss, no duplication — across the growing manifest list
+    /// (where a manifest-merge bug would surface). Finally, expiring ALL ancestor
+    /// snapshots must preserve reachability. Deterministic + replayable by seed.
+    #[tokio::test]
+    async fn dst_seeded_real_append_reachability() {
+        fn mix(s: &mut u64) -> u64 {
+            *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        for seed in 0..12u64 {
+            let mut rng = seed ^ 0xDEAD_BEEF;
+            let catalog = new_memory_catalog().await;
+            let mut table = make_v3_minimal_table_in_catalog(&catalog).await;
+            let mut expected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+            for step in 0..12u64 {
+                let k = 1 + mix(&mut rng) % 3;
+                let mut files = Vec::new();
+                for i in 0..k {
+                    let path = format!("dst/{seed}/{step}/{i}.parquet");
+                    expected.insert(path.clone());
+                    files.push(dst_data_file(&path, 1 + mix(&mut rng) % 100));
+                }
+                let tx = Transaction::new(&table);
+                let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
+                table = tx.commit(&catalog).await.unwrap();
+
+                assert_eq!(
+                    dst_live_paths(&table).await,
+                    expected,
+                    "seed={seed} step={step}: scan != cumulative appends (loss or spurious rows)"
+                );
+                assert_eq!(
+                    dst_live_count(&table).await,
+                    expected.len(),
+                    "seed={seed} step={step}: duplicate live files after append"
+                );
+            }
+
+            // Expire ALL ancestor snapshots — the current snapshot must stay fully
+            // reachable (no committed data lost to expiry).
+            let current = table.metadata().current_snapshot_id().unwrap();
+            let ancestors: Vec<i64> = table
+                .metadata()
+                .snapshots()
+                .map(|s| s.snapshot_id())
+                .filter(|id| *id != current)
+                .collect();
+            if !ancestors.is_empty() {
+                let meta = table
+                    .metadata()
+                    .clone()
+                    .into_builder(None)
+                    .remove_snapshots(&ancestors)
+                    .build()
+                    .unwrap()
+                    .metadata;
+                let expired = table.with_metadata(std::sync::Arc::new(meta));
+                assert_eq!(
+                    dst_live_paths(&expired).await,
+                    expected,
+                    "seed={seed}: expiring all ancestors broke reachability of committed data"
+                );
+            }
+        }
+    }
+
     /// M4 (OPEN INVESTIGATION). Running `replace_data_files` (delete files + add a
     /// merged one) in ISOLATION on a v3-minimal table does NOT reflect the deletion
     /// through the scan planner — the live set still shows the replaced files —

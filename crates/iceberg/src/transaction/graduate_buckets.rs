@@ -100,7 +100,7 @@ fn bucket_index_maxts_sidecar_path(bucket_index_path: &str) -> String {
 /// (missing, unreadable, corrupt, wrong ts_field_id, wrong format version)
 /// — the caller falls back to loading manifests, so all failure modes are
 /// non-fatal.
-async fn load_maxts_sidecar(
+pub(crate) async fn load_maxts_sidecar(
     file_io: &crate::io::FileIO,
     bucket_index_path: &str,
     ts_field_id: i32,
@@ -269,7 +269,7 @@ fn file_max_ts(df: &DataFile, ts_field_id: i32) -> Option<i64> {
 /// Without this, an all-`None` sidecar permanently suppresses TTL for any table
 /// whose retention ts-field isn't the partition source (e.g. logs on
 /// `ingestion_time`, where `ref_max_event_micros` is structurally always None).
-fn sidecar_hit(entry: Option<&Option<i64>>) -> Option<i64> {
+pub(crate) fn sidecar_hit(entry: Option<&Option<i64>>) -> Option<i64> {
     match entry {
         Some(Some(v)) => Some(*v),
         _ => None,

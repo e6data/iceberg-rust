@@ -62,6 +62,22 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
 
+/// Keep-vs-drop for one cold leaf.
+///
+/// Extracted so the sidecar fast path and the manifest fallback provably
+/// apply the SAME rule — that equivalence is the whole correctness claim of
+/// consulting the sidecar, and inlining it twice would let the two drift.
+///
+/// `None` (no max-ts derivable) keeps the leaf: dropping data because a stat
+/// was missing would be unrecoverable, whereas keeping it costs one more TTL
+/// pass.
+fn keep_leaf(max_ts: Option<i64>, cutoff_micros: i64) -> bool {
+    match max_ts {
+        Some(max_ts) => max_ts >= cutoff_micros,
+        None => true,
+    }
+}
+
 /// Action that drops cold leaves whose data is entirely older than the cutoff
 /// (time-based retention), trims the bucket-index, and repoints the root.
 ///
@@ -155,19 +171,52 @@ impl TransactionAction for DropColdBucketsAction {
         let scan_start = std::time::Instant::now();
         let n_leaves = leaves.len();
         let mut load_micros: u128 = 0;
+        let mut sidecar_hits: usize = 0;
+        let mut sidecar_misses: usize = 0;
+
+        // Consult the max-ts sidecar that graduate_buckets already maintains
+        // for exactly this keep-vs-drop decision. One read replaces up to N
+        // sequential per-leaf manifest GETs. A miss (absent, stale
+        // ts_field_id, or a cached `None` "poison" value) falls through to the
+        // manifest load below, so behaviour is identical — only the I/O
+        // changes. `sidecar_hit` is what enforces that a cached non-answer is
+        // NOT trusted; without it an all-None sidecar would permanently
+        // suppress TTL on tables whose retention field is not the partition
+        // source (e.g. logs on ingestion_time).
+        let maxts_sidecar = match &rm_metadata.bucket_index_path {
+            Some(bip) => {
+                crate::transaction::graduate_buckets::load_maxts_sidecar(
+                    table.file_io(),
+                    bip,
+                    self.ts_field_id,
+                )
+                .await
+            }
+            None => None,
+        };
+
         for leaf in leaves {
-            let load_start = std::time::Instant::now();
-            let manifest = leaf.load_manifest(table.file_io()).await?;
-            load_micros += load_start.elapsed().as_micros();
-            let files: Vec<DataFile> = manifest
-                .entries()
-                .iter()
-                .filter(|e| e.is_alive())
-                .map(|e| e.data_file().clone())
-                .collect();
-            let keep = match max_ts_of(&files, self.ts_field_id) {
-                Some(max_ts) => max_ts >= self.cutoff_micros,
-                None => true,
+            // Sidecar first; only pay the S3 GET on a miss.
+            let cached = maxts_sidecar
+                .as_ref()
+                .and_then(|m| {
+                    crate::transaction::graduate_buckets::sidecar_hit(m.get(&leaf.manifest_path))
+                });
+            let keep = if let Some(max_ts) = cached {
+                sidecar_hits += 1;
+                keep_leaf(Some(max_ts), self.cutoff_micros)
+            } else {
+                sidecar_misses += 1;
+                let load_start = std::time::Instant::now();
+                let manifest = leaf.load_manifest(table.file_io()).await?;
+                load_micros += load_start.elapsed().as_micros();
+                let files: Vec<DataFile> = manifest
+                    .entries()
+                    .iter()
+                    .filter(|e| e.is_alive())
+                    .map(|e| e.data_file().clone())
+                    .collect();
+                keep_leaf(max_ts_of(&files, self.ts_field_id), self.cutoff_micros)
             };
             if keep {
                 kept.push(leaf);
@@ -177,14 +226,16 @@ impl TransactionAction for DropColdBucketsAction {
         }
 
         log::info!(
-            "drop_cold_buckets scan: leaves={} kept={} dropped={} load_ms={} scan_ms={} \
-             mean_load_ms={:.1}",
+            "drop_cold_buckets scan: leaves={} kept={} dropped={} sidecar_hits={} \
+             sidecar_misses={} manifest_loads={} load_ms={} scan_ms={}",
             n_leaves,
             kept.len(),
             dropped.len(),
+            sidecar_hits,
+            sidecar_misses,
+            sidecar_misses,
             (load_micros / 1000) as u64,
-            scan_start.elapsed().as_millis() as u64,
-            if n_leaves > 0 { (load_micros as f64 / 1000.0) / n_leaves as f64 } else { 0.0 }
+            scan_start.elapsed().as_millis() as u64
         );
 
         if dropped.is_empty() {
@@ -360,5 +411,36 @@ mod tests {
         // Only field 5 carries a stat; asking for field 9 → None.
         let files = vec![df("a", Some((5, 100)))];
         assert_eq!(max_ts_of(&files, 9), None);
+    }
+}
+
+#[cfg(test)]
+mod keep_leaf_tests {
+    use super::keep_leaf;
+
+    /// The sidecar fast path and the manifest fallback must agree for every
+    /// input — that equivalence is what makes consulting the sidecar safe.
+    #[test]
+    fn cutoff_boundary_is_inclusive_keep() {
+        assert!(keep_leaf(Some(100), 100), "at cutoff must be KEPT");
+        assert!(keep_leaf(Some(101), 100));
+        assert!(!keep_leaf(Some(99), 100), "strictly older is dropped");
+    }
+
+    /// A missing max-ts keeps the leaf. Dropping on absent data would be
+    /// unrecoverable; keeping costs one more TTL pass. This is also what makes
+    /// a sidecar MISS safe: it falls through to the manifest load, and if that
+    /// also yields nothing the leaf survives.
+    #[test]
+    fn absent_max_ts_keeps() {
+        assert!(keep_leaf(None, 100));
+        assert!(keep_leaf(None, i64::MAX));
+    }
+
+    /// Extremes must not wrap or panic.
+    #[test]
+    fn extremes_are_sane() {
+        assert!(keep_leaf(Some(i64::MAX), 0));
+        assert!(!keep_leaf(Some(i64::MIN), 0));
     }
 }

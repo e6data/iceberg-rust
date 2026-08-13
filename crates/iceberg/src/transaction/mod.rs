@@ -2052,4 +2052,120 @@ mod test_row_lineage {
             }
         }
     }
+
+    /// M3 real-code — NETWORK PARTITION. While the store is unreachable, EVERY read
+    /// and write fails: a commit cannot land and a cold scan cannot read. The table
+    /// must be unchanged through the partition, and once the partition HEALS, both
+    /// commit and scan recover — no data lost, no phantom introduced.
+    #[tokio::test]
+    async fn dst_bytefault_partition_then_heal() {
+        let ctrl = crate::io::fault_layer::FaultController::new();
+        let (catalog, table) = dst_make_v4_faulty(ctrl.clone()).await;
+        let ident = table.identifier().clone();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/A.parquet", 1), dst_data_file("test/B.parquet", 2)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let ab: std::collections::BTreeSet<String> = ["test/A.parquet", "test/B.parquet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(dst_live_paths(&table).await, ab);
+
+        // Fresh (cold-cache) handle so the scan below reads manifests from the store.
+        let fresh = crate::Catalog::load_table(&catalog, &ident).await.unwrap();
+
+        // PARTITION: the store is unreachable.
+        ctrl.partition();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/C.parquet", 3)])
+            .apply(tx)
+            .unwrap();
+        assert!(
+            tx.commit(&catalog).await.is_err(),
+            "a commit during a store partition must fail"
+        );
+        assert!(
+            dst_try_live_paths(&fresh).await.is_err(),
+            "a cold scan during a store partition must fail, not read stale/empty"
+        );
+
+        // HEAL: the store is reachable again.
+        ctrl.heal();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/C.parquet", 3)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let abc: std::collections::BTreeSet<String> =
+            ["test/A.parquet", "test/B.parquet", "test/C.parquet"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(
+            dst_live_paths(&table).await,
+            abc,
+            "commit did not recover after the partition healed"
+        );
+        // Reads recover too (the healed scan succeeds).
+        assert!(
+            dst_try_live_paths(&fresh).await.is_ok(),
+            "scan did not recover after the partition healed"
+        );
+    }
+
+    /// M3 real-code — LATENCY. Injecting per-operation latency below FileIO must not
+    /// change results: a full append + compaction under added store latency yields
+    /// exactly the same live set. Guards against timing-dependent races in the
+    /// commit/scan path. (Latency is timing, not a fault; correctness is the assertion.)
+    #[tokio::test]
+    async fn dst_bytefault_latency_preserves_correctness() {
+        let ctrl = crate::io::fault_layer::FaultController::new();
+        let (catalog, table) = dst_make_v4_faulty(ctrl.clone()).await;
+        ctrl.set_latency_ms(2);
+
+        let a = dst_data_file("test/A.parquet", 1);
+        let b = dst_data_file("test/B.parquet", 2);
+        let c = dst_data_file("test/C.parquet", 3);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![a.clone(), b.clone(), c])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Compact A,B -> D under latency.
+        let snap = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let table = Transaction::new(&table)
+            .replace_data_files()
+            .delete_files(vec![a, b])
+            .add_files(vec![dst_data_file("test/D.parquet", 3)])
+            .validate_from_snapshot(snap)
+            .apply(Transaction::new(&table))
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        let cd: std::collections::BTreeSet<String> = ["test/C.parquet", "test/D.parquet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(dst_live_paths(&table).await, cd);
+        assert_eq!(dst_live_count(&table).await, 2);
+        // Sanity: operations actually flowed through the latency-injecting layer.
+        assert!(
+            ctrl.reads() > 0 && ctrl.writes() > 0,
+            "expected reads and writes to traverse the fault layer"
+        );
+    }
 }

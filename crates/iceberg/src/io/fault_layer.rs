@@ -48,6 +48,11 @@ struct FaultState {
     fail_deletes: usize,
     fail_write_substr: Option<(String, usize)>,
     fail_read_substr: Option<(String, usize)>,
+    /// Network-partition mode: while set, EVERY read/write/delete fails (the store
+    /// is unreachable), until `heal()`.
+    partitioned: bool,
+    /// Latency (ms) added before every operation.
+    delay_ms: u64,
     writes: usize,
     reads: usize,
     deletes: usize,
@@ -81,6 +86,22 @@ impl FaultController {
     pub(crate) fn fail_writes_containing(&self, substr: &str, n: usize) {
         self.state.lock().unwrap().fail_write_substr = Some((substr.to_string(), n));
     }
+    /// Enter network-partition mode: every read/write/delete fails until `heal()`.
+    pub(crate) fn partition(&self) {
+        self.state.lock().unwrap().partitioned = true;
+    }
+    /// Leave network-partition mode: operations succeed again.
+    pub(crate) fn heal(&self) {
+        self.state.lock().unwrap().partitioned = false;
+    }
+    /// Add `ms` of latency before every operation.
+    pub(crate) fn set_latency_ms(&self, ms: u64) {
+        self.state.lock().unwrap().delay_ms = ms;
+    }
+    fn latency_ms(&self) -> u64 {
+        self.state.lock().unwrap().delay_ms
+    }
+
     /// Total writes observed (for assertions about retry).
     #[allow(dead_code)]
     pub(crate) fn writes(&self) -> usize {
@@ -94,6 +115,9 @@ impl FaultController {
     fn should_fail_write(&self, path: &str) -> bool {
         let mut s = self.state.lock().unwrap();
         s.writes += 1;
+        if s.partitioned {
+            return true;
+        }
         let mut fail = false;
         if s.fail_writes > 0 {
             s.fail_writes -= 1;
@@ -112,6 +136,9 @@ impl FaultController {
     fn should_fail_read(&self, path: &str) -> bool {
         let mut s = self.state.lock().unwrap();
         s.reads += 1;
+        if s.partitioned {
+            return true;
+        }
         let mut fail = false;
         if s.fail_reads > 0 {
             s.fail_reads -= 1;
@@ -130,11 +157,22 @@ impl FaultController {
     fn should_fail_delete(&self) -> bool {
         let mut s = self.state.lock().unwrap();
         s.deletes += 1;
+        if s.partitioned {
+            return true;
+        }
         if s.fail_deletes > 0 {
             s.fail_deletes -= 1;
             return true;
         }
         false
+    }
+}
+
+/// Sleep for the currently-configured latency, if any. Kept out of the lock.
+async fn apply_latency(ctrl: &FaultController) {
+    let ms = ctrl.latency_ms();
+    if ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 }
 
@@ -187,6 +225,7 @@ impl<A: Access> LayeredAccess for FaultAccessor<A> {
     }
 
     async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+        apply_latency(&self.ctrl).await;
         if self.ctrl.should_fail_read(path) {
             return Err(injected("read", path));
         }
@@ -194,6 +233,7 @@ impl<A: Access> LayeredAccess for FaultAccessor<A> {
     }
 
     async fn write(&self, path: &str, args: OpWrite) -> opendal::Result<(RpWrite, Self::Writer)> {
+        apply_latency(&self.ctrl).await;
         if self.ctrl.should_fail_write(path) {
             return Err(injected("write", path));
         }
@@ -201,6 +241,7 @@ impl<A: Access> LayeredAccess for FaultAccessor<A> {
     }
 
     async fn delete(&self) -> opendal::Result<(RpDelete, Self::Deleter)> {
+        apply_latency(&self.ctrl).await;
         if self.ctrl.should_fail_delete() {
             return Err(injected("delete", ""));
         }

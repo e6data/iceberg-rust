@@ -154,21 +154,17 @@ use crate::spec::root_manifest::{
     RootManifestMetadata,
 };
 use crate::spec::{
-    DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus, Operation,
-    PartitionSpec, PrimitiveLiteral, Snapshot, SnapshotReference, SnapshotRetention, Summary,
-    Transform, MAIN_BRANCH,
+    DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
+    Operation, PartitionSpec, PrimitiveLiteral, Snapshot, SnapshotReference, SnapshotRetention,
+    Summary, Transform, MAIN_BRANCH,
 };
 use crate::table::Table;
 use crate::transaction::action::TransactionAction;
-use crate::transaction::snapshot::SnapshotProducer;
+use crate::transaction::snapshot::{max_chain_depth, SnapshotProducer};
 use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
-/// Chain-depth cap for the incremental delta path. Mirrors `commit_v4`'s
-/// constant at `snapshot.rs:1349` and the identical cap in `compact_cold_tier`
-/// — beyond MAX_CHAIN we fall back to a flat-base collapse.
-const MAX_CHAIN: u32 = 64;
 
 /// Cached prep from a prior `commit()` attempt on the same
 /// [`GraduateBucketsAction`] instance. Same retry-cheap invariant as
@@ -222,6 +218,10 @@ pub struct GraduateBucketsAction {
     /// Transaction commit loop uses `Arc<Self>` and holds the lock across
     /// async I/O.
     prepared: Mutex<Option<PreparedGraduation>>,
+    /// Max nodes folded into partition-clustered leaves per pass; `None` ⇒
+    /// move every graduating node by reference (prior behaviour). See
+    /// [`GraduateBucketsAction::with_leaf_fold`].
+    fold_leaves: Option<usize>,
 }
 
 impl GraduateBucketsAction {
@@ -234,7 +234,34 @@ impl GraduateBucketsAction {
             cutoff_micros,
             commit_uuid: Uuid::now_v7(),
             prepared: Mutex::new(None),
+            fold_leaves: None,
         }
+    }
+
+    /// Fold graduating nodes into partition-clustered cold leaves instead of
+    /// moving each one across by reference.
+    ///
+    /// By-reference graduation is O(1) per node, but it makes the cold tier
+    /// inherit the HOT tier's manifest granularity: laminar writes one node per
+    /// commit (~15-30 s), so an hour arrives as 120-240 nodes and lands as that
+    /// many leaves. Measured on sri-olly: `nodes_moved=719` in a single tick,
+    /// cold leaves 1,282 → 1,615 within a day. Every cold-tier pass is O(leaves)
+    /// — `compact_cold_tier`'s prep loads every leaf manifest — so the leaf count
+    /// is the term that sets tick cost.
+    ///
+    /// Folding reads those nodes' entries and rewrites them clustered by
+    /// partition tuple, yielding one leaf per partition (≈ one per tenant-hour,
+    /// which is what the tiered design documents). The reads are parallel and
+    /// happen inside `prepare()`, so they are paid once per action and reused
+    /// across CAS retries.
+    ///
+    /// `max_nodes` bounds the per-fold batch. Nodes beyond the bound stay HOT
+    /// and graduate on a later pass — never graduated-but-unfolded, so the
+    /// one-leaf-per-partition property holds for everything that crosses over.
+    /// `0` disables folding (by-reference behaviour, unchanged).
+    pub fn with_leaf_fold(mut self, max_nodes: usize) -> Self {
+        self.fold_leaves = (max_nodes > 0).then_some(max_nodes);
+        self
     }
 }
 
@@ -393,6 +420,46 @@ fn plan_graduated_node(
     }
 }
 
+/// Per-pass graduation bound: the tighter of the caller's per-collapse cap and
+/// the fold batch size. `None` on both ⇒ unbounded (manual/maintenance use).
+/// Pure.
+fn effective_graduation_cap(
+    max_graduate: Option<usize>,
+    fold_leaves: Option<usize>,
+) -> Option<usize> {
+    match (max_graduate, fold_leaves) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// Entries a folded node contributes to its new cold leaf: alive, not pending
+/// removal, restamped `Existing`.
+///
+/// The removal filter is load-bearing, not hygiene. On incremental tables a
+/// merge records its deletes as delta path-tombstones rather than MDVs, so a
+/// node can still LIST files that have been merged away and are awaiting GC.
+/// Carrying those into the cold tier is the 2026-07-16 data-loss shape:
+/// dangling references that 404 once grace expires. Folding reads every node
+/// anyway, so it applies the same filter [`plan_graduated_node`] applies on the
+/// by-reference path. Pure.
+fn fold_surviving_entries(
+    entries: &[Arc<ManifestEntry>],
+    removed_paths: &HashSet<String>,
+) -> Vec<ManifestEntry> {
+    entries
+        .iter()
+        .filter(|e| e.is_alive() && !removed_paths.contains(e.data_file().file_path()))
+        .map(|e| {
+            ManifestEntry::builder()
+                .status(ManifestStatus::Existing)
+                .data_file(e.data_file().clone())
+                .build()
+        })
+        .collect()
+}
+
 /// Fold the "closed" entries of a reconstructed live set (those whose max
 /// `ts_field_id` event time is below `cutoff_micros`) into the cold bucket-index,
 /// returning the entries that stay hot (`kept`) and — if anything was moved — a
@@ -433,6 +500,11 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // rest drop on later collapses (eventually consistent).
     retention_cutoff_micros: Option<i64>,
     max_ttl_drop_files: usize,
+    // When `Some(n)`, graduating nodes are re-clustered by partition into new
+    // cold leaves (at most `n` nodes per pass) instead of moving across by
+    // reference — see `GraduateBucketsAction::with_leaf_fold`. `None` keeps the
+    // by-reference path, which is what `commit_v4`'s collapse uses.
+    fold_leaves: Option<usize>,
     snapshot_id: i64,
     commit_uuid: Uuid,
     manifest_counter: &mut u64,
@@ -747,7 +819,11 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // graduation can otherwise move most of the table in one commit; cap it and
     // graduate the COLDEST refs first — the rest stay hot and graduate on later
     // collapses (eventually consistent, bounded per-commit work).
-    if let Some(cap) = max_graduate {
+    // Two independent bounds, whichever is tighter: the caller's per-collapse
+    // graduation cap, and (when folding) the per-pass fold batch. Deferring a
+    // node keeps it HOT, so it is folded on the pass that finally graduates it —
+    // nothing crosses into cold unfolded.
+    if let Some(cap) = effective_graduation_cap(max_graduate, fold_leaves) {
         if closed_refs.len() > cap {
             closed_refs.sort_by_key(|(_, mx)| *mx);
             for (mf, _) in closed_refs.split_off(cap) {
@@ -828,9 +904,21 @@ pub(crate) async fn fold_closed_into_bucket_index(
     }
     let nodes_moved = graduated_nodes.len();
 
-    // Materialize any closed inline files into new partition-tight cold leaves.
+    // Closed inline files become partition-tight cold leaves. When folding is
+    // on they are instead seeded into the fold batch below, so inline files and
+    // graduating nodes land in ONE clustered write — otherwise the same
+    // partition would get a leaf from each source, and the invariant is one
+    // leaf per partition per graduation, not per source kind.
     let mut inline_leaves = 0usize;
-    if !closed_inline_files.is_empty() {
+    let mut folded_entries: Vec<ManifestEntry> = Vec::new();
+    if fold_leaves.is_some() {
+        folded_entries.extend(closed_inline_files.into_iter().map(|df| {
+            ManifestEntry::builder()
+                .status(ManifestStatus::Existing)
+                .data_file(df)
+                .build()
+        }));
+    } else if !closed_inline_files.is_empty() {
         let grad_entries: Vec<ManifestEntry> = closed_inline_files
             .into_iter()
             .map(|df| {
@@ -865,7 +953,76 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // dangling refs ⇒ 404 after grace. So: a graduating node with any pending
     // removal is MATERIALIZED here (leaf rewritten keeping only non-removed alive
     // entries). Nodes with no pending removal still move by cheap reference.
-    if removed_paths.is_empty() {
+    //
+    // When leaf folding is on, all of that is subsumed: every graduating DATA
+    // node is read anyway, so removals are filtered in the same pass and the
+    // survivors are re-clustered by partition — one leaf per partition tuple
+    // instead of one per source node. Delete-content manifests are never folded
+    // (different entry semantics; they must not be welded into a data manifest)
+    // and keep the by-reference path.
+    let mut folded_leaves_out: usize = 0;
+    if fold_leaves.is_some() {
+        let (to_fold, by_ref): (Vec<ManifestFile>, Vec<ManifestFile>) = graduated_nodes
+            .into_iter()
+            .partition(|mf| mf.content == ManifestContentType::Data);
+        cold_leaves.extend(by_ref);
+
+        let load_start = std::time::Instant::now();
+        let file_io = table.file_io();
+        let nodes_folded = to_fold.len();
+        let mut s = stream_iter(to_fold.into_iter().map(|mf| {
+            let file_io = file_io.clone();
+            async move {
+                let res = mf.load_manifest(&file_io).await;
+                (mf, res)
+            }
+        }))
+        .buffer_unordered(FOLD_MANIFEST_FETCH_CONCURRENCY);
+        while let Some((mf, res)) = s.next().await {
+            match res {
+                Ok(manifest) => folded_entries
+                    .extend(fold_surviving_entries(manifest.entries(), removed_paths)),
+                // Best-effort, mirroring the materialize path below: a node we
+                // can't read still has to graduate, so fall back to moving it
+                // by reference rather than failing the whole commit.
+                Err(e) => {
+                    log::warn!(
+                        "graduation fold: could not load {} to fold, moving by reference: {e}",
+                        mf.manifest_path
+                    );
+                    cold_leaves.push(mf);
+                }
+            }
+        }
+        let load_ms = load_start.elapsed().as_millis() as u64;
+
+        let fold_write_start = std::time::Instant::now();
+        let entries_in = folded_entries.len();
+        let new_leaves = write_entries_clustered(
+            table,
+            &schema,
+            spec.as_ref(),
+            format_version,
+            snapshot_id,
+            commit_uuid,
+            manifest_counter,
+            false,
+            folded_entries,
+            true,
+        )
+        .await?;
+        let leaves_out = new_leaves.len();
+        cold_leaves.extend(new_leaves);
+        folded_leaves_out = leaves_out;
+        log::info!(
+            "graduation fold: nodes_folded={} entries={} leaves_out={} load_ms={} write_ms={}",
+            nodes_folded,
+            entries_in,
+            leaves_out,
+            load_ms,
+            fold_write_start.elapsed().as_millis() as u64,
+        );
+    } else if removed_paths.is_empty() {
         cold_leaves.extend(graduated_nodes);
     } else {
         for mf in graduated_nodes {
@@ -971,7 +1128,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
 
     let cold_leaves_total = cold_leaves.len();
     log::info!(
-        "tiered collapse-fold sub-phase: total_ms={} bi_load_ms={} ttl_prune_ms={} classify_ms={} write_ms={} entries={} cold_leaves={} nodes_moved={} inline_leaves={} ttl_fallback_loads={} classify_fallback_loads={} sidecar_hits={} sidecar_misses={} outcome=changed",
+        "tiered collapse-fold sub-phase: total_ms={} bi_load_ms={} ttl_prune_ms={} classify_ms={} write_ms={} entries={} cold_leaves={} nodes_moved={} folded_leaves={} inline_leaves={} ttl_fallback_loads={} classify_fallback_loads={} sidecar_hits={} sidecar_misses={} outcome=changed",
         fold_started.elapsed().as_millis() as u64,
         bi_load_ms,
         ttl_prune_ms,
@@ -980,6 +1137,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
         entries_total,
         cold_leaves_total,
         nodes_moved,
+        folded_leaves_out,
         inline_leaves,
         ttl_prune_fallback_loads,
         classify_fallback_loads,
@@ -1038,6 +1196,7 @@ impl GraduateBucketsAction {
             None, // manual/maintenance use: no per-collapse cap
             None, // TTL retention drop is driven only by the commit_v4 collapse
             0,
+            self.fold_leaves,
             snapshot_id,
             commit_uuid,
             &mut manifest_counter,
@@ -1106,7 +1265,7 @@ impl GraduateBucketsAction {
             .get("root-manifest.incremental")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let do_delta = incremental && head_meta.chain_depth < MAX_CHAIN;
+        let do_delta = incremental && head_meta.chain_depth < max_chain_depth();
 
         let new_rm_metadata = RootManifestMetadata {
             schema: schema.clone(),
@@ -1266,7 +1425,7 @@ impl TransactionAction for GraduateBucketsAction {
                 .await?;
             let (head_meta, _) = read_root_manifest(head_bytes)?;
             head_meta.bucket_index_path == prep.prep_bucket_index_path
-                && head_meta.chain_depth < MAX_CHAIN
+                && head_meta.chain_depth < max_chain_depth()
         } else {
             false
         };
@@ -1324,6 +1483,63 @@ mod tests {
 
     fn removed(paths: &[&str]) -> HashSet<String> {
         paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    // The fold must enforce the SAME removal filter as the by-reference path's
+    // `plan_graduated_node` — it replaces that path, so a gap here re-opens the
+    // 2026-07-16 dangling-reference bug on every folded node.
+    #[test]
+    fn fold_drops_removed_files() {
+        let entries = vec![alive_entry("a"), alive_entry("b"), alive_entry("c")];
+        let kept = fold_surviving_entries(&entries, &removed(&["b"]));
+        let paths: Vec<&str> = kept.iter().map(|e| e.data_file().file_path()).collect();
+        assert_eq!(paths, vec!["a", "c"]);
+        assert!(
+            kept.iter().all(|e| e.status() == ManifestStatus::Existing),
+            "folded entries carry into a new leaf as Existing"
+        );
+    }
+
+    // Nothing pending → every alive entry survives the fold (no silent loss).
+    #[test]
+    fn fold_keeps_everything_when_nothing_removed() {
+        let entries = vec![alive_entry("a"), alive_entry("b")];
+        assert_eq!(fold_surviving_entries(&entries, &removed(&[])).len(), 2);
+        assert_eq!(fold_surviving_entries(&entries, &removed(&["x"])).len(), 2);
+    }
+
+    // A node whose files were ALL merged away contributes nothing — the
+    // by-reference path's `Skip` outcome, reached by producing zero entries.
+    #[test]
+    fn fold_yields_nothing_when_all_removed() {
+        let entries = vec![alive_entry("a"), alive_entry("b")];
+        assert!(fold_surviving_entries(&entries, &removed(&["a", "b"])).is_empty());
+    }
+
+    // The two bounds compose as a min, and either one alone still binds. The
+    // tighter-of-the-two rule is what keeps a node from graduating unfolded.
+    #[test]
+    fn graduation_cap_takes_the_tighter_bound() {
+        assert_eq!(effective_graduation_cap(Some(16), Some(256)), Some(16));
+        assert_eq!(effective_graduation_cap(Some(512), Some(256)), Some(256));
+        assert_eq!(effective_graduation_cap(Some(16), None), Some(16));
+        assert_eq!(effective_graduation_cap(None, Some(256)), Some(256));
+        assert_eq!(effective_graduation_cap(None, None), None);
+    }
+
+    // Folding is opt-in per writer: `with_leaf_fold(0)` means "off", so the
+    // by-reference path stays reachable without a rebuild.
+    #[test]
+    fn leaf_fold_is_opt_in_and_zero_disables() {
+        assert_eq!(GraduateBucketsAction::new(1, 0).fold_leaves, None);
+        assert_eq!(
+            GraduateBucketsAction::new(1, 0).with_leaf_fold(256).fold_leaves,
+            Some(256)
+        );
+        assert_eq!(
+            GraduateBucketsAction::new(1, 0).with_leaf_fold(0).fold_leaves,
+            None
+        );
     }
 
     // No pending removal touches the node → cheap by-reference graduation.

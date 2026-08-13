@@ -53,6 +53,47 @@ pub fn generate_unique_snapshot_id(table: &Table) -> i64 {
 
 const META_ROOT_PATH: &str = "metadata";
 
+/// Default chain-depth cap for the incremental delta path.
+pub(crate) const DEFAULT_MAX_CHAIN: u32 = 64;
+
+/// Env var overriding [`DEFAULT_MAX_CHAIN`] for THIS process.
+pub(crate) const MAX_CHAIN_ENV: &str = "ICEBERG_ROOT_MANIFEST_MAX_CHAIN";
+
+/// Chain-depth cap at which an incremental root collapses back to a flat base.
+///
+/// **Per-writer, deliberately.** `chain_depth` carries two unrelated concerns on
+/// one counter: "how deep is the read chain" (a correctness/latency bound, the
+/// same for everyone) and "when do we consolidate refs" (a maintenance cadence,
+/// which is a per-writer choice). Only the collapse path runs
+/// `merge_manifests_if_needed`, so the cap is also the ONLY thing deciding how
+/// often manifest refs get merged.
+///
+/// On sri-olly that coupling stalled consolidation outright: tessellate's
+/// `rebalance_root_manifest` writes a fresh BASE root (`chain_depth: 0`) every
+/// ~10 min, so the chain never approached 64 (observed 1→36 within a tick,
+/// `do_delta=true` on 36 of 36 commits), the collapse never fired, and root refs
+/// grew without bound (`entries_in_root=2171`). Letting the maintenance writer
+/// pick a LOW cap makes it collapse — and therefore consolidate — on its own
+/// cadence, while laminar's hot ingest keeps the default 64 and its O(1)
+/// per-commit delta.
+///
+/// Read once per process; `0`/unparseable ⇒ the default. Mirrored by
+/// `graduate_buckets` and `compact_cold_tier`, which must agree on the cap.
+pub(crate) fn max_chain_depth() -> u32 {
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| parse_max_chain(std::env::var(MAX_CHAIN_ENV).ok().as_deref()))
+}
+
+/// Pure half of [`max_chain_depth`], so the precedence rules are testable
+/// without touching process env (which `OnceLock` would cache anyway). A `0`
+/// cap would collapse on every commit and never write a delta, so it is
+/// rejected in favour of the default rather than honoured.
+pub(crate) fn parse_max_chain(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_CHAIN)
+}
+
 /// Extract a grouping key from the partition values at the given field positions.
 /// Empty partition / no positions → "__empty__"; each position encodes its value
 /// (or "__null__" for a null field, "__oob__" for an out-of-range position),
@@ -1387,7 +1428,7 @@ impl<'a> SnapshotProducer<'a> {
             .get("root-manifest.incremental")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        const MAX_CHAIN: u32 = 64;
+        let max_chain = max_chain_depth();
         let current_root_path: Option<String> = self
             .table
             .metadata()
@@ -1398,7 +1439,7 @@ impl<'a> SnapshotProducer<'a> {
         // merge-on-write (remove small inputs, add merged output) stays O(1).
         let do_delta = incremental
             && current_root_path.is_some()
-            && current_chain_depth < MAX_CHAIN;
+            && current_chain_depth < max_chain;
         // Fires on EVERY v4 commit, so delta-path and collapse-path commits can
         // be counted separately. Without this the two are indistinguishable in
         // `actions_ms` and a spike cannot be attributed: a collapse should be
@@ -1411,7 +1452,7 @@ impl<'a> SnapshotProducer<'a> {
             do_delta,
             incremental,
             current_chain_depth,
-            MAX_CHAIN,
+            max_chain,
             entries.len()
         );
         // Ref-resident tombstones carried forward from the chain on a collapse.
@@ -1862,6 +1903,11 @@ impl<'a> SnapshotProducer<'a> {
                                 Some(max_graduate),
                                 retention_cutoff_micros,
                                 max_ttl_drop_files,
+                                // Leaf folding is a maintenance-writer choice
+                                // (tessellate opts in via `with_leaf_fold`); a
+                                // hot-path collapse keeps the by-reference move
+                                // so ingest never pays N manifest reads.
+                                None,
                                 self.snapshot_id,
                                 fold_uuid,
                                 &mut fold_counter,
@@ -2599,7 +2645,9 @@ mod test_v4_commit {
         DataContentType, DataFile, DataFileFormat, FormatVersion, NestedField, PrimitiveType,
         Schema, Struct, Type,
     };
-    use super::{partition_grouping_key, resolve_grouping_positions};
+    use super::{
+        parse_max_chain, partition_grouping_key, resolve_grouping_positions, DEFAULT_MAX_CHAIN,
+    };
     use crate::TableUpdate;
     use crate::transaction::Transaction;
     use crate::transaction::action::{ApplyTransactionAction, TransactionAction};
@@ -2614,6 +2662,23 @@ mod test_v4_commit {
             ])
             .build()
             .unwrap()
+    }
+
+    /// The chain cap is per-writer so a maintenance writer can collapse — and
+    /// therefore consolidate refs — far more often than ingest. Absent or
+    /// unusable config must land on the historical 64, since that value is
+    /// baked into the collapse e2e tests below and into laminar's live tuning.
+    #[test]
+    fn max_chain_parses_per_writer_override() {
+        assert_eq!(parse_max_chain(Some("8")), 8);
+        assert_eq!(parse_max_chain(Some("  8 ")), 8);
+        assert_eq!(parse_max_chain(None), DEFAULT_MAX_CHAIN);
+        assert_eq!(parse_max_chain(Some("")), DEFAULT_MAX_CHAIN);
+        assert_eq!(parse_max_chain(Some("nope")), DEFAULT_MAX_CHAIN);
+        assert_eq!(parse_max_chain(Some("-1")), DEFAULT_MAX_CHAIN);
+        // 0 would collapse on every commit and never write a delta — the
+        // opposite of the incremental root's purpose, so it is refused.
+        assert_eq!(parse_max_chain(Some("0")), DEFAULT_MAX_CHAIN);
     }
 
     fn test_data_file(path: &str) -> DataFile {
@@ -3207,6 +3272,124 @@ mod test_v4_commit {
         let mut df = test_data_file(path);
         df.upper_bounds = HashMap::from([(1, crate::spec::Datum::long(ts))]);
         df
+    }
+
+    /// Count leaves in a table's current cold bucket-index (0 if none yet).
+    async fn cold_leaf_count(table: &crate::table::Table) -> usize {
+        let (meta, _) = read_head_root(table).await;
+        match &meta.bucket_index_path {
+            None => 0,
+            Some(bp) => {
+                let bytes = table.file_io().new_input(bp).unwrap().read().await.unwrap();
+                crate::spec::bucket_index::read_bucket_index(bytes)
+                    .unwrap()
+                    .leaves()
+                    .len()
+            }
+        }
+    }
+
+    /// Graduate closed hot nodes and report (cold leaves BEFORE the action,
+    /// cold leaves after, cold data files after). `fold = None` is the
+    /// by-reference path; `Some(n)` opts into leaf folding.
+    async fn graduate_and_measure_cold(
+        name: &str,
+        fold: Option<usize>,
+    ) -> (usize, usize, usize) {
+        const NODES: usize = 8;
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new(format!("test_grad_fold_{name}"));
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let mut table = catalog
+            .create_table(&ns, tiered_table_creation(name, 3600))
+            .await
+            .unwrap();
+
+        // One append per commit — laminar's shape, one hot node each. Stays
+        // under the chain cap so no collapse fires and all NODES refs are still
+        // hot when the action runs.
+        for i in 0..NODES {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![ts_data_file(
+                    &format!("s3://bucket/data/{name}_{i}.parquet"),
+                    1000, // far below the cutoff ⇒ closed
+                )])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+
+        // Setup itself can graduate (a collapse during the appends), so the
+        // cold tier may be non-empty before the action runs. Measure the DELTA.
+        let leaves_before = cold_leaf_count(&table).await;
+
+        let mut action =
+            crate::transaction::graduate_buckets::GraduateBucketsAction::new(1, i64::MAX / 2);
+        if let Some(n) = fold {
+            action = action.with_leaf_fold(n);
+        }
+        let mut ac = Arc::new(action).commit(&table).await.unwrap();
+        let bi_path = ac
+            .take_manifest_paths()
+            .into_iter()
+            .find(|p| p.contains("bucket-index-"))
+            .expect("graduation wrote a bucket-index");
+        let bytes = table
+            .file_io()
+            .new_input(&bi_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let bi = crate::spec::bucket_index::read_bucket_index(bytes).unwrap();
+        let mut files = 0usize;
+        for leaf in bi.leaves() {
+            let manifest = leaf.load_manifest(table.file_io()).await.unwrap();
+            files += manifest.entries().iter().filter(|e| e.is_alive()).count();
+        }
+        (leaves_before, bi.leaves().len(), files)
+    }
+
+    /// By-reference graduation makes the COLD tier inherit the HOT tier's
+    /// manifest granularity: one leaf per source node, i.e. one per ~15-30s
+    /// laminar commit. Every cold-tier pass is O(leaves) — `compact_cold_tier`
+    /// loads each leaf manifest at prep — so that count is what sets tessellate's
+    /// tick cost, and on sri-olly it grew unbounded (1,282 → 1,615 leaves in a
+    /// day, `nodes_moved=719` in one tick).
+    ///
+    /// Folding re-clusters the graduating nodes by partition instead, so the
+    /// cold tier is shaped by the DATA (one leaf per partition tuple) rather
+    /// than by how often the writer happened to commit. The data itself must be
+    /// identical either way — a fold that loses a file is the 2026-07-16 bug.
+    #[tokio::test]
+    async fn test_v4_graduation_fold_clusters_nodes_into_partition_leaves() {
+        let (ref_before, ref_after, ref_files) =
+            graduate_and_measure_cold("v4gradbyref", None).await;
+        let (fold_before, fold_after, fold_files) =
+            graduate_and_measure_cold("v4gradfold", Some(256)).await;
+
+        // Growth is what matters: by-reference adds one leaf per source node,
+        // folding adds one per partition tuple. The test schema is
+        // unpartitioned, so everything graduating collapses into a single leaf.
+        assert_eq!(
+            ref_after - ref_before,
+            7,
+            "by-reference graduation adds one cold leaf per source node"
+        );
+        assert_eq!(
+            fold_after - fold_before,
+            1,
+            "folding adds one leaf per partition, independent of node count"
+        );
+        // Folding changes manifest LAYOUT only. It rewrites the nodes it
+        // graduates and leaves already-cold leaves alone, so it bounds the RATE
+        // of leaf growth, not the existing stock.
+        assert_eq!(ref_before, fold_before, "same setup on both paths");
+        assert_eq!(ref_files, fold_files, "folding must not change the data");
+        assert_eq!(fold_files, 8, "no data file may be lost in the fold");
     }
 
     /// Regression for the graduate-durability bug. The old standalone graduate

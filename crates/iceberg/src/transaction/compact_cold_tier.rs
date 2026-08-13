@@ -87,12 +87,11 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::action::TransactionAction;
-use crate::transaction::snapshot::SnapshotProducer;
+use crate::transaction::snapshot::{max_chain_depth, SnapshotProducer};
 use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
-const MAX_CHAIN: u32 = 64;
 
 /// Cached prep from a prior `commit()` attempt on the same
 /// [`CompactColdTierAction`] instance. See the module doc for the retry-cheap
@@ -453,7 +452,7 @@ impl CompactColdTierAction {
             .get("root-manifest.incremental")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let do_delta = incremental && head_meta.chain_depth < MAX_CHAIN;
+        let do_delta = incremental && head_meta.chain_depth < max_chain_depth();
 
         let new_rm_metadata = RootManifestMetadata {
             schema: schema.clone(),
@@ -633,7 +632,7 @@ impl TransactionAction for CompactColdTierAction {
                 .await?;
             let (head_meta, _) = read_root_manifest(head_bytes)?;
             head_meta.bucket_index_path == prep.prep_bucket_index_path
-                && head_meta.chain_depth < MAX_CHAIN
+                && head_meta.chain_depth < max_chain_depth()
         } else {
             false
         };

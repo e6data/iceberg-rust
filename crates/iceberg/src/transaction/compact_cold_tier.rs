@@ -71,6 +71,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::{iter as stream_iter, StreamExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -82,8 +83,9 @@ use crate::spec::root_manifest::{
     RootManifestMetadata,
 };
 use crate::spec::{
-    DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, Summary, MAIN_BRANCH,
+    DataFile, Datum, FormatVersion, Literal, ManifestEntry, ManifestFile, ManifestStatus,
+    Operation, Snapshot, SnapshotReference, SnapshotRetention, Struct, StructType, Summary, Type,
+    MAIN_BRANCH,
 };
 use crate::table::Table;
 use crate::transaction::action::TransactionAction;
@@ -202,6 +204,71 @@ fn apply_removals(files: Vec<DataFile>, removed: &HashSet<String>) -> (Vec<DataF
     (survivors, affected)
 }
 
+/// Concurrency for the cold-leaf load that survives the partition prune.
+/// Matches the fold's fanout in `graduate_buckets`; well inside S3's
+/// per-client budget.
+const COLD_LEAF_FETCH_CONCURRENCY: usize = 32;
+
+/// Could `leaf` hold a data file belonging to any partition in `targets`?
+///
+/// Answers "no" ONLY when the leaf's partition summary is TIGHT — `lower ==
+/// upper` on every field, which is exactly what partition-scoped cold leaves
+/// are — and the value it is pinned to matches no target. Everything else
+/// (no targets, absent summary, arity mismatch, a wide field, a value we
+/// can't encode) answers "yes" and the leaf is loaded as before.
+///
+/// Comparison is byte equality against `Datum::to_bytes`, the same encoding
+/// the manifest writer used to build the summary. Equality only — no ordering
+/// — because byte order does not track value order for every primitive type,
+/// and a range test would be silently wrong for signed integers. Pure.
+fn leaf_may_hold_partitions(
+    leaf: &ManifestFile,
+    targets: &HashSet<Struct>,
+    partition_type: &StructType,
+) -> bool {
+    if targets.is_empty() {
+        return true;
+    }
+    let Some(summary) = leaf.partitions.as_ref() else {
+        return true;
+    };
+    let fields = partition_type.fields();
+    if summary.len() != fields.len() {
+        return true;
+    }
+    // Every field must be tight, else we cannot rule the leaf out at all.
+    let mut pinned: Vec<&[u8]> = Vec::with_capacity(summary.len());
+    for fs in summary.iter() {
+        match (&fs.lower_bound, &fs.upper_bound) {
+            (Some(lo), Some(hi)) if lo == hi => pinned.push(lo.as_ref()),
+            _ => return true,
+        }
+    }
+    targets.iter().any(|target| {
+        let values = target.fields();
+        if values.len() != fields.len() {
+            return true;
+        }
+        for (idx, field) in fields.iter().enumerate() {
+            let Some(Literal::Primitive(p)) = &values[idx] else {
+                // Null or nested partition value — not encodable as a bound
+                // here, so don't claim a mismatch.
+                return true;
+            };
+            let Type::Primitive(pt) = &field.field_type.as_ref() else {
+                return true;
+            };
+            let Ok(bytes) = Datum::new(pt.clone(), p.clone()).to_bytes() else {
+                return true;
+            };
+            if bytes.as_ref() != pinned[idx] {
+                return false;
+            }
+        }
+        true
+    })
+}
+
 fn existing_entry(df: DataFile) -> ManifestEntry {
     ManifestEntry::builder()
         .status(ManifestStatus::Existing)
@@ -253,8 +320,63 @@ impl CompactColdTierAction {
         let removed_paths_set: HashSet<String> =
             rm_metadata.removed_paths.iter().cloned().collect();
 
-        for leaf in leaves {
-            let manifest = leaf.load_manifest(table.file_io()).await?;
+        // Needed by the partition prune below as well as the rewrite further
+        // down, so resolve it once here.
+        let spec = table.metadata().default_partition_spec().clone();
+        let partition_type = spec.partition_type(table.metadata().current_schema())?;
+
+        // Narrow the walk before doing any I/O.
+        //
+        // Prep only loads a leaf to answer ONE question: does it hold any path
+        // in `self.removed`? Leaves that answer "no" are re-emitted as the very
+        // `ManifestFile` ref that `read_bucket_index` already returned — so
+        // fetching them was pure waste. Serial + unfiltered, that made prep
+        // scale with the whole cold tier: on sri-olly 6,698 metrics_1m leaves ×
+        // ~26 ms/GET = the measured 175 s of a 294 s tick (2,021 logs leaves →
+        // 61 s, 611 metrics → 17-23 s; the model fits all three).
+        //
+        // A compaction never crosses partitions — its merged outputs live in
+        // the same partitions as the inputs it removes — and cold leaves are
+        // written partition-tight, so a leaf whose summary pins it to some
+        // OTHER partition provably cannot hold a removed path. That is decided
+        // from the bucket-index alone, with no S3 read. Whatever survives the
+        // prune is then loaded in parallel, so the conservative fallbacks below
+        // stay fast too.
+        //
+        // Conservative by construction: the prune skips a leaf only when the
+        // summary PROVES it can't match. No target partitions (pure-removal
+        // caller), an absent summary, or a wide one ⇒ load it.
+        let target_partitions: HashSet<Struct> =
+            self.added.iter().map(|df| df.partition.clone()).collect();
+        let (candidates, pruned): (Vec<ManifestFile>, Vec<ManifestFile>) = leaves
+            .into_iter()
+            .partition(|leaf| leaf_may_hold_partitions(leaf, &target_partitions, &partition_type));
+        let pruned_count = pruned.len();
+        // A pruned leaf is unaffected by definition — carry it forward as-is.
+        for leaf in pruned {
+            kept_leaf_refs.push(RootManifestEntry::ManifestRef {
+                manifest_file: leaf,
+                mdv: None,
+            });
+        }
+
+        let scan_start = std::time::Instant::now();
+        let candidate_count = candidates.len();
+        let file_io = table.file_io();
+        // `buffered`, not `_unordered`: leaf order drives the resulting
+        // bucket-index, and a deterministic index is worth the head-of-line
+        // wait at this concurrency.
+        let mut loaded = stream_iter(candidates.into_iter().map(|leaf| {
+            let file_io = file_io.clone();
+            async move {
+                let res = leaf.load_manifest(&file_io).await;
+                (leaf, res)
+            }
+        }))
+        .buffered(COLD_LEAF_FETCH_CONCURRENCY);
+
+        while let Some((leaf, manifest)) = loaded.next().await {
+            let manifest = manifest?;
             let files: Vec<DataFile> = manifest
                 .entries()
                 .iter()
@@ -273,6 +395,15 @@ impl CompactColdTierAction {
                 });
             }
         }
+        log::info!(
+            "compact_cold_tier leaf scan: leaves={} pruned_by_partition={} loaded={} \
+             target_partitions={} scan_ms={}",
+            pruned_count + candidate_count,
+            pruned_count,
+            candidate_count,
+            target_partitions.len(),
+            scan_start.elapsed().as_millis() as u64,
+        );
 
         // If nothing matched the removal set and there's nothing to add, no-op.
         if !any_affected && self.added.is_empty() {
@@ -309,8 +440,6 @@ impl CompactColdTierAction {
         let schema = table.metadata().current_schema().clone();
         let format_version = table.metadata().format_version();
         let commit_uuid = self.commit_uuid;
-        let spec = table.metadata().default_partition_spec().clone();
-        let partition_type = spec.partition_type(table.metadata().current_schema())?;
         let mut manifest_counter: u64 = 0;
 
         let mut rewrite_entries = survivors;
@@ -691,6 +820,131 @@ mod tests {
         let (survivors, affected) = apply_removals(files, &removed);
         assert!(!affected);
         assert_eq!(survivors.len(), 2);
+    }
+
+    fn leaf_with(partitions: Option<Vec<crate::spec::FieldSummary>>) -> ManifestFile {
+        ManifestFile {
+            manifest_path: "s3://b/leaf.parquet".to_string(),
+            manifest_length: 4096,
+            partition_spec_id: 0,
+            content: crate::spec::ManifestContentType::Data,
+            sequence_number: 5,
+            min_sequence_number: 1,
+            added_snapshot_id: 100,
+            added_files_count: Some(10),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1000),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions,
+            key_metadata: None,
+            first_row_id: None,
+        }
+    }
+
+    /// Single Long partition field, matching the `hour`-style specs in use.
+    fn long_partition_type() -> StructType {
+        StructType::new(vec![crate::spec::NestedField::required(
+            1000,
+            "p",
+            Type::Primitive(crate::spec::PrimitiveType::Long),
+        )
+        .into()])
+    }
+
+    fn long_partition(v: i64) -> Struct {
+        Struct::from_iter([Some(Literal::Primitive(crate::spec::PrimitiveLiteral::Long(
+            v,
+        )))])
+    }
+
+    fn tight_summary(v: i64) -> Option<Vec<crate::spec::FieldSummary>> {
+        let bytes = Datum::long(v).to_bytes().unwrap();
+        Some(vec![crate::spec::FieldSummary {
+            contains_null: false,
+            contains_nan: Some(false),
+            lower_bound: Some(bytes.clone()),
+            upper_bound: Some(bytes),
+        }])
+    }
+
+    // The prune is what stops prep from scaling with the whole cold tier
+    // (6,698 leaves × ~26ms/GET = 175s on sri-olly). A tight leaf pinned to a
+    // partition none of the targets match provably holds no removed path.
+    #[test]
+    fn tight_leaf_in_another_partition_is_pruned() {
+        let pt = long_partition_type();
+        let targets: HashSet<Struct> = [long_partition(7)].into_iter().collect();
+        assert!(!leaf_may_hold_partitions(
+            &leaf_with(tight_summary(9)),
+            &targets,
+            &pt
+        ));
+        assert!(leaf_may_hold_partitions(
+            &leaf_with(tight_summary(7)),
+            &targets,
+            &pt
+        ));
+    }
+
+    // Every way of NOT knowing must load the leaf. Pruning on a guess here
+    // silently drops data files out of the rewrite.
+    #[test]
+    fn prune_is_conservative_when_it_cannot_prove_a_mismatch() {
+        let pt = long_partition_type();
+        let targets: HashSet<Struct> = [long_partition(7)].into_iter().collect();
+
+        // No targets at all (pure-removal caller) — nothing to prune against.
+        assert!(leaf_may_hold_partitions(
+            &leaf_with(tight_summary(9)),
+            &HashSet::new(),
+            &pt
+        ));
+        // No summary.
+        assert!(leaf_may_hold_partitions(&leaf_with(None), &targets, &pt));
+        // Summary arity disagrees with the spec.
+        assert!(leaf_may_hold_partitions(
+            &leaf_with(Some(vec![])),
+            &targets,
+            &pt
+        ));
+        // Wide field (lower != upper) — the leaf spans values, so it may match.
+        let wide = Some(vec![crate::spec::FieldSummary {
+            contains_null: false,
+            contains_nan: Some(false),
+            lower_bound: Some(Datum::long(1).to_bytes().unwrap()),
+            upper_bound: Some(Datum::long(99).to_bytes().unwrap()),
+        }]);
+        assert!(leaf_may_hold_partitions(&leaf_with(wide), &targets, &pt));
+        // Missing bound.
+        let half = Some(vec![crate::spec::FieldSummary {
+            contains_null: false,
+            contains_nan: Some(false),
+            lower_bound: Some(Datum::long(7).to_bytes().unwrap()),
+            upper_bound: None,
+        }]);
+        assert!(leaf_may_hold_partitions(&leaf_with(half), &targets, &pt));
+    }
+
+    // Any ONE matching target keeps the leaf — a batched swap spans several
+    // partitions and each leaf only has to match one of them.
+    #[test]
+    fn leaf_matching_any_target_partition_is_kept() {
+        let pt = long_partition_type();
+        let targets: HashSet<Struct> = [long_partition(1), long_partition(7), long_partition(42)]
+            .into_iter()
+            .collect();
+        assert!(leaf_may_hold_partitions(
+            &leaf_with(tight_summary(42)),
+            &targets,
+            &pt
+        ));
+        assert!(!leaf_may_hold_partitions(
+            &leaf_with(tight_summary(43)),
+            &targets,
+            &pt
+        ));
     }
 
     #[test]

@@ -880,6 +880,50 @@ mod test_row_lineage {
         );
     }
 
+    /// M4 real-code — expiring an ancestor snapshot must not break the CURRENT
+    /// snapshot's reachability (a corollary of "no lost committed data": data a
+    /// live snapshot references stays readable through snapshot expiry). Drives the
+    /// real `remove_snapshots` metadata builder + the real scan planner.
+    #[tokio::test]
+    async fn dst_expire_old_snapshot_keeps_current_reachable() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        let a = dst_data_file("test/A.parquet", 10);
+        let tx = Transaction::new(&table);
+        let tx = tx.fast_append().add_data_files(vec![a]).apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let old_snap = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        let b = dst_data_file("test/B.parquet", 20);
+        let tx = Transaction::new(&table);
+        let tx = tx.fast_append().add_data_files(vec![b]).apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let before = dst_live_paths(&table).await;
+        assert!(
+            before.contains("test/A.parquet") && before.contains("test/B.parquet"),
+            "precondition: current sees both appends"
+        );
+
+        // Expire the OLD (ancestor) snapshot via the real metadata builder.
+        let expired_meta = table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .remove_snapshots(&[old_snap])
+            .build()
+            .unwrap()
+            .metadata;
+        let expired = table.with_metadata(std::sync::Arc::new(expired_meta));
+
+        let after = dst_live_paths(&expired).await;
+        assert!(
+            after.contains("test/A.parquet") && after.contains("test/B.parquet"),
+            "expiring an ancestor snapshot broke current-snapshot reachability: {after:?}"
+        );
+    }
+
     /// M4 (OPEN INVESTIGATION). Running `replace_data_files` (delete files + add a
     /// merged one) in ISOLATION on a v3-minimal table does NOT reflect the deletion
     /// through the scan planner — the live set still shows the replaced files —

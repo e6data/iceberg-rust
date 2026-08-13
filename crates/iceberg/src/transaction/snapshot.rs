@@ -1396,6 +1396,7 @@ impl<'a> SnapshotProducer<'a> {
         // `actions_ms` and a spike cannot be attributed: a collapse should be
         // roughly 1-in-MAX_CHAIN, so if slow commits outnumber collapses the
         // cost is contention/retries rather than the collapse itself.
+        let v4_start = std::time::Instant::now();
         log::info!(
             "v4 commit path: do_delta={} incremental={} chain_depth={} max_chain={} \
              carried_entries={}",
@@ -1688,6 +1689,24 @@ impl<'a> SnapshotProducer<'a> {
         } else {
             Vec::new()
         };
+        // Tombstone accounting. On an incremental tiered root every removal is
+        // recorded here as a path string rather than an MDV, and the set is
+        // CARRIED FORWARD commit to commit — so it grows until a sweep retires
+        // it. This is the leading suspect for why tessellate's remove-heavy
+        // commits cost 28-35x laminar's append-only ones on the SAME tables
+        // (logs p50 3,970ms vs 112ms; metrics 3,168ms vs 114ms) while the
+        // freshly-rebuilt metrics_1m is identical for both (107ms vs 104ms).
+        // Precedent: this set previously reached 430k paths / 108 MB of a
+        // 132 MB root before rebalance began sweeping it into MDVs.
+        log::info!(
+            "v4 removal tombstones: carried={} new_removals={} matched_inline={} total={} \
+             sweep_min={}",
+            node_removed_paths.len().saturating_sub(paths_to_remove.len()),
+            paths_to_remove.len(),
+            matched_inline.len(),
+            node_removed_paths.len(),
+            sweep_min_paths
+        );
 
         // Add new data files as inline entries
         let added_data_files = std::mem::take(&mut self.added_data_files);
@@ -2165,6 +2184,10 @@ impl<'a> SnapshotProducer<'a> {
                 n_delete_manifests,
                 flush_start.elapsed().as_millis() as u64,
                 tiered
+            );
+            log::info!(
+                "v4 elapsed at flush end: v4_ms={}",
+                v4_start.elapsed().as_millis() as u64
             );
         }
 

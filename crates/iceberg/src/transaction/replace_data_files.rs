@@ -291,6 +291,51 @@ fn build_target_partition_bytes(
 /// `upper_bound` are present and equal (single-value summary). When a
 /// range or missing bounds are encountered the field is conservatively
 /// treated as a possible match.
+/// Diagnostic companion to [`manifest_could_contain_target_files`]: is this
+/// manifest's summary provably disjoint from the targets on any partition
+/// field, using RANGE comparison rather than the single-value equality the
+/// pruning function requires?
+///
+/// Pure measurement — nothing branches on this. It exists to size the prize
+/// before changing behaviour: a manifest counted here was loaded from S3 even
+/// though its own bounds show it cannot hold a target file. For the
+/// observability tables the interesting field is `timestamp_hour`, where a
+/// cold-tier leaf sits entirely below the graduation cutoff while every target
+/// is at or above it.
+///
+/// Byte-comparing bounds is sound for the transforms in use here
+/// (identity strings, hour-as-int) because their serialised forms are
+/// order-preserving. Deliberately conservative: any field it cannot reason
+/// about contributes nothing rather than a false "disjoint".
+fn summary_disjoint_from_targets(
+    partitions: &[FieldSummary],
+    target_partition_bytes: &[HashSet<Vec<u8>>],
+) -> bool {
+    for (i, summary) in partitions.iter().enumerate() {
+        let targets = match target_partition_bytes.get(i) {
+            Some(t) if !t.is_empty() => t,
+            _ => continue,
+        };
+        let (Some(lower), Some(upper)) = (&summary.lower_bound, &summary.upper_bound) else {
+            continue;
+        };
+        let (lo, hi): (&[u8], &[u8]) = (lower.as_ref(), upper.as_ref());
+        // Disjoint iff EVERY target falls outside [lo, hi]. Length-differing
+        // encodings are skipped rather than guessed at.
+        let all_outside = targets.iter().all(|t| {
+            let t: &[u8] = t.as_slice();
+            if t.len() != lo.len() || t.len() != hi.len() {
+                return false;
+            }
+            t < lo || t > hi
+        });
+        if all_outside {
+            return true;
+        }
+    }
+    false
+}
+
 fn manifest_could_contain_target_files(
     partitions: &[FieldSummary],
     target_partition_bytes: &[HashSet<Vec<u8>>],
@@ -420,7 +465,42 @@ impl SnapshotProduceOperation for ReplaceOperation {
         let schema = metadata.current_schema();
         let mut partition_bytes_by_spec: HashMap<i32, Vec<HashSet<Vec<u8>>>> = HashMap::new();
 
+        // ── Walk instrumentation: measurement only, no behaviour change. ──
+        //
+        // This loop is the body of the `actions_ms` that dominates tessellate's
+        // tick — measured 96.6s across 26 commits on `logs` (p50 3.35s each),
+        // while the root it produces is only ~16 KB and the catalog round-trip
+        // is ~0 ms. So the cost is here, in walking and loading manifests.
+        //
+        // The open question these settle: tessellate commits target ONE closed
+        // hour and ONE partition, and cold-tier bucket-index leaves hold hours
+        // older than the graduation cutoff, so they cannot contain the target
+        // files. Yet nothing in this loop is hour-aware —
+        // `manifest_could_contain_target_files` prunes only when a field's
+        // lower_bound == upper_bound, so a leaf spanning ANY range is loaded no
+        // matter how far its hours sit from the target.
+        //
+        // If `loaded` is dominated by entries whose hour range is disjoint from
+        // the target, the fix is hour-RANGE pruning off the leaf summaries (the
+        // same LVI Phase 6 and the pre-graduate check already use). If `loaded`
+        // turns out small and the time is elsewhere, the hypothesis is wrong
+        // and these numbers say so — which is the point of measuring first.
+        let walk_start = std::time::Instant::now();
+        let mut n_total: usize = 0;
+        let mut n_skip_inactive: usize = 0;
+        let mut n_skip_short_circuit: usize = 0;
+        let mut n_skip_summary: usize = 0;
+        let mut n_loaded: usize = 0;
+        let mut load_micros: u128 = 0;
+        // Hour-disjointness tally: of the manifests we actually paid an S3 GET
+        // for, how many had a timestamp_hour range that does not overlap the
+        // targets? Those are the provably-wasted loads that hour-range pruning
+        // would eliminate. Counted from the SAME FieldSummary bounds the
+        // pruning function reads, so no extra I/O.
+        let mut n_loaded_hour_disjoint: usize = 0;
+
         for manifest_entry in manifest_list.entries() {
+            n_total += 1;
             // NOTE: The previous fast-path here used `delete_manifests` to drop
             // an entire manifest_entry without inspecting its contents. This is
             // unsafe whenever a single manifest file holds entries for files
@@ -440,12 +520,14 @@ impl SnapshotProduceOperation for ReplaceOperation {
 
             // Skip manifests with no active files
             if !manifest_entry.has_added_files() && !manifest_entry.has_existing_files() {
+                n_skip_inactive += 1;
                 continue;
             }
 
             // Short-circuit: if all files to delete have been found,
             // keep remaining manifests as-is without loading them from S3.
             if remaining_to_delete.is_empty() {
+                n_skip_short_circuit += 1;
                 result_manifests.push(manifest_entry.clone());
                 continue;
             }
@@ -467,15 +549,29 @@ impl SnapshotProduceOperation for ReplaceOperation {
                 if !target_bytes.is_empty()
                     && !manifest_could_contain_target_files(summaries, target_bytes)
                 {
+                    n_skip_summary += 1;
                     result_manifests.push(manifest_entry.clone());
                     continue;
+                }
+
+                // About to pay an S3 GET. Record whether this manifest's
+                // partition-field ranges are DISJOINT from the targets on any
+                // field — i.e. a load that hour-range pruning would have
+                // avoided. Uses only the summary bounds already in hand.
+                if !target_bytes.is_empty()
+                    && summary_disjoint_from_targets(summaries, target_bytes)
+                {
+                    n_loaded_hour_disjoint += 1;
                 }
             }
 
             // Load the manifest to check if any of its entries need to be deleted
+            n_loaded += 1;
+            let load_start = std::time::Instant::now();
             let manifest = manifest_entry
                 .load_manifest(snapshot_produce.table.file_io())
                 .await?;
+            load_micros += load_start.elapsed().as_micros();
 
             // Check if this manifest contains any files we need to delete
             let entries = manifest.entries();
@@ -586,6 +682,27 @@ impl SnapshotProduceOperation for ReplaceOperation {
             result_manifests.push(new_manifest_file);
         }
 
+        // One line per commit. `loaded` is the S3-GET count that
+        // `manifest_could_contain_target_files` could not prune;
+        // `loaded_hour_disjoint` is the subset provably unable to hold a
+        // target, i.e. the waste that hour-RANGE pruning would remove.
+        // `load_ms` vs `walk_ms` separates I/O from CPU so a slow walk is not
+        // misread as slow S3.
+        log::info!(
+            "replace_data_files: manifest walk entries_total={} skipped_inactive={} \
+             skipped_short_circuit={} skipped_by_summary={} loaded={} \
+             loaded_hour_disjoint={} load_ms={} walk_ms={} targets={}",
+            n_total,
+            n_skip_inactive,
+            n_skip_short_circuit,
+            n_skip_summary,
+            n_loaded,
+            n_loaded_hour_disjoint,
+            (load_micros / 1000) as u64,
+            walk_start.elapsed().as_millis() as u64,
+            self.files_to_delete.len()
+        );
+
         // Validate that all files_to_delete were found
         if !remaining_to_delete.is_empty() {
             return Err(Error::new(
@@ -614,5 +731,123 @@ impl SnapshotProduceOperation for ReplaceOperation {
         }
 
         Ok(result_manifests)
+    }
+}
+
+#[cfg(test)]
+mod walk_pruning_tests {
+    use std::collections::HashSet;
+
+    use serde_bytes::ByteBuf;
+
+    use super::{manifest_could_contain_target_files, summary_disjoint_from_targets};
+    use crate::spec::FieldSummary;
+
+    fn summary(lo: &[u8], hi: &[u8]) -> FieldSummary {
+        FieldSummary {
+            contains_null: false,
+            contains_nan: Some(false),
+            lower_bound: Some(ByteBuf::from(lo.to_vec())),
+            upper_bound: Some(ByteBuf::from(hi.to_vec())),
+        }
+    }
+
+    fn targets(vals: &[&[u8]]) -> Vec<HashSet<Vec<u8>>> {
+        vec![vals.iter().map(|v| v.to_vec()).collect()]
+    }
+
+    /// The gap this instrumentation exists to size.
+    ///
+    /// A cold-tier leaf covering hours 100-200 cannot hold a file from hour
+    /// 500, and its own summary proves it. But the pruning function only fires
+    /// on `lower == upper`, so it says "keep" and the caller pays an S3 GET.
+    /// The diagnostic sees the range and reports the load as wasted.
+    #[test]
+    fn range_leaf_is_loaded_despite_being_provably_disjoint() {
+        let s = vec![summary(&[0, 100], &[0, 200])];
+        let t = targets(&[&[1, 244]]); // well above the upper bound
+        assert!(
+            manifest_could_contain_target_files(&s, &t),
+            "pruning keeps it — only single-value bounds are prunable"
+        );
+        assert!(
+            summary_disjoint_from_targets(&s, &t),
+            "but the range proves it cannot contain the target"
+        );
+    }
+
+    /// Overlap must never be reported as disjoint — that is the direction that
+    /// would lose data if this ever drove behaviour.
+    #[test]
+    fn overlapping_range_is_not_disjoint() {
+        let s = vec![summary(&[0, 100], &[0, 200])];
+        assert!(!summary_disjoint_from_targets(&s, &targets(&[&[0, 150]])));
+        assert!(!summary_disjoint_from_targets(&s, &targets(&[&[0, 100]]))); // on the lower edge
+        assert!(!summary_disjoint_from_targets(&s, &targets(&[&[0, 200]]))); // on the upper edge
+    }
+
+    /// Disjoint only when EVERY target is outside; one inside is enough to
+    /// require the load.
+    #[test]
+    fn any_target_inside_range_means_not_disjoint() {
+        let s = vec![summary(&[0, 100], &[0, 200])];
+        assert!(!summary_disjoint_from_targets(
+            &s,
+            &targets(&[&[0, 150], &[1, 244]])
+        ));
+        assert!(summary_disjoint_from_targets(
+            &s,
+            &targets(&[&[0, 5], &[1, 244]])
+        ));
+    }
+
+    /// Single-value bounds: the pruning function already handles these, and
+    /// the diagnostic must agree rather than double-count them as waste.
+    #[test]
+    fn single_value_bounds_agree_with_pruning() {
+        let s = vec![summary(&[0, 7], &[0, 7])];
+        assert!(!manifest_could_contain_target_files(
+            &s,
+            &targets(&[&[0, 9]])
+        ));
+        assert!(summary_disjoint_from_targets(&s, &targets(&[&[0, 9]])));
+        assert!(manifest_could_contain_target_files(
+            &s,
+            &targets(&[&[0, 7]])
+        ));
+        assert!(!summary_disjoint_from_targets(&s, &targets(&[&[0, 7]])));
+    }
+
+    /// Conservative on anything it cannot reason about: differing encoded
+    /// widths, absent bounds, and empty targets all yield "not disjoint".
+    #[test]
+    fn unreasonable_input_is_never_called_disjoint() {
+        // width mismatch
+        let s = vec![summary(&[0, 100], &[0, 200])];
+        assert!(!summary_disjoint_from_targets(&s, &targets(&[&[5]])));
+        // missing bounds
+        let none = vec![FieldSummary {
+            contains_null: false,
+            contains_nan: Some(false),
+            lower_bound: None,
+            upper_bound: None,
+        }];
+        assert!(!summary_disjoint_from_targets(&none, &targets(&[&[0, 9]])));
+        // no targets for the field
+        assert!(!summary_disjoint_from_targets(&s, &[HashSet::new()]));
+        assert!(!summary_disjoint_from_targets(&s, &[]));
+    }
+
+    /// Multi-field: disjointness on ANY field is sufficient, which mirrors the
+    /// observability spec where timestamp_hour discriminates but the leading
+    /// signallake_tenant field has cardinality ~1 and never does.
+    #[test]
+    fn disjoint_on_any_field_is_enough() {
+        let s = vec![summary(&[1], &[1]), summary(&[0, 100], &[0, 200])];
+        let t = vec![
+            [vec![1u8]].into_iter().collect::<HashSet<_>>(), // matches field 0
+            [vec![1u8, 244]].into_iter().collect::<HashSet<_>>(), // disjoint on field 1
+        ];
+        assert!(summary_disjoint_from_targets(&s, &t));
     }
 }

@@ -29,6 +29,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -265,6 +267,26 @@ pub struct RebalanceRootManifestAction {
     /// callers that need it (e.g. small tables where extra commit round-trips
     /// dominate the wall clock).
     max_manifests_per_commit: Option<usize>,
+    /// Rewritten Phase-A outputs, memoised by (source manifest path, source
+    /// MDV bytes), so a CAS retry reuses the S3 work instead of redoing it.
+    ///
+    /// Rebalance consolidates CLOSED-hour leaves. That work is disjoint from
+    /// laminar's hot appends, and the outputs are fresh UUID-addressed S3
+    /// objects — the old manifests are not removed until the root swap — so a
+    /// delayed or lost CAS does not invalidate them. Only the small root
+    /// write has to be redone. Same reasoning `compact_cold_tier` documents
+    /// for its `PreparedCompaction`: "UUID-addressed and safe to reuse across
+    /// CAS retries. The only per-retry work is writing the small delta root."
+    ///
+    /// The key includes the source MDV: if a concurrent writer tombstoned
+    /// more rows in that leaf, the cached rewrite is stale and must be
+    /// recomputed. Keyed rather than all-or-nothing so one changed leaf does
+    /// not discard the other N-1 rewrites.
+    ///
+    /// This is what `max_manifests_per_commit` was compensating for — its own
+    /// doc says it bounds "retry state ... not the total". With reuse, the cap
+    /// bounds only the FIRST pass.
+    rewrite_cache: Arc<Mutex<HashMap<(String, Option<Vec<u8>>), Vec<ManifestFile>>>>,
     /// Optional (hour_field_idx, max_hour) filter — skip rewriting root entries
     /// whose partition hour is strictly greater than `max_hour`. Used by
     /// callers that need to leave the CURRENT hour's entries alone to avoid
@@ -290,6 +312,7 @@ impl RebalanceRootManifestAction {
             mdv_compaction_threshold: DEFAULT_MDV_COMPACTION_THRESHOLD,
             partition_scoped: false,
             max_manifests_per_commit: None,
+            rewrite_cache: Arc::new(Mutex::new(HashMap::new())),
             hour_filter: None,
             commit_uuid: Uuid::now_v7(),
         }
@@ -532,6 +555,7 @@ impl TransactionAction for RebalanceRootManifestAction {
 
         // Separate entries into manifest refs and inline entries
         let mut new_entries: Vec<RootManifestEntry> = Vec::new();
+        let mut cache_hits: usize = 0;
 
         // Task #485: track how many manifests Phase A has actually rewritten
         // this invocation. When `max_manifests_per_commit` is set, we stop
@@ -620,6 +644,25 @@ impl TransactionAction for RebalanceRootManifestAction {
                 //         each pulling from source entries by index.
                 //     Only one output writer is live at a time, so peak =
                 //     one row-group buffer + the small indices map.
+                // Reuse a prior rewrite of this exact (source manifest, MDV)
+                // if we already produced one in an earlier CAS attempt. The
+                // outputs are fresh UUID-addressed S3 objects and the source
+                // is a closed-hour leaf, so nothing about them goes stale when
+                // a commit loses the race — only the root write must be redone.
+                let cache_key = (manifest_file.manifest_path.clone(), mdv.clone());
+                if let Some(cached) = self.rewrite_cache.lock().await.get(&cache_key) {
+                    for mf in cached.iter().cloned() {
+                        new_entries.push(RootManifestEntry::ManifestRef {
+                            manifest_file: mf,
+                            mdv: None,
+                        });
+                    }
+                    rewrites_done += 1;
+                    cache_hits += 1;
+                    continue;
+                }
+                let mut produced: Vec<ManifestFile> = Vec::new();
+
                 let manifest = manifest_file.load_manifest(table.file_io()).await?;
                 let spec_id = manifest_file.partition_spec_id;
                 let spec = table
@@ -671,6 +714,7 @@ impl TransactionAction for RebalanceRootManifestAction {
                         )
                         .await?;
                         manifest_counter += 1;
+                        produced.push(mf.clone());
                         new_entries.push(RootManifestEntry::ManifestRef {
                             manifest_file: mf,
                             mdv: None,
@@ -699,11 +743,13 @@ impl TransactionAction for RebalanceRootManifestAction {
                     )
                     .await?;
                     manifest_counter += 1;
+                    produced.push(mf.clone());
                     new_entries.push(RootManifestEntry::ManifestRef {
                         manifest_file: mf,
                         mdv: None,
                     });
                 }
+                self.rewrite_cache.lock().await.insert(cache_key, produced);
             }
         }
 

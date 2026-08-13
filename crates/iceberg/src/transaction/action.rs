@@ -47,6 +47,15 @@ pub(crate) trait TransactionAction: AsAny + Sync + Send {
     /// An `ActionCommit` containing table updates and table requirements,
     /// or an error if the commit fails.
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit>;
+
+    /// Whether this action must disable the commit retry loop. An action returns
+    /// `true` when a retry after a commit conflict could reuse now-stale inputs and
+    /// corrupt data. `ReplaceDataFiles` overrides this: a retry with a stale
+    /// delete-file list can duplicate or resurrect data, so the whole transaction
+    /// must fail fast and let the caller re-plan against the fresh table.
+    fn disables_retry(&self) -> bool {
+        false
+    }
 }
 
 /// A helper trait for applying a `TransactionAction` to a `Transaction`.
@@ -69,6 +78,9 @@ pub trait ApplyTransactionAction {
 impl<T: TransactionAction + 'static> ApplyTransactionAction for T {
     fn apply(self, mut tx: Transaction) -> Result<Transaction>
     where Self: Sized {
+        if self.disables_retry() {
+            tx.disable_retry = true;
+        }
         tx.actions.push(Arc::new(self));
         Ok(tx)
     }

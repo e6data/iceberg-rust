@@ -102,9 +102,10 @@ pub struct Transaction {
     actions: Vec<BoxedTransactionAction>,
     first_attempt: bool,
     created_manifest_paths: Vec<String>,
-    /// When true, OCC commit failures are not retried. Set automatically
-    /// when the transaction contains ReplaceDataFiles — retry with a stale
-    /// delete-file list produces duplicate data.
+    /// When true, OCC commit failures are not retried. Set automatically by
+    /// `apply` for any action whose `TransactionAction::disables_retry()` returns
+    /// true — currently ReplaceDataFiles, because retrying with a stale delete-file
+    /// list produces duplicate or resurrected data.
     disable_retry: bool,
 }
 
@@ -1192,15 +1193,15 @@ mod test_row_lineage {
     /// is that the loser's retry reuses its stale delete-list (RetryMode::Naive →
     /// re-deletes an already-gone file / resurrects a merged one → duplicate data).
     ///
-    /// FINDING: the fork carries a `Transaction::disable_retry` field, commented as
-    /// "Set automatically when the transaction contains ReplaceDataFiles", intended to
-    /// make the loser fail-fast. It is read in the retry guard (`… && !disable_retry`)
-    /// but is SET NOWHERE — the mitigation is unwired. So the loser actually RETRIES.
-    /// This test pins the real safety property regardless: after both transactions
-    /// resolve, the authoritative committed state must have NO duplicate and NO
-    /// resurrected (winner-deleted) file — which holds only if the retry re-derives
-    /// against the fresh base (the `occ.rs` "Safe" path), not if it reuses the stale
-    /// plan. That is what makes the current behavior tolerable despite the dead knob.
+    /// MITIGATION: `ReplaceDataFilesAction::disables_retry()` returns `true`, so
+    /// `apply` sets `Transaction::disable_retry` and the retry guard
+    /// (`e.retryable() && !disable_retry`) refuses to retry the loser — it fails fast
+    /// and the caller must re-plan against the fresh table. This test pins the safety
+    /// property either way: after both transactions resolve, the authoritative
+    /// committed state must have NO duplicate and NO resurrected (winner-deleted)
+    /// file. The `Err` arm (fail-fast, current behavior) leaves the winner's state
+    /// untouched; the `Ok` arm (were retry re-enabled) would require the retry to
+    /// re-derive against the fresh base — either way, no corruption.
     #[tokio::test]
     async fn dst_v4_conflicting_replace_no_dup_no_resurrect() {
         let catalog = new_memory_catalog().await;

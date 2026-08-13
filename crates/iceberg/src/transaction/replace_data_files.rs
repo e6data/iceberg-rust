@@ -186,6 +186,14 @@ impl ReplaceDataFilesAction {
 
 #[async_trait]
 impl TransactionAction for ReplaceDataFilesAction {
+    /// A retry after a commit conflict could re-apply this action's delete-file list
+    /// against a table where those files are already gone (or add its merged file a
+    /// second time), duplicating or resurrecting data. Fail the transaction fast
+    /// instead so the caller re-plans the compaction against the fresh snapshot.
+    fn disables_retry(&self) -> bool {
+        true
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let mut snapshot_producer = SnapshotProducer::new(
             table,

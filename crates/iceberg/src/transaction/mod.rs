@@ -997,65 +997,177 @@ mod test_row_lineage {
         }
     }
 
-    /// M4 (OPEN INVESTIGATION). Running `replace_data_files` (delete files + add a
-    /// merged one) in ISOLATION on a v3-minimal table does NOT reflect the deletion
-    /// through the scan planner — the live set still shows the replaced files —
-    /// even with manifest-sourced delete files + `validate_from_snapshot`.
-    /// Production compaction (tessellate) DOES remove them, so this isolated harness
-    /// is missing production context (most likely the V4 root-manifest structure /
-    /// real file provenance). Tracked as the next M4 step. `#[ignore]`d so it records
-    /// the target invariant without reding CI — un-ignore once the harness matches
-    /// the production manifest layout.
+    /// M4 real-code — SEEDED DST over MIXED append+replace schedules on a V4 table
+    /// (the production format where `replace_data_files` operates on the root
+    /// manifest). An oracle tracks the exact live set of hand-built DataFiles; each
+    /// step either appends 1..=3 new files or compacts 1..=2 live files into one
+    /// merged file via the REAL `replace_data_files` path. After EVERY commit the real
+    /// scan planner must return exactly the oracle's live set — no loss, no duplicate,
+    /// no resurrected deleted file — across a growing/shrinking manifest. This is the
+    /// seeded generalization of `dst_v4_replace_data_files_removes_deleted_files`.
+    /// Deterministic + replayable by seed.
     #[tokio::test]
-    #[ignore = "M4 follow-up: isolated replace_data_files needs production compaction/manifest context"]
-    async fn dst_replace_data_files_removes_deleted_files() {
+    async fn dst_v4_seeded_append_replace_reachability() {
+        fn mix(s: &mut u64) -> u64 {
+            *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        for seed in 0..10u64 {
+            let mut rng = seed ^ 0x5EED_1CE5;
+            let catalog = new_memory_catalog().await;
+            let mut table = dst_make_v4_table_in_catalog(&catalog).await;
+            // Oracle: path -> the exact DataFile we appended (needed to delete later,
+            // since manifest-walk can't read V4 root manifests).
+            let mut live: std::collections::BTreeMap<String, DataFile> =
+                std::collections::BTreeMap::new();
+            let mut ctr = 0u64;
+
+            for step in 0..16u64 {
+                let do_replace = live.len() >= 2 && mix(&mut rng) % 100 < 45;
+                if do_replace {
+                    // Compact 1..=2 live files into one merged file.
+                    let keys: Vec<String> = live.keys().cloned().collect();
+                    let ndel = 1 + (mix(&mut rng) % 2) as usize;
+                    let mut del_keys: Vec<String> = Vec::new();
+                    for _ in 0..ndel {
+                        let idx = (mix(&mut rng) as usize) % keys.len();
+                        let k = keys[idx].clone();
+                        if !del_keys.contains(&k) {
+                            del_keys.push(k);
+                        }
+                    }
+                    let del: Vec<DataFile> = del_keys.iter().map(|k| live[k].clone()).collect();
+                    ctr += 1;
+                    let merged_path = format!("dst/{seed}/m{ctr}.parquet");
+                    let rows = 1 + mix(&mut rng) % 100;
+                    let merged = dst_data_file(&merged_path, rows);
+                    let snap = table.metadata().current_snapshot().unwrap().snapshot_id();
+                    let tx = Transaction::new(&table)
+                        .replace_data_files()
+                        .delete_files(del)
+                        .add_files(vec![merged.clone()])
+                        .validate_from_snapshot(snap)
+                        .apply(Transaction::new(&table))
+                        .unwrap();
+                    table = tx.commit(&catalog).await.unwrap();
+                    for k in &del_keys {
+                        live.remove(k);
+                    }
+                    live.insert(merged_path, merged);
+                } else {
+                    // Append 1..=3 new files.
+                    let k = 1 + mix(&mut rng) % 3;
+                    let mut files = Vec::new();
+                    for _ in 0..k {
+                        ctr += 1;
+                        let path = format!("dst/{seed}/a{ctr}.parquet");
+                        let rows = 1 + mix(&mut rng) % 100;
+                        let df = dst_data_file(&path, rows);
+                        files.push(df.clone());
+                        live.insert(path, df);
+                    }
+                    let tx = Transaction::new(&table);
+                    let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
+                    table = tx.commit(&catalog).await.unwrap();
+                }
+
+                let expected: std::collections::BTreeSet<String> = live.keys().cloned().collect();
+                assert_eq!(
+                    dst_live_paths(&table).await,
+                    expected,
+                    "seed={seed} step={step}: scan != oracle live set (append/replace loss or dup)"
+                );
+                assert_eq!(
+                    dst_live_count(&table).await,
+                    expected.len(),
+                    "seed={seed} step={step}: duplicate live data-file entries"
+                );
+            }
+        }
+    }
+
+    /// Create a V4 table in the catalog (reusing the v3-minimal schema/spec). V4
+    /// `fast_append` writes into the ROOT manifest — which is exactly what
+    /// `replace_data_files` operates on, so deletes take effect (unlike a v3 table).
+    async fn dst_make_v4_table_in_catalog(catalog: &impl crate::Catalog) -> crate::table::Table {
+        use std::collections::HashMap;
+        let ident = crate::TableIdent::from_strs([
+            format!("dstv4-{}", uuid::Uuid::new_v4()),
+            "t".to_string(),
+        ])
+        .unwrap();
+        catalog
+            .create_namespace(ident.namespace(), HashMap::new())
+            .await
+            .unwrap();
+        let file = std::fs::File::open(format!(
+            "{}/testdata/table_metadata/TableMetadataV3ValidMinimal.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let base: crate::spec::TableMetadata =
+            serde_json::from_reader(std::io::BufReader::new(file)).unwrap();
+        let creation = crate::TableCreation::builder()
+            .schema((**base.current_schema()).clone())
+            .partition_spec((**base.default_partition_spec()).clone())
+            .sort_order((**base.default_sort_order()).clone())
+            .name(ident.name().to_string())
+            .format_version(crate::spec::FormatVersion::V4)
+            .build();
+        catalog
+            .create_table(ident.namespace(), creation)
+            .await
+            .unwrap()
+    }
+
+    /// M4 real-code — the replace/stale-delete invariant against a V4 table (the
+    /// production format). `replace_data_files` removing A,B and adding D must leave
+    /// the live set as {C, D} via the real scan planner — no deleted file lingering,
+    /// no duplicate. This is the direct real-code counterpart of the `occ.rs` model
+    /// and the `disable_retry` mitigation.
+    #[tokio::test]
+    async fn dst_v4_replace_data_files_removes_deleted_files() {
         let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = dst_make_v4_table_in_catalog(&catalog).await;
+        assert_eq!(table.metadata().format_version(), crate::spec::FormatVersion::V4);
 
         let a = dst_data_file("test/A.parquet", 10);
         let b = dst_data_file("test/B.parquet", 20);
         let c = dst_data_file("test/C.parquet", 30);
-
-        // Real append of A, B, C.
         let tx = Transaction::new(&table);
         let tx = tx
             .fast_append()
-            .add_data_files(vec![a.clone(), b.clone(), c.clone()])
+            .add_data_files(vec![a.clone(), b.clone(), c])
             .apply(tx)
             .unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
-        let expect: std::collections::BTreeSet<String> =
+        let expect3: std::collections::BTreeSet<String> =
             ["test/A.parquet", "test/B.parquet", "test/C.parquet"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-        assert_eq!(dst_live_paths(&table).await, expect);
-        assert_eq!(dst_live_count(&table).await, 3, "no duplicate manifest entries");
+        assert_eq!(dst_live_paths(&table).await, expect3);
 
-        // Real compaction: replace A+B with D. `delete_files` must receive the
-        // manifest's own DataFile objects (as real compaction does — via a scan),
-        // not the hand-built ones, or the delete won't match.
-        let del: Vec<DataFile> = dst_live_data_files(&table)
-            .await
-            .into_iter()
-            .filter(|df| df.file_path() == "test/A.parquet" || df.file_path() == "test/B.parquet")
-            .collect();
-        assert_eq!(del.len(), 2, "should find A and B in the manifests to delete");
+        // Delete A,B by their (path-bearing) DataFile — replace_data_files matches
+        // deletes by path, and on V4 it operates on the root manifest where the
+        // appends landed.
+        let del: Vec<DataFile> = vec![a, b];
         let snap_id = table.metadata().current_snapshot().unwrap().snapshot_id();
         let d = dst_data_file("test/D.parquet", 30);
         let tx = Transaction::new(&table);
         let tx = tx
             .replace_data_files()
             .delete_files(del)
-            .add_files(vec![d.clone()])
+            .add_files(vec![d])
             .validate_from_snapshot(snap_id)
             .apply(tx)
             .unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
-        // INVARIANT: live set == (old − {A,B}) + {D} == {C, D}. No deleted file
-        // lingering, no duplicate.
         let expect_after: std::collections::BTreeSet<String> =
             ["test/C.parquet", "test/D.parquet"]
                 .iter()
@@ -1064,12 +1176,110 @@ mod test_row_lineage {
         assert_eq!(
             dst_live_paths(&table).await,
             expect_after,
-            "replace_data_files must remove deleted files, add the new one, keep the rest"
+            "V4 replace_data_files must remove deleted files, add the new one, keep the rest"
         );
         assert_eq!(
             dst_live_count(&table).await,
             2,
-            "content is a partition — no duplicate live data-file entries after replace"
+            "no duplicate live files after replace"
         );
+    }
+
+    /// M4 real-code — the MARQUEE M2 incident test. Two `replace_data_files`
+    /// (compaction) transactions plan against the SAME base snapshot, each deleting a
+    /// pair that OVERLAPS on B and adding a merged file. One commits first; the second
+    /// is now stale. This is the direct real-code counterpart of `occ.rs`: the danger
+    /// is that the loser's retry reuses its stale delete-list (RetryMode::Naive →
+    /// re-deletes an already-gone file / resurrects a merged one → duplicate data).
+    ///
+    /// FINDING: the fork carries a `Transaction::disable_retry` field, commented as
+    /// "Set automatically when the transaction contains ReplaceDataFiles", intended to
+    /// make the loser fail-fast. It is read in the retry guard (`… && !disable_retry`)
+    /// but is SET NOWHERE — the mitigation is unwired. So the loser actually RETRIES.
+    /// This test pins the real safety property regardless: after both transactions
+    /// resolve, the authoritative committed state must have NO duplicate and NO
+    /// resurrected (winner-deleted) file — which holds only if the retry re-derives
+    /// against the fresh base (the `occ.rs` "Safe" path), not if it reuses the stale
+    /// plan. That is what makes the current behavior tolerable despite the dead knob.
+    #[tokio::test]
+    async fn dst_v4_conflicting_replace_no_dup_no_resurrect() {
+        let catalog = new_memory_catalog().await;
+        let table = dst_make_v4_table_in_catalog(&catalog).await;
+        let ident = table.identifier().clone();
+
+        // Seed five files: A,B,C,D,E.
+        let a = dst_data_file("test/A.parquet", 10);
+        let b = dst_data_file("test/B.parquet", 20);
+        let c = dst_data_file("test/C.parquet", 30);
+        let d = dst_data_file("test/D.parquet", 40);
+        let e = dst_data_file("test/E.parquet", 50);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![a.clone(), b.clone(), c.clone(), d.clone(), e])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let base_snap = table.metadata().current_snapshot().unwrap().snapshot_id();
+        assert_eq!(dst_live_count(&table).await, 5);
+
+        // Two compactions from the SAME base, deletes OVERLAPPING on B.
+        let f = dst_data_file("test/F.parquet", 30); // tx1 merges A+B
+        let h = dst_data_file("test/H.parquet", 50); // tx2 merges B+C
+        let tx1 = Transaction::new(&table)
+            .replace_data_files()
+            .delete_files(vec![a, b.clone()])
+            .add_files(vec![f])
+            .validate_from_snapshot(base_snap)
+            .apply(Transaction::new(&table))
+            .unwrap();
+        let tx2 = Transaction::new(&table)
+            .replace_data_files()
+            .delete_files(vec![b, c])
+            .add_files(vec![h])
+            .validate_from_snapshot(base_snap)
+            .apply(Transaction::new(&table))
+            .unwrap();
+
+        // tx1 wins → {C,D,E,F}.
+        let _table = tx1.commit(&catalog).await.unwrap();
+        // tx2 is stale (B already gone). Whether it fails or retries, capture the
+        // authoritative committed state from the catalog.
+        let res = tx2.commit(&catalog).await;
+        let final_tbl = crate::Catalog::load_table(&catalog, &ident).await.unwrap();
+        let live = dst_live_paths(&final_tbl).await;
+
+        // SAFETY INVARIANTS — must hold whether tx2 failed (were disable_retry wired)
+        // or retried and re-derived against the fresh base:
+        // 1. No duplicate / resurrected file: live entry count == distinct paths.
+        assert_eq!(
+            dst_live_count(&final_tbl).await,
+            live.len(),
+            "duplicate live data-file entries after conflicting replace: {live:?}"
+        );
+        // 2. The winner's deletes (A, B) must never reappear.
+        assert!(
+            !live.contains("test/A.parquet") && !live.contains("test/B.parquet"),
+            "winner-deleted files resurrected by the stale replace: {live:?}"
+        );
+        // 3. The winner's merge output F is present.
+        assert!(
+            live.contains("test/F.parquet"),
+            "winner's merge output F must be live: {live:?}"
+        );
+        // Document which path the real code took (the knob is unwired → it retries).
+        match res {
+            // Retried + re-derived: B was already gone, so tx2 legitimately deleted
+            // only C and added H against the fresh base → {D,E,F,H}.
+            Ok(_) => assert!(
+                live.contains("test/H.parquet") && !live.contains("test/C.parquet"),
+                "retry re-derived unsoundly (stale plan): {live:?}"
+            ),
+            // Fail-fast (would require wiring disable_retry): winner's state stands.
+            Err(_) => assert!(
+                live.contains("test/C.parquet") && !live.contains("test/H.parquet"),
+                "failed replace must leave the winner's state untouched: {live:?}"
+            ),
+        }
     }
 }

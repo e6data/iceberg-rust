@@ -134,8 +134,31 @@ impl TransactionAction for DropColdBucketsAction {
         // makes the decision partition-agnostic.
         let mut kept: Vec<ManifestFile> = Vec::new();
         let mut dropped: Vec<ManifestFile> = Vec::new();
+        // THE COST. This loads EVERY cold leaf manifest from S3, one at a
+        // time, on every TTL run — just to read one number per leaf (max
+        // event-time) and decide keep-vs-drop. Nothing is batched, nothing is
+        // concurrent, and there is no cache consulted.
+        //
+        // Measured 2026-08-13: drop_cold_buckets was the single most expensive
+        // action in the tick — 98.1s across 3 invocations (45.4s logs, 37.2s
+        // metrics_1m, 15.5s metrics) out of 203.1s total actions_ms. Leaf
+        // counts at the time were 1282 / 788 / 550, which at ~30-45ms per
+        // sequential S3 GET reproduces those timings almost exactly.
+        //
+        // That makes the cost strictly O(cold leaves) per TTL run, which is
+        // why it grows as leaves accumulate and why laminar — which never runs
+        // this action — is unaffected on the same tables.
+        //
+        // Note graduate_buckets already maintains a max-ts SIDECAR for exactly
+        // this decision (see its sidecar_hits/sidecar_misses counters). This
+        // path does not consult it.
+        let scan_start = std::time::Instant::now();
+        let n_leaves = leaves.len();
+        let mut load_micros: u128 = 0;
         for leaf in leaves {
+            let load_start = std::time::Instant::now();
             let manifest = leaf.load_manifest(table.file_io()).await?;
+            load_micros += load_start.elapsed().as_micros();
             let files: Vec<DataFile> = manifest
                 .entries()
                 .iter()
@@ -152,6 +175,17 @@ impl TransactionAction for DropColdBucketsAction {
                 dropped.push(leaf);
             }
         }
+
+        log::info!(
+            "drop_cold_buckets scan: leaves={} kept={} dropped={} load_ms={} scan_ms={} \
+             mean_load_ms={:.1}",
+            n_leaves,
+            kept.len(),
+            dropped.len(),
+            (load_micros / 1000) as u64,
+            scan_start.elapsed().as_millis() as u64,
+            if n_leaves > 0 { (load_micros as f64 / 1000.0) / n_leaves as f64 } else { 0.0 }
+        );
 
         if dropped.is_empty() {
             return Ok(ActionCommit::new(vec![], vec![]));

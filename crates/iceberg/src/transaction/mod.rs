@@ -846,6 +846,40 @@ mod test_row_lineage {
         assert_eq!(dst_live_count(&table).await, 5, "append additive: no dup, no loss");
     }
 
+    /// M4 real-code — OCC conflict + RETRY, the "no lost committed data" invariant
+    /// against the actual optimistic-concurrency + retry loop. Two fast_appends read
+    /// the SAME base version; one commits (advancing the catalog), the other's commit
+    /// then conflicts (`CatalogCommitConflicts`) and must RETRY — reload the won
+    /// version and re-apply — landing BOTH appends. If the retry re-applied against
+    /// its stale base instead, the first append would be lost; this asserts it isn't.
+    #[tokio::test]
+    async fn dst_occ_conflict_fast_append_no_loss() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // Both transactions are built from the SAME freshly-created base table.
+        let x = dst_data_file("test/X.parquet", 1);
+        let y = dst_data_file("test/Y.parquet", 1);
+        let tx1 = Transaction::new(&table);
+        let tx1 = tx1.fast_append().add_data_files(vec![x]).apply(tx1).unwrap();
+        let tx2 = Transaction::new(&table);
+        let tx2 = tx2.fast_append().add_data_files(vec![y]).apply(tx2).unwrap();
+
+        // tx1 wins; tx2 is now stale → conflict → real retry loop → must still land.
+        let _v1 = tx1.commit(&catalog).await.unwrap();
+        let v2 = tx2.commit(&catalog).await.unwrap();
+
+        let live = dst_live_paths(&v2).await;
+        assert!(
+            live.contains("test/X.parquet"),
+            "OCC retry LOST the winning commit's append X (retry re-applied a stale base): {live:?}"
+        );
+        assert!(
+            live.contains("test/Y.parquet"),
+            "OCC retry dropped its own append Y: {live:?}"
+        );
+    }
+
     /// M4 (OPEN INVESTIGATION). Running `replace_data_files` (delete files + add a
     /// merged one) in ISOLATION on a v3-minimal table does NOT reflect the deletion
     /// through the scan planner — the live set still shows the replaced files —

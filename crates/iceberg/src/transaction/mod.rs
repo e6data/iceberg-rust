@@ -643,6 +643,8 @@ mod test_row_lineage {
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct,
     };
+    use crate::error::Result;
+    use crate::table::Table;
     use crate::transaction::tests::make_v3_minimal_table_in_catalog;
     use crate::transaction::{ApplyTransactionAction, Transaction};
 
@@ -1276,11 +1278,337 @@ mod test_row_lineage {
                 live.contains("test/H.parquet") && !live.contains("test/C.parquet"),
                 "retry re-derived unsoundly (stale plan): {live:?}"
             ),
-            // Fail-fast (would require wiring disable_retry): winner's state stands.
+            // Fail-fast (disable_retry wired): winner's state stands.
             Err(_) => assert!(
                 live.contains("test/C.parquet") && !live.contains("test/H.parquet"),
                 "failed replace must leave the winner's state untouched: {live:?}"
             ),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // M3 real-code FAULT INJECTION.
+    //
+    // A `Catalog` decorator that injects register (`update_table`) failures. In the
+    // real commit path, an action first WRITES its data/manifest files through FileIO
+    // and only then REGISTERS the new snapshot via the catalog. Failing the register
+    // models the "crash between write and register" incident: the files land in the
+    // store as orphans, but the snapshot must NOT become reachable, and the table must
+    // stay exactly at its prior state (commit atomicity). Injected errors are
+    // non-retryable, so they surface as a failed commit rather than being retried away.
+    // ---------------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct FaultyCatalog<C: crate::Catalog> {
+        inner: C,
+        fail_updates: std::sync::atomic::AtomicUsize,
+        update_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<C: crate::Catalog> FaultyCatalog<C> {
+        fn new(inner: C) -> Self {
+            Self {
+                inner,
+                fail_updates: std::sync::atomic::AtomicUsize::new(0),
+                update_attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        /// Fail the next `n` `update_table` (register) calls, then behave normally.
+        fn fail_next_updates(&self, n: usize) {
+            self.fail_updates
+                .store(n, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<C: crate::Catalog> crate::Catalog for FaultyCatalog<C> {
+        async fn list_namespaces(
+            &self,
+            parent: Option<&crate::NamespaceIdent>,
+        ) -> Result<Vec<crate::NamespaceIdent>> {
+            self.inner.list_namespaces(parent).await
+        }
+        async fn create_namespace(
+            &self,
+            ns: &crate::NamespaceIdent,
+            props: std::collections::HashMap<String, String>,
+        ) -> Result<crate::Namespace> {
+            self.inner.create_namespace(ns, props).await
+        }
+        async fn get_namespace(&self, ns: &crate::NamespaceIdent) -> Result<crate::Namespace> {
+            self.inner.get_namespace(ns).await
+        }
+        async fn namespace_exists(&self, ns: &crate::NamespaceIdent) -> Result<bool> {
+            self.inner.namespace_exists(ns).await
+        }
+        async fn update_namespace(
+            &self,
+            ns: &crate::NamespaceIdent,
+            props: std::collections::HashMap<String, String>,
+        ) -> Result<()> {
+            self.inner.update_namespace(ns, props).await
+        }
+        async fn drop_namespace(&self, ns: &crate::NamespaceIdent) -> Result<()> {
+            self.inner.drop_namespace(ns).await
+        }
+        async fn list_tables(
+            &self,
+            ns: &crate::NamespaceIdent,
+        ) -> Result<Vec<crate::TableIdent>> {
+            self.inner.list_tables(ns).await
+        }
+        async fn create_table(
+            &self,
+            ns: &crate::NamespaceIdent,
+            creation: crate::TableCreation,
+        ) -> Result<Table> {
+            self.inner.create_table(ns, creation).await
+        }
+        async fn load_table(&self, t: &crate::TableIdent) -> Result<Table> {
+            self.inner.load_table(t).await
+        }
+        async fn drop_table(&self, t: &crate::TableIdent) -> Result<()> {
+            self.inner.drop_table(t).await
+        }
+        async fn table_exists(&self, t: &crate::TableIdent) -> Result<bool> {
+            self.inner.table_exists(t).await
+        }
+        async fn rename_table(
+            &self,
+            src: &crate::TableIdent,
+            dst: &crate::TableIdent,
+        ) -> Result<()> {
+            self.inner.rename_table(src, dst).await
+        }
+        async fn register_table(
+            &self,
+            t: &crate::TableIdent,
+            metadata_location: String,
+        ) -> Result<Table> {
+            self.inner.register_table(t, metadata_location).await
+        }
+        async fn update_table(&self, commit: crate::TableCommit) -> Result<Table> {
+            self.update_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let remaining = self.fail_updates.load(std::sync::atomic::Ordering::SeqCst);
+            if remaining > 0 {
+                self.fail_updates
+                    .store(remaining - 1, std::sync::atomic::Ordering::SeqCst);
+                return Err(crate::Error::new(
+                    crate::ErrorKind::Unexpected,
+                    "injected fault: store/catalog unavailable during register \
+                     (crash between write and register)",
+                ));
+            }
+            self.inner.update_table(commit).await
+        }
+    }
+
+    /// M3 real-code — a register fault must be ATOMIC and RECOVERABLE. The data/
+    /// manifest writes for the appended file land, but the catalog register fails.
+    /// The commit must fail, the authoritative table must be unchanged (the new file
+    /// never becomes reachable — it is an orphan for GC, cf. the M1 model), and a
+    /// fresh retry after the fault clears must land the data with no loss or dup.
+    #[tokio::test]
+    async fn dst_fault_commit_register_failure_is_atomic() {
+        let catalog = FaultyCatalog::new(new_memory_catalog().await);
+        let table = dst_make_v4_table_in_catalog(&catalog).await;
+        let ident = table.identifier().clone();
+
+        // Clean commit of A, B.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/A.parquet", 1), dst_data_file("test/B.parquet", 2)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let ab: std::collections::BTreeSet<String> = ["test/A.parquet", "test/B.parquet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(dst_live_paths(&table).await, ab);
+
+        // Inject the register fault, then attempt to append C.
+        catalog.fail_next_updates(1);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/C.parquet", 3)])
+            .apply(tx)
+            .unwrap();
+        let res = tx.commit(&catalog).await;
+        assert!(
+            res.is_err(),
+            "a failed register must surface as a failed commit, not silent success"
+        );
+
+        // ATOMICITY: the authoritative table is unchanged — C never became reachable.
+        let reloaded = crate::Catalog::load_table(&catalog, &ident).await.unwrap();
+        assert_eq!(
+            dst_live_paths(&reloaded).await,
+            ab,
+            "failed commit advanced the table / left a phantom row"
+        );
+
+        // RECOVERY: the fault cleared; a fresh commit of C lands with no loss/dup
+        // (the orphan from the crashed attempt does not interfere).
+        let tx = Transaction::new(&reloaded);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/C.parquet", 3)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let abc: std::collections::BTreeSet<String> =
+            ["test/A.parquet", "test/B.parquet", "test/C.parquet"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(
+            dst_live_paths(&table).await,
+            abc,
+            "recovery commit after a register fault lost or duplicated data"
+        );
+        assert_eq!(dst_live_count(&table).await, 3);
+    }
+
+    /// M3 real-code — a register fault during a REPLACE (compaction) must not delete
+    /// or corrupt data. The replace writes its merged file and plans the deletes, but
+    /// the register fails: the table must stay exactly at {A,B,C} (no half-applied
+    /// compaction), and a clean re-run must then produce {C,D}.
+    #[tokio::test]
+    async fn dst_fault_replace_register_failure_preserves_data() {
+        let catalog = FaultyCatalog::new(new_memory_catalog().await);
+        let table = dst_make_v4_table_in_catalog(&catalog).await;
+        let ident = table.identifier().clone();
+
+        let a = dst_data_file("test/A.parquet", 1);
+        let b = dst_data_file("test/B.parquet", 2);
+        let c = dst_data_file("test/C.parquet", 3);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![a.clone(), b.clone(), c])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let abc: std::collections::BTreeSet<String> =
+            ["test/A.parquet", "test/B.parquet", "test/C.parquet"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(dst_live_paths(&table).await, abc);
+
+        // Replace A,B -> D, but the register faults.
+        catalog.fail_next_updates(1);
+        let snap = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let res = Transaction::new(&table)
+            .replace_data_files()
+            .delete_files(vec![a.clone(), b.clone()])
+            .add_files(vec![dst_data_file("test/D.parquet", 3)])
+            .validate_from_snapshot(snap)
+            .apply(Transaction::new(&table))
+            .unwrap()
+            .commit(&catalog)
+            .await;
+        assert!(res.is_err(), "a faulted replace register must fail the commit");
+
+        // ATOMICITY: nothing deleted, nothing added.
+        let reloaded = crate::Catalog::load_table(&catalog, &ident).await.unwrap();
+        assert_eq!(
+            dst_live_paths(&reloaded).await,
+            abc,
+            "a failed replace half-applied: deleted data or advanced the table"
+        );
+
+        // RECOVERY: clean replace now yields {C,D}.
+        let snap = reloaded.metadata().current_snapshot().unwrap().snapshot_id();
+        let table = Transaction::new(&reloaded)
+            .replace_data_files()
+            .delete_files(vec![a, b])
+            .add_files(vec![dst_data_file("test/D.parquet", 3)])
+            .validate_from_snapshot(snap)
+            .apply(Transaction::new(&reloaded))
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        let cd: std::collections::BTreeSet<String> = ["test/C.parquet", "test/D.parquet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(dst_live_paths(&table).await, cd);
+        assert_eq!(dst_live_count(&table).await, 2);
+    }
+
+    /// M3 real-code — SEEDED fault schedule. Over a random append schedule, randomly
+    /// crash the register before some commits. The invariant across the whole run:
+    /// the reachable set equals EXACTLY the set of successfully-committed files —
+    /// never losing a committed append, never making a crashed (unregistered) write
+    /// reachable. Deterministic + replayable by seed. This is the real-code
+    /// counterpart of the M1 over-deletion/orphan sim.
+    #[tokio::test]
+    async fn dst_fault_seeded_commit_crash_no_loss_no_phantom() {
+        fn mix(s: &mut u64) -> u64 {
+            *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        for seed in 0..10u64 {
+            let mut rng = seed ^ 0xFA01_7ED5;
+            let catalog = FaultyCatalog::new(new_memory_catalog().await);
+            let mut table = dst_make_v4_table_in_catalog(&catalog).await;
+            let ident = table.identifier().clone();
+            let mut oracle: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut ctr = 0u64;
+
+            for step in 0..16u64 {
+                let crash = mix(&mut rng) % 100 < 35;
+                if crash {
+                    catalog.fail_next_updates(1);
+                }
+                let k = 1 + mix(&mut rng) % 3;
+                let mut files = Vec::new();
+                let mut paths = Vec::new();
+                for _ in 0..k {
+                    ctr += 1;
+                    let p = format!("dst/{seed}/f{ctr}.parquet");
+                    files.push(dst_data_file(&p, 1 + mix(&mut rng) % 50));
+                    paths.push(p);
+                }
+                let tx = Transaction::new(&table);
+                let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
+                let res = tx.commit(&catalog).await;
+
+                if crash {
+                    assert!(
+                        res.is_err(),
+                        "seed={seed} step={step}: injected register crash didn't fail the commit"
+                    );
+                    // The crashed writes stay unregistered → reload the prior state.
+                    table = crate::Catalog::load_table(&catalog, &ident).await.unwrap();
+                } else {
+                    table = res.expect("clean commit failed unexpectedly");
+                    for p in paths {
+                        oracle.insert(p);
+                    }
+                }
+
+                assert_eq!(
+                    dst_live_paths(&table).await,
+                    oracle,
+                    "seed={seed} step={step}: reachable set != successfully-committed set \
+                     (lost a commit or a crashed write became reachable)"
+                );
+                assert_eq!(
+                    dst_live_count(&table).await,
+                    oracle.len(),
+                    "seed={seed} step={step}: duplicate reachable files"
+                );
+            }
         }
     }
 }

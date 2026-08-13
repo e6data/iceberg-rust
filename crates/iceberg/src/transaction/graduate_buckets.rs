@@ -957,14 +957,22 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // When leaf folding is on, all of that is subsumed: every graduating DATA
     // node is read anyway, so removals are filtered in the same pass and the
     // survivors are re-clustered by partition — one leaf per partition tuple
-    // instead of one per source node. Delete-content manifests are never folded
-    // (different entry semantics; they must not be welded into a data manifest)
-    // and keep the by-reference path.
+    // instead of one per source node. Two kinds of node are excluded and keep
+    // the by-reference path:
+    //   * delete-content manifests — different entry semantics; they must never
+    //     be welded into a data manifest;
+    //   * nodes written under a non-default partition spec — the fold rewrites
+    //     under the table's CURRENT spec, so restamping them would relabel
+    //     their partitions. Rare (needs a spec evolution) but silent, so it is
+    //     excluded structurally rather than assumed away.
     let mut folded_leaves_out: usize = 0;
     if fold_leaves.is_some() {
-        let (to_fold, by_ref): (Vec<ManifestFile>, Vec<ManifestFile>) = graduated_nodes
-            .into_iter()
-            .partition(|mf| mf.content == ManifestContentType::Data);
+        let default_spec_id = spec.spec_id();
+        let (to_fold, by_ref): (Vec<ManifestFile>, Vec<ManifestFile>) =
+            graduated_nodes.into_iter().partition(|mf| {
+                mf.content == ManifestContentType::Data
+                    && mf.partition_spec_id == default_spec_id
+            });
         cold_leaves.extend(by_ref);
 
         let load_start = std::time::Instant::now();

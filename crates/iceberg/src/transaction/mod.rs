@@ -1113,11 +1113,18 @@ mod test_row_lineage {
         .unwrap();
         let base: crate::spec::TableMetadata =
             serde_json::from_reader(std::io::BufReader::new(file)).unwrap();
+        // Fast retry backoff so transient-fault tests don't spend real wall-time
+        // sleeping between the commit retry loop's attempts.
+        let props = HashMap::from([
+            ("commit.retry.min-wait-ms".to_string(), "1".to_string()),
+            ("commit.retry.max-wait-ms".to_string(), "2".to_string()),
+        ]);
         let creation = crate::TableCreation::builder()
             .schema((**base.current_schema()).clone())
             .partition_spec((**base.default_partition_spec()).clone())
             .sort_order((**base.default_sort_order()).clone())
             .name(ident.name().to_string())
+            .properties(props)
             .format_version(crate::spec::FormatVersion::V4)
             .build();
         catalog
@@ -1302,6 +1309,7 @@ mod test_row_lineage {
     struct FaultyCatalog<C: crate::Catalog> {
         inner: C,
         fail_updates: std::sync::atomic::AtomicUsize,
+        fail_updates_retryable: std::sync::atomic::AtomicUsize,
         update_attempts: std::sync::atomic::AtomicUsize,
     }
 
@@ -1310,13 +1318,26 @@ mod test_row_lineage {
             Self {
                 inner,
                 fail_updates: std::sync::atomic::AtomicUsize::new(0),
+                fail_updates_retryable: std::sync::atomic::AtomicUsize::new(0),
                 update_attempts: std::sync::atomic::AtomicUsize::new(0),
             }
         }
-        /// Fail the next `n` `update_table` (register) calls, then behave normally.
+        /// Fail the next `n` `update_table` (register) calls with a NON-retryable
+        /// error, then behave normally (crash between write and register).
         fn fail_next_updates(&self, n: usize) {
             self.fail_updates
                 .store(n, std::sync::atomic::Ordering::SeqCst);
+        }
+        /// Fail the next `n` `update_table` calls with a RETRYABLE error, then behave
+        /// normally (transient object-store/catalog flakiness the retry loop absorbs).
+        fn fail_next_updates_retryable(&self, n: usize) {
+            self.fail_updates_retryable
+                .store(n, std::sync::atomic::Ordering::SeqCst);
+        }
+        /// Total `update_table` calls observed (each commit attempt is one call).
+        fn attempts(&self) -> usize {
+            self.update_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1399,6 +1420,18 @@ mod test_row_lineage {
                     "injected fault: store/catalog unavailable during register \
                      (crash between write and register)",
                 ));
+            }
+            let retryable = self
+                .fail_updates_retryable
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if retryable > 0 {
+                self.fail_updates_retryable
+                    .store(retryable - 1, std::sync::atomic::Ordering::SeqCst);
+                return Err(crate::Error::new(
+                    crate::ErrorKind::Unexpected,
+                    "injected transient fault: store/catalog temporarily unavailable",
+                )
+                .with_retryable(true));
             }
             self.inner.update_table(commit).await
         }
@@ -1610,5 +1643,220 @@ mod test_row_lineage {
                 );
             }
         }
+    }
+
+    /// M3 real-code — a TRANSIENT (retryable) register fault must be absorbed by the
+    /// real commit retry loop. Two retryable faults are injected before an append;
+    /// the production `backon` loop (default 4 retries) must re-run the commit and
+    /// land the data. Proves the real retry path recovers from flaky object-store /
+    /// catalog register calls — the complement of the non-retryable crash test.
+    #[tokio::test]
+    async fn dst_fault_transient_retryable_append_recovers() {
+        let catalog = FaultyCatalog::new(new_memory_catalog().await);
+        let table = dst_make_v4_table_in_catalog(&catalog).await;
+
+        catalog.fail_next_updates_retryable(2);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/A.parquet", 1)])
+            .apply(tx)
+            .unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("retry loop must absorb transient register faults and land the append");
+
+        let a: std::collections::BTreeSet<String> =
+            ["test/A.parquet"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(dst_live_paths(&table).await, a);
+        // 2 faulted attempts + 1 that succeeded = at least 3 register calls.
+        assert!(
+            catalog.attempts() >= 3,
+            "expected the commit to retry through the injected faults, saw {} attempt(s)",
+            catalog.attempts()
+        );
+    }
+
+    /// M3 real-code — the sharp interaction of the `disable_retry` wiring with a
+    /// RETRYABLE fault. A replace sets `disable_retry`, so even a retryable register
+    /// error must NOT be retried: the commit fails on the first attempt and the table
+    /// is untouched. This is what stops a retry from re-applying the stale delete-list
+    /// (the M2 duplicate incident) even when the failure looks transient.
+    #[tokio::test]
+    async fn dst_fault_transient_retryable_replace_not_retried() {
+        let catalog = FaultyCatalog::new(new_memory_catalog().await);
+        let table = dst_make_v4_table_in_catalog(&catalog).await;
+
+        let a = dst_data_file("test/A.parquet", 1);
+        let b = dst_data_file("test/B.parquet", 2);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![a.clone(), b.clone()])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let attempts_before = catalog.attempts();
+
+        // A single retryable fault would be absorbed by a fast_append; a replace must
+        // refuse to retry and fail immediately.
+        catalog.fail_next_updates_retryable(1);
+        let snap = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let res = Transaction::new(&table)
+            .replace_data_files()
+            .delete_files(vec![a])
+            .add_files(vec![dst_data_file("test/C.parquet", 1)])
+            .validate_from_snapshot(snap)
+            .apply(Transaction::new(&table))
+            .unwrap()
+            .commit(&catalog)
+            .await;
+        assert!(
+            res.is_err(),
+            "disable_retry must suppress retry even for a retryable error on a replace"
+        );
+        assert_eq!(
+            catalog.attempts() - attempts_before,
+            1,
+            "replace must make exactly one register attempt (no retry), saw {}",
+            catalog.attempts() - attempts_before
+        );
+
+        // Table untouched: still {A, B}.
+        let ab: std::collections::BTreeSet<String> = ["test/A.parquet", "test/B.parquet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(dst_live_paths(&table).await, ab);
+    }
+
+    /// M3 real-code — SEEDED transient-fault schedule. Before each append, inject
+    /// 0..=2 retryable register faults; every commit must still land (the retry loop
+    /// absorbs them) and the reachable set must equal the cumulative appended set —
+    /// no loss, no duplicate — under a random storm of transient flakiness.
+    /// Deterministic + replayable by seed.
+    #[tokio::test]
+    async fn dst_fault_seeded_transient_no_loss() {
+        fn mix(s: &mut u64) -> u64 {
+            *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        for seed in 0..8u64 {
+            let mut rng = seed ^ 0x7A11_5EED;
+            let catalog = FaultyCatalog::new(new_memory_catalog().await);
+            let mut table = dst_make_v4_table_in_catalog(&catalog).await;
+            let mut oracle: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut ctr = 0u64;
+
+            for _step in 0..12u64 {
+                let faults = mix(&mut rng) % 3; // 0, 1, or 2 transient faults
+                if faults > 0 {
+                    catalog.fail_next_updates_retryable(faults as usize);
+                }
+                let k = 1 + mix(&mut rng) % 3;
+                let mut files = Vec::new();
+                for _ in 0..k {
+                    ctr += 1;
+                    let p = format!("dst/{seed}/t{ctr}.parquet");
+                    files.push(dst_data_file(&p, 1 + mix(&mut rng) % 50));
+                    oracle.insert(p);
+                }
+                let tx = Transaction::new(&table);
+                let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
+                table = tx
+                    .commit(&catalog)
+                    .await
+                    .expect("append must survive transient faults via the retry loop");
+
+                assert_eq!(
+                    dst_live_paths(&table).await,
+                    oracle,
+                    "seed={seed}: reachable set != cumulative appends under transient faults"
+                );
+                assert_eq!(
+                    dst_live_count(&table).await,
+                    oracle.len(),
+                    "seed={seed}: duplicate reachable files under transient faults"
+                );
+            }
+        }
+    }
+
+    /// M3 real-code — CLOCK SKEW. History is ordered by SEQUENCE NUMBER (skew-immune),
+    /// and snapshot timestamps carry a 1-minute tolerance, so a backwards/skewed wall
+    /// clock can neither reorder history nor slip a stale snapshot in. (OCC conflict
+    /// detection is snapshot-id based — RefSnapshotIdMatch — and is exercised by the
+    /// conflicting-replace tests.) This drives the real MetadataBuilder::add_snapshot
+    /// checks with synthetic snapshots whose (sequence, timestamp) we control.
+    #[tokio::test]
+    async fn dst_clockskew_ordering_and_tolerance() {
+        const ONE_MINUTE_MS: i64 = 60_000;
+        let catalog = new_memory_catalog().await;
+        let table = dst_make_v4_table_in_catalog(&catalog).await;
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/A.parquet", 1)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let cur = table.metadata().current_snapshot().unwrap().clone();
+        let next_row_id = table.metadata().next_row_id();
+        let schema_id = cur.schema_id().unwrap_or(0);
+        let mk = |id_delta: i64, seq: i64, ts: i64| -> crate::spec::Snapshot {
+            crate::spec::Snapshot::builder()
+                .with_snapshot_id(cur.snapshot_id() + id_delta)
+                .with_parent_snapshot_id(Some(cur.snapshot_id()))
+                .with_sequence_number(seq)
+                .with_timestamp_ms(ts)
+                .with_manifest_list(cur.manifest_list().to_string())
+                .with_summary(cur.summary().clone())
+                .with_schema_id(schema_id)
+                .with_row_range(next_row_id, 0u64)
+                .build()
+        };
+
+        // 1. Gross backwards skew (5 min) with a valid higher sequence number —
+        //    REJECTED by the timestamp tolerance guard.
+        let big_skew = mk(1, cur.sequence_number() + 1, cur.timestamp_ms() - 5 * ONE_MINUTE_MS);
+        assert!(
+            table
+                .metadata()
+                .clone()
+                .into_builder(None)
+                .add_snapshot(big_skew)
+                .is_err(),
+            "a snapshot timestamped >1min before the last must be rejected (backwards clock)"
+        );
+
+        // 2. Small skew (10s) within tolerance — ACCEPTED (concurrent machines drift).
+        let small_skew = mk(2, cur.sequence_number() + 1, cur.timestamp_ms() - 10_000);
+        assert!(
+            table
+                .metadata()
+                .clone()
+                .into_builder(None)
+                .add_snapshot(small_skew)
+                .is_ok(),
+            "small (<1min) clock skew must be tolerated"
+        );
+
+        // 3. Non-increasing sequence number (even with a fine timestamp) — REJECTED.
+        //    Ordering is by sequence number, not wall clock: the skew-immune invariant.
+        let stale_seq = mk(3, cur.sequence_number(), cur.timestamp_ms() + 1_000);
+        assert!(
+            table
+                .metadata()
+                .clone()
+                .into_builder(None)
+                .add_snapshot(stale_seq)
+                .is_err(),
+            "a non-increasing sequence number must be rejected (ordering is by sequence, not clock)"
+        );
     }
 }

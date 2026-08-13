@@ -66,6 +66,8 @@
 //! - `new_input`: Create input file for reading.
 //! - `new_output`: Create output file for writing.
 
+#[cfg(all(test, feature = "storage-memory"))]
+pub(crate) mod fault_layer;
 mod file_io;
 mod storage;
 mod write_through_cache;

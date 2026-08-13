@@ -1859,4 +1859,197 @@ mod test_row_lineage {
             "a non-increasing sequence number must be rejected (ordering is by sequence, not clock)"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // M3 real-code BYTE-LEVEL fault injection (below FileIO).
+    //
+    // These use a byte-level opendal fault layer wrapping an in-memory store, so the
+    // fault hits the RAW read/write/delete the commit and scan paths perform — a
+    // manifest write that fails mid-commit, a manifest read that fails during scan
+    // planning. This is strictly deeper than the catalog-level FaultyCatalog, which
+    // can only fail the register step (a fault that has already survived every store
+    // write). Errors from opendal map to non-retryable iceberg errors, so a byte
+    // fault fails the commit outright.
+    // ---------------------------------------------------------------------------
+
+    /// Fallible variant of `dst_live_paths` — a scan whose storage reads may fault.
+    async fn dst_try_live_paths(
+        table: &crate::table::Table,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        use futures::TryStreamExt;
+        let scan = table.scan().select_all().build()?;
+        let tasks: Vec<_> = scan.plan_files().await?.try_collect().await?;
+        Ok(tasks.into_iter().map(|t| t.data_file_path).collect())
+    }
+
+    /// Build a V4 table over an in-memory store wrapped with a byte-level fault layer.
+    async fn dst_make_v4_faulty(
+        ctrl: std::sync::Arc<crate::io::fault_layer::FaultController>,
+    ) -> (crate::memory::MemoryCatalog, Table) {
+        let file_io = crate::io::FileIO::memory_with_faults(ctrl);
+        let catalog = crate::memory::MemoryCatalog::new_with_file_io("memory://dst", file_io);
+        let table = dst_make_v4_table_in_catalog(&catalog).await;
+        (catalog, table)
+    }
+
+    /// M3 real-code — a BYTE-LEVEL write fault (a manifest write failing mid-commit)
+    /// must be atomic and recoverable: the commit fails, the table is unchanged (no
+    /// half-written snapshot becomes reachable), and a clean retry lands the data.
+    /// Deeper than the catalog test — this fails the store write, before the register.
+    #[tokio::test]
+    async fn dst_bytefault_write_failure_is_atomic() {
+        let ctrl = crate::io::fault_layer::FaultController::new();
+        let (catalog, table) = dst_make_v4_faulty(ctrl.clone()).await;
+        let ident = table.identifier().clone();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/A.parquet", 1), dst_data_file("test/B.parquet", 2)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let ab: std::collections::BTreeSet<String> = ["test/A.parquet", "test/B.parquet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(dst_live_paths(&table).await, ab);
+
+        // Fail the next raw write — the manifest write inside the commit.
+        ctrl.fail_next_writes(1);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/C.parquet", 3)])
+            .apply(tx)
+            .unwrap();
+        assert!(
+            tx.commit(&catalog).await.is_err(),
+            "a failed manifest write must fail the commit"
+        );
+
+        // ATOMICITY: the authoritative table is unchanged.
+        let reloaded = crate::Catalog::load_table(&catalog, &ident).await.unwrap();
+        assert_eq!(
+            dst_live_paths(&reloaded).await,
+            ab,
+            "a failed write advanced the table / left a phantom row"
+        );
+
+        // RECOVERY: with the store healthy, the commit of C lands with no loss/dup.
+        let tx = Transaction::new(&reloaded);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![dst_data_file("test/C.parquet", 3)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let abc: std::collections::BTreeSet<String> =
+            ["test/A.parquet", "test/B.parquet", "test/C.parquet"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(dst_live_paths(&table).await, abc);
+        assert_eq!(dst_live_count(&table).await, 3);
+    }
+
+    /// M3 real-code — a BYTE-LEVEL read fault during scan planning must surface as a
+    /// scan ERROR, never as silently fewer rows. A storage read that fails is the
+    /// most dangerous fault class: if the planner swallowed it, a transient S3 blip
+    /// would look like data loss. The committed data is intact; only the read faults.
+    #[tokio::test]
+    async fn dst_bytefault_read_failure_scan_errors_not_silent() {
+        let ctrl = crate::io::fault_layer::FaultController::new();
+        let (catalog, table) = dst_make_v4_faulty(ctrl.clone()).await;
+        let ident = table.identifier().clone();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![
+                dst_data_file("test/A.parquet", 1),
+                dst_data_file("test/B.parquet", 2),
+                dst_data_file("test/C.parquet", 3),
+            ])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        assert_eq!(dst_live_count(&table).await, 3);
+
+        // Fresh load → cold cache, so the scan reads manifests from the store.
+        let fresh = crate::Catalog::load_table(&catalog, &ident).await.unwrap();
+        // Fail the first manifest read the scan performs.
+        ctrl.fail_next_reads(1);
+        assert!(
+            dst_try_live_paths(&fresh).await.is_err(),
+            "a manifest read fault must surface as a scan error, never silent data loss"
+        );
+        assert!(ctrl.reads() >= 1, "the scan must have attempted a manifest read");
+    }
+
+    /// M3 real-code — SEEDED byte-level write-crash schedule. Before each append,
+    /// randomly fail the manifest write. Every faulted commit must fail; the
+    /// reachable set must always equal exactly the set of successfully-committed
+    /// files — no lost commit, no half-written snapshot made reachable. Deterministic.
+    #[tokio::test]
+    async fn dst_bytefault_seeded_write_crash_no_loss() {
+        fn mix(s: &mut u64) -> u64 {
+            *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        for seed in 0..8u64 {
+            let mut rng = seed ^ 0xB17E_FA01;
+            let ctrl = crate::io::fault_layer::FaultController::new();
+            let (catalog, mut table) = dst_make_v4_faulty(ctrl.clone()).await;
+            let ident = table.identifier().clone();
+            let mut oracle: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut ctr = 0u64;
+
+            for step in 0..12u64 {
+                let crash = mix(&mut rng) % 100 < 35;
+                if crash {
+                    ctrl.fail_next_writes(1);
+                }
+                let k = 1 + mix(&mut rng) % 3;
+                let mut files = Vec::new();
+                let mut paths = Vec::new();
+                for _ in 0..k {
+                    ctr += 1;
+                    let p = format!("dst/{seed}/b{ctr}.parquet");
+                    files.push(dst_data_file(&p, 1 + mix(&mut rng) % 50));
+                    paths.push(p);
+                }
+                let tx = Transaction::new(&table);
+                let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
+                let res = tx.commit(&catalog).await;
+
+                if crash {
+                    assert!(
+                        res.is_err(),
+                        "seed={seed} step={step}: injected write crash didn't fail the commit"
+                    );
+                    table = crate::Catalog::load_table(&catalog, &ident).await.unwrap();
+                } else {
+                    table = res.expect("clean commit failed unexpectedly");
+                    for p in paths {
+                        oracle.insert(p);
+                    }
+                }
+
+                assert_eq!(
+                    dst_live_paths(&table).await,
+                    oracle,
+                    "seed={seed} step={step}: reachable set != successfully-committed set"
+                );
+                assert_eq!(
+                    dst_live_count(&table).await,
+                    oracle.len(),
+                    "seed={seed} step={step}: duplicate reachable files"
+                );
+            }
+        }
+    }
 }

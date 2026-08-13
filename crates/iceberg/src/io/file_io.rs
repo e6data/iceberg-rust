@@ -270,6 +270,23 @@ impl FileIOBuilder {
     }
 }
 
+#[cfg(all(test, feature = "storage-memory"))]
+impl FileIO {
+    /// Build a `FileIO` over an in-memory store wrapped with a byte-level
+    /// fault-injection layer (DST helper). All operations flow through the
+    /// [`crate::io::fault_layer::FaultController`], so a test can fail the raw
+    /// reads/writes/deletes the commit and scan paths perform.
+    pub(crate) fn memory_with_faults(
+        ctrl: std::sync::Arc<crate::io::fault_layer::FaultController>,
+    ) -> FileIO {
+        let op = crate::io::fault_layer::memory_operator_with_faults(ctrl);
+        FileIO {
+            builder: FileIOBuilder::new("memory"),
+            inner: Arc::new(Storage::Memory(op)),
+        }
+    }
+}
+
 /// The struct the represents the metadata of a file.
 ///
 /// TODO: we can add last modified time, content type, etc. in the future.

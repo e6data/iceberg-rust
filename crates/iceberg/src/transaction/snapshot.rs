@@ -1391,6 +1391,20 @@ impl<'a> SnapshotProducer<'a> {
         let do_delta = incremental
             && current_root_path.is_some()
             && current_chain_depth < MAX_CHAIN;
+        // Fires on EVERY v4 commit, so delta-path and collapse-path commits can
+        // be counted separately. Without this the two are indistinguishable in
+        // `actions_ms` and a spike cannot be attributed: a collapse should be
+        // roughly 1-in-MAX_CHAIN, so if slow commits outnumber collapses the
+        // cost is contention/retries rather than the collapse itself.
+        log::info!(
+            "v4 commit path: do_delta={} incremental={} chain_depth={} max_chain={} \
+             carried_entries={}",
+            do_delta,
+            incremental,
+            current_chain_depth,
+            MAX_CHAIN,
+            entries.len()
+        );
         // Ref-resident tombstones carried forward from the chain on a collapse.
         // Metadata-orphan GC: metadata objects this collapse REPLACES and thus
         // orphans — the collapsed root-delta chain (below) and the replaced
@@ -1409,14 +1423,66 @@ impl<'a> SnapshotProducer<'a> {
             // entries, so reconstruct the full live set from the chain. The
             // reconstructed metadata carries the still-pending ref tombstones.
             if let Some(p) = &current_root_path {
+                // ── Collapse instrumentation (measurement only) ──
+                //
+                // This branch is the documented home of the expensive commit:
+                // most commits append a cheap delta, and every MAX_CHAIN(=64)th
+                // one lands here and rebuilds the whole live entry set.
+                //
+                // Three candidates currently sit conflated inside one
+                // `actions_ms` number and these split them:
+                //   * collapse cost      → recon_ms + chain_ms
+                //   * leaf-count scaling → entries_total / manifest_refs
+                //     (`reconstruct_root` returns BOTH Inline hot entries and
+                //     ManifestRef cold-tier leaves, so a table carrying
+                //     hundreds of leaves rebuilds all of them here — that is
+                //     the coupling between leaf growth and commit time)
+                //   * OCC contention     → neither; if actions_ms greatly
+                //     exceeds recon_ms + chain_ms, the time is elsewhere
+                //
+                // Live shape being explained: p50 0.10-0.29s with 12 of 29
+                // commits spiking to 7-30s. That rate is far above 1-in-64, so
+                // collapse alone should NOT account for it. If these numbers
+                // confirm that, the spikes are contention/retries and the fix
+                // is fewer commits, not a cheaper collapse.
+                //
+                // NOTE `reconstruct_root_filtered` exists and would let the
+                // walk prune entries as it goes; this path uses the unfiltered
+                // form. Worth revisiting only once the numbers say the
+                // reconstruct is actually the cost.
+                let recon_start = std::time::Instant::now();
                 let (recon_meta, full) = reconstruct_root(self.table.file_io(), p).await?;
+                let recon_ms = recon_start.elapsed().as_millis() as u64;
+                let n_entries = full.len();
+                let n_refs = full
+                    .iter()
+                    .filter(|e| {
+                        matches!(e, crate::spec::root_manifest::RootManifestEntry::ManifestRef { .. })
+                    })
+                    .count();
+                log::info!(
+                    "v4 collapse walk: chain_depth={} entries_total={} manifest_refs={} inline={} \
+                     removed_paths={} recon_ms={}",
+                    current_chain_depth,
+                    n_entries,
+                    n_refs,
+                    n_entries - n_refs,
+                    recon_meta.removed_paths.len(),
+                    recon_ms
+                );
                 entries = full;
                 carried_removed = recon_meta.removed_paths;
                 // The entire root-delta chain we just collapsed is replaced by the
                 // new base → orphaned. Collect its paths to tombstone. Best-effort:
                 // a walk failure must not fail the commit (metadata just leaks a
                 // cycle, cleaned next time).
+                let chain_start = std::time::Instant::now();
                 if let Ok(chain) = chain_root_paths(self.table.file_io(), p).await {
+                    log::info!(
+                        "v4 collapse chain: chain_objects={} chain_ms={}",
+                        chain.len(),
+                        chain_start.elapsed().as_millis() as u64
+                    );
                     metadata_orphan_paths.extend(chain);
                 }
             }

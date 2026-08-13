@@ -1994,6 +1994,20 @@ impl<'a> SnapshotProducer<'a> {
                     || inline_bytes > flush_bytes
                     || total_entries > flush_entries))
         {
+            // Timed: this inline-flush block is the prime suspect for the
+            // delta-path cost. Measured live 2026-08-13: 26 of 82 commits took
+            // >2s and carried 98% of all actions_ms (436.6s of 444.9s), logs
+            // uniformly 27-30s and metrics 15-16s. Crucially `retry=false`,
+            // `update_table_ms`=2-3ms, and ZERO collapses (do_delta=true on all
+            // 35 commits, chain_depth 29-36 vs MAX_CHAIN 64). So it is neither
+            // OCC contention, nor the catalog, nor the 1-in-64 chain collapse —
+            // all three are eliminated by measurement. What remains on this
+            // path is the work below: grouping inline entries and writing one
+            // child manifest per (spec, grouping key) to S3.
+            let flush_start = std::time::Instant::now();
+            let mut n_data_manifests: usize = 0;
+            let mut n_delete_manifests: usize = 0;
+
             // Split inline entries by (content type, partition_spec_id).
             // Grouping by spec id is required: a single commit can carry files
             // written under different partition specs (e.g. compaction inputs
@@ -2087,6 +2101,7 @@ impl<'a> SnapshotProducer<'a> {
                     // "Invalid Parquet file. Corrupt footer".
                     // `RebalanceRootManifestAction` already takes the Parquet
                     // path; this lines commit_v4 up with that convention.
+                    n_data_manifests += 1;
                     entries.push(RootManifestEntry::ManifestRef {
                         manifest_file: writer.write_manifest_file_parquet().await?,
                         mdv: None,
@@ -2135,12 +2150,22 @@ impl<'a> SnapshotProducer<'a> {
                     // See the matching note on the data-entry flush above:
                     // .parquet path => Parquet bytes. Avro here silently writes
                     // bytes that fail to read.
+                    n_delete_manifests += 1;
                     entries.push(RootManifestEntry::ManifestRef {
                         manifest_file: writer.write_manifest_file_parquet().await?,
                         mdv: None,
                     });
                 }
             }
+            log::info!(
+                "v4 delta flush: inline_entries={} data_manifests={} delete_manifests={} \
+                 flush_ms={} tiered={}",
+                inline_count,
+                n_data_manifests,
+                n_delete_manifests,
+                flush_start.elapsed().as_millis() as u64,
+                tiered
+            );
         }
 
         // Merge small manifest refs to keep ref count bounded.

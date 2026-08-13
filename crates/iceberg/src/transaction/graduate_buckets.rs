@@ -434,6 +434,59 @@ fn effective_graduation_cap(
     }
 }
 
+/// Distinct partition keys among `nodes`, read from their partition SUMMARIES —
+/// no manifest loads, no S3. `None` when any node's summary cannot pin a single
+/// key (absent, or a field where `lower != upper`), i.e. when the answer is
+/// unknowable for free.
+///
+/// This is the same observation the `compact_cold_tier` prune rests on: a
+/// partition-tight manifest already advertises its partition in the bucket-index
+/// / root, so questions about *which* partition a manifest belongs to are
+/// answerable without reading it. Pure.
+fn distinct_summary_partitions(nodes: &[ManifestFile]) -> Option<usize> {
+    let mut keys: HashSet<Vec<u8>> = HashSet::with_capacity(nodes.len());
+    for mf in nodes {
+        let parts = mf.partitions.as_ref()?;
+        let mut key: Vec<u8> = Vec::new();
+        for fs in parts.iter() {
+            match (&fs.lower_bound, &fs.upper_bound) {
+                (Some(lo), Some(hi)) if lo == hi => {
+                    key.extend_from_slice(lo.as_ref());
+                    // Separator so ("a","bc") and ("ab","c") cannot collide.
+                    key.push(0xff);
+                }
+                _ => return None,
+            }
+        }
+        keys.insert(key);
+    }
+    Some(keys.len())
+}
+
+/// Would folding these nodes actually consolidate anything?
+///
+/// Folding re-clusters graduating nodes by partition, so it can only help when
+/// several nodes SHARE a partition. Measured on sri-olly: metrics_1m folds 256
+/// nodes into 14 leaves (18x — its rollup emits one entry per checkpoint), while
+/// logs folds 80 into 80 (nothing — Phase 6 has already compacted each
+/// partition-hour to ~1 file). On logs the fold was pure cost: ~2.5-3.1s of
+/// manifest rewriting per tick, three ticks running, for zero reduction.
+///
+/// The per-table split is a property of the DATA, not of the table, so gate on
+/// the data rather than on a hand-maintained allowlist — the "logs doesn't
+/// benefit" fact would go stale the moment ingest shape changes, exactly as the
+/// "small fan-in, serial reads are fine" assumption did in laminar's
+/// merge_puffin. Require a 2x reduction to be worth the rewrite.
+///
+/// Unknowable (`None` from the summaries) ⇒ fold, preserving prior behaviour
+/// rather than silently skipping work that might be needed. Pure.
+fn fold_would_consolidate(nodes: &[ManifestFile]) -> bool {
+    match distinct_summary_partitions(nodes) {
+        Some(distinct) => distinct * 2 <= nodes.len(),
+        None => true,
+    }
+}
+
 /// Entries a folded node contributes to its new cold leaf: alive, not pending
 /// removal, restamped `Existing`.
 ///
@@ -911,7 +964,8 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // leaf per partition per graduation, not per source kind.
     let mut inline_leaves = 0usize;
     let mut folded_entries: Vec<ManifestEntry> = Vec::new();
-    if fold_leaves.is_some() {
+    let fold_this_pass = fold_leaves.is_some() && fold_would_consolidate(&graduated_nodes);
+    if fold_this_pass {
         folded_entries.extend(closed_inline_files.into_iter().map(|df| {
             ManifestEntry::builder()
                 .status(ManifestStatus::Existing)
@@ -966,7 +1020,17 @@ pub(crate) async fn fold_closed_into_bucket_index(
     //     their partitions. Rare (needs a spec evolution) but silent, so it is
     //     excluded structurally rather than assumed away.
     let mut folded_leaves_out: usize = 0;
-    if fold_leaves.is_some() {
+    // Self-gating: fold only when the summaries say it would consolidate. See
+    // `fold_would_consolidate` — this is decided for free, per table and per
+    // pass, from partition summaries already in hand.
+    if fold_leaves.is_some() && !fold_this_pass {
+        log::info!(
+            "graduation fold: skipped nodes={} distinct_partitions={:?} reason=no_consolidation",
+            graduated_nodes.len(),
+            distinct_summary_partitions(&graduated_nodes),
+        );
+    }
+    if fold_this_pass {
         let default_spec_id = spec.spec_id();
         let (to_fold, by_ref): (Vec<ManifestFile>, Vec<ManifestFile>) =
             graduated_nodes.into_iter().partition(|mf| {
@@ -1522,6 +1586,103 @@ mod tests {
     fn fold_yields_nothing_when_all_removed() {
         let entries = vec![alive_entry("a"), alive_entry("b")];
         assert!(fold_surviving_entries(&entries, &removed(&["a", "b"])).is_empty());
+    }
+
+    fn leaf_with_partition(vals: &[i64]) -> ManifestFile {
+        let partitions = vals
+            .iter()
+            .map(|v| {
+                let b = Datum::long(*v).to_bytes().unwrap();
+                crate::spec::FieldSummary {
+                    contains_null: false,
+                    contains_nan: Some(false),
+                    lower_bound: Some(b.clone()),
+                    upper_bound: Some(b),
+                }
+            })
+            .collect::<Vec<_>>();
+        ManifestFile {
+            manifest_path: format!("s3://b/{vals:?}.parquet"),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(partitions),
+            key_metadata: None,
+            first_row_id: None,
+        }
+    }
+
+    // Folding can only consolidate when nodes SHARE a partition, and the
+    // summaries already say whether they do — no manifest loads needed.
+    #[test]
+    fn distinct_partitions_read_from_summaries() {
+        // 4 nodes, 2 partitions.
+        let nodes = vec![
+            leaf_with_partition(&[1, 10]),
+            leaf_with_partition(&[1, 10]),
+            leaf_with_partition(&[1, 11]),
+            leaf_with_partition(&[1, 11]),
+        ];
+        assert_eq!(distinct_summary_partitions(&nodes), Some(2));
+        // Field values must not collide across boundaries.
+        let a = leaf_with_partition(&[1, 2]);
+        let b = leaf_with_partition(&[12]);
+        assert_ne!(
+            distinct_summary_partitions(&[a, b]),
+            Some(1),
+            "concatenated keys must not collide"
+        );
+    }
+
+    // A wide or absent summary makes the answer unknowable for free; the gate
+    // must then FOLD (preserve prior behaviour), never silently skip.
+    #[test]
+    fn distinct_partitions_unknowable_when_summary_is_wide() {
+        let mut wide = leaf_with_partition(&[1]);
+        wide.partitions.as_mut().unwrap()[0].upper_bound =
+            Some(Datum::long(99).to_bytes().unwrap());
+        assert_eq!(distinct_summary_partitions(&[wide.clone()]), None);
+        assert!(fold_would_consolidate(&[wide]), "unknowable must fold");
+
+        let mut absent = leaf_with_partition(&[1]);
+        absent.partitions = None;
+        assert_eq!(distinct_summary_partitions(&[absent.clone()]), None);
+        assert!(fold_would_consolidate(&[absent]));
+    }
+
+    /// The live split this gate exists for. metrics_1m folds 256 nodes into 14
+    /// leaves; logs folded 80 into 80 across three consecutive ticks, paying
+    /// ~2.5-3.1s of manifest rewriting each time for zero reduction. Gate on
+    /// the DATA, not on a table allowlist that would go stale.
+    #[test]
+    fn fold_gate_matches_the_measured_split() {
+        // logs shape: every node its own partition ⇒ nothing to consolidate.
+        let logs: Vec<ManifestFile> = (0..80).map(|i| leaf_with_partition(&[1, i])).collect();
+        assert_eq!(distinct_summary_partitions(&logs), Some(80));
+        assert!(!fold_would_consolidate(&logs), "80 -> 80 must not fold");
+
+        // metrics_1m shape: 256 nodes across 14 partitions ⇒ 18x reduction.
+        let m1m: Vec<ManifestFile> = (0..256)
+            .map(|i| leaf_with_partition(&[1, i % 14]))
+            .collect();
+        assert_eq!(distinct_summary_partitions(&m1m), Some(14));
+        assert!(fold_would_consolidate(&m1m), "256 -> 14 must fold");
+
+        // Exactly 2x is the documented threshold — worth the rewrite.
+        let exact: Vec<ManifestFile> = (0..10).map(|i| leaf_with_partition(&[1, i % 5])).collect();
+        assert!(fold_would_consolidate(&exact));
+        // Just under 2x is not.
+        let under: Vec<ManifestFile> = (0..10).map(|i| leaf_with_partition(&[1, i % 6])).collect();
+        assert!(!fold_would_consolidate(&under));
     }
 
     // The two bounds compose as a min, and either one alone still binds. The

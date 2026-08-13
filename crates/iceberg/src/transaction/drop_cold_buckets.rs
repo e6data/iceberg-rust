@@ -98,6 +98,10 @@ fn max_ts_of(files: &[DataFile], ts_field_id: i32) -> Option<i64> {
 
 #[async_trait]
 impl TransactionAction for DropColdBucketsAction {
+    fn action_name(&self) -> &'static str {
+        "drop_cold_buckets"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         if table.effective_format_version() != FormatVersion::V4 {
             return Err(Error::new(

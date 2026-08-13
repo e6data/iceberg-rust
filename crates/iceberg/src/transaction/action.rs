@@ -48,6 +48,22 @@ pub(crate) trait TransactionAction: AsAny + Sync + Send {
     /// or an error if the commit fails.
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit>;
 
+    /// Short stable name for logs and metrics.
+    ///
+    /// Exists because `actions_ms` is emitted per transaction with only a
+    /// positional `per_action_ms` array, which makes an expensive action
+    /// impossible to identify without guessing. That cost three
+    /// mis-targeted instrumentation rounds: `replace_data_files`'
+    /// commit_v4 path measures 61-96ms while single-action commits in the
+    /// same tick reach 36s, so the expensive one was a DIFFERENT action all
+    /// along. Naming them removes the guesswork.
+    ///
+    /// Defaulted so no implementor is forced to change; override where the
+    /// action can appear in a hot commit path.
+    fn action_name(&self) -> &'static str {
+        "unknown"
+    }
+
     /// Whether this action must disable the commit retry loop. An action returns
     /// `true` when a retry after a commit conflict could reuse now-stale inputs and
     /// corrupt data. `ReplaceDataFiles` overrides this: a retry with a stale

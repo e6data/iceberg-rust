@@ -61,6 +61,10 @@ impl Default for UpdateLocationAction {
 
 #[async_trait]
 impl TransactionAction for UpdateLocationAction {
+    fn action_name(&self) -> &'static str {
+        "update_location"
+    }
+
     async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
         let updates: Vec<TableUpdate>;
         if let Some(location) = self.location.clone() {

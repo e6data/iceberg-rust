@@ -122,6 +122,10 @@ impl FastAppendAction {
 
 #[async_trait]
 impl TransactionAction for FastAppendAction {
+    fn action_name(&self) -> &'static str {
+        "fast_append"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let mut snapshot_producer = SnapshotProducer::new(
             table,

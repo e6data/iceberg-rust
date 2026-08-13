@@ -69,6 +69,10 @@ impl Default for UpdateSchemaAction {
 
 #[async_trait]
 impl TransactionAction for UpdateSchemaAction {
+    fn action_name(&self) -> &'static str {
+        "update_schema"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         if self.new_columns.is_empty() {
             return Ok(ActionCommit::new(vec![], vec![]));

@@ -113,6 +113,10 @@ impl Default for UpdateStatisticsAction {
 
 #[async_trait]
 impl TransactionAction for UpdateStatisticsAction {
+    fn action_name(&self) -> &'static str {
+        "update_statistics"
+    }
+
     async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
         let mut updates: Vec<TableUpdate> =
             Vec::with_capacity(self.statistics_to_set.len() + self.statistics_to_remove.len());

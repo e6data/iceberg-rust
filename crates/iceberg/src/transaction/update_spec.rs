@@ -95,6 +95,10 @@ impl Default for UpdateSpecAction {
 
 #[async_trait]
 impl TransactionAction for UpdateSpecAction {
+    fn action_name(&self) -> &'static str {
+        "update_spec"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         if self.declared_fields.is_empty() {
             return Ok(ActionCommit::new(vec![], vec![]));

@@ -186,6 +186,10 @@ impl ReplaceDataFilesAction {
 
 #[async_trait]
 impl TransactionAction for ReplaceDataFilesAction {
+    fn action_name(&self) -> &'static str {
+        "replace_data_files"
+    }
+
     /// A retry after a commit conflict could re-apply this action's delete-file list
     /// against a table where those files are already gone (or add its merged file a
     /// second time), duplicating or resurrecting data. Fail the transaction fast

@@ -422,6 +422,10 @@ impl Default for RebalanceRootManifestAction {
 
 #[async_trait]
 impl TransactionAction for RebalanceRootManifestAction {
+    fn action_name(&self) -> &'static str {
+        "rebalance_root_manifest"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         // 1. Verify V4. We accept both:
         //    a) tables that declare V4 to the catalog directly (in-process

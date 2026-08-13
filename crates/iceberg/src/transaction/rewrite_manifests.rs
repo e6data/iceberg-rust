@@ -608,6 +608,10 @@ impl RewriteManifestsAction {
 // resilience.
 #[async_trait]
 impl TransactionAction for RewriteManifestsAction {
+    fn action_name(&self) -> &'static str {
+        "rewrite_manifests"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         // Fallback: single-phase approach via Transaction framework.
         // For the merge-aware two-phase approach, use execute() directly.

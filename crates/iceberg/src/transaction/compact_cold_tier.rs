@@ -582,6 +582,10 @@ impl CompactColdTierAction {
 
 #[async_trait]
 impl TransactionAction for CompactColdTierAction {
+    fn action_name(&self) -> &'static str {
+        "compact_cold_tier"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         if table.effective_format_version() != FormatVersion::V4 {
             return Err(Error::new(

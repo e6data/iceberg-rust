@@ -65,6 +65,10 @@ impl Default for UpgradeFormatVersionAction {
 
 #[async_trait]
 impl TransactionAction for UpgradeFormatVersionAction {
+    fn action_name(&self) -> &'static str {
+        "upgrade_format_version"
+    }
+
     async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
         let format_version = self.format_version.ok_or_else(|| {
             Error::new(

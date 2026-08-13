@@ -324,10 +324,29 @@ impl Transaction {
 
         let actions_started = std::time::Instant::now();
         let mut action_ms: Vec<u64> = Vec::with_capacity(self.actions.len());
+        let mut action_names: Vec<&'static str> = Vec::with_capacity(self.actions.len());
         for action in &self.actions {
             let action_started = std::time::Instant::now();
+            let action_name = action.action_name();
             let mut action_commit = Arc::clone(action).commit(&current_table).await?;
-            action_ms.push(action_started.elapsed().as_millis() as u64);
+            let this_action_ms = action_started.elapsed().as_millis() as u64;
+            action_ms.push(this_action_ms);
+            action_names.push(action_name);
+            // Name the expensive one directly. `per_action_ms` is positional,
+            // so a 36s entry could not previously be attributed to an action
+            // without inference — and inference sent instrumentation to the
+            // wrong place three times. 2s is well above the ~100ms p50 and
+            // low enough to catch everything that matters.
+            if this_action_ms > 2_000 {
+                log::info!(
+                    "slow action: name={} ms={} table={} action_idx={} of {}",
+                    action_name,
+                    this_action_ms,
+                    self.table.identifier(),
+                    action_ms.len() - 1,
+                    self.actions.len()
+                );
+            }
             all_manifest_paths.extend(action_commit.take_manifest_paths());
             // apply action commit to current_table
             current_table = Self::apply(
@@ -350,12 +369,13 @@ impl Transaction {
         let update_started = std::time::Instant::now();
         let result = catalog.update_table(table_commit).await;
         log::info!(
-            "commit sub-steps: table={} retry={} refresh_ms={} actions_ms={} per_action_ms={:?} update_table_ms={} total_ms={} ok={}",
+            "commit sub-steps: table={} retry={} refresh_ms={} actions_ms={} per_action_ms={:?} action_names={:?} update_table_ms={} total_ms={} ok={}",
             self.table.identifier(),
             is_retry,
             refresh_ms,
             actions_elapsed_ms,
             action_ms,
+            action_names,
             update_started.elapsed().as_millis() as u64,
             attempt_started.elapsed().as_millis() as u64,
             result.is_ok(),

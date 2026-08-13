@@ -1224,6 +1224,10 @@ impl GraduateBucketsAction {
 
 #[async_trait]
 impl TransactionAction for GraduateBucketsAction {
+    fn action_name(&self) -> &'static str {
+        "graduate_buckets"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         if table.effective_format_version() != FormatVersion::V4 {
             return Err(Error::new(

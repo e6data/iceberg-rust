@@ -287,6 +287,28 @@ fn leaf_keep_reason(
     }
 }
 
+/// Is this leaf's partition summary TIGHT — `lower == upper` on every field,
+/// pinning it to exactly one partition?
+///
+/// Tightness is what makes a leaf prunable at all, independent of any target.
+/// A wide leaf can never be ruled out, so it is loaded on every compaction of
+/// every partition forever. Cold leaves written by `write_entries_clustered`
+/// are tight by construction; leaves that arrived by REFERENCE from a hot
+/// manifest are only as tight as that manifest was, and laminar's flush groups
+/// on `[timestamp_hour]` alone by default — hour-tight, tenant-wide. Pure.
+pub(crate) fn leaf_is_tight(leaf: &ManifestFile, partition_type: &StructType) -> bool {
+    let Some(summary) = leaf.partitions.as_ref() else {
+        return false;
+    };
+    if summary.len() != partition_type.fields().len() {
+        return false;
+    }
+    summary.iter().all(|fs| match (&fs.lower_bound, &fs.upper_bound) {
+        (Some(lo), Some(hi)) => lo == hi,
+        _ => false,
+    })
+}
+
 /// Back-compat wrapper: a leaf is loaded unless it is provably Pruned.
 fn leaf_may_hold_partitions(
     leaf: &ManifestFile,
@@ -374,12 +396,22 @@ impl CompactColdTierAction {
         // summary PROVES it can't match. No target partitions (pure-removal
         // caller), an absent summary, or a wide one ⇒ load it.
         // Whole-index shape, derived from partition summaries only — no loads.
-        // This is the number that decides the fix: if the index holds ~1 leaf
-        // per partition, leaf count is just history and the append path is at
-        // fault; if it holds many leaves per partition, same-partition leaves
-        // need merging. Reported for the ENTIRE index, not just the target.
+        //
+        // `distinct_summary_partitions` collapses to None if ANY leaf is
+        // non-tight, which on the one table that needed the answer told us
+        // nothing. Report the population instead: how many leaves are
+        // structurally unprunable (wide), and how many distinct partitions the
+        // tight ones span. `index_wide` is the number that decides whether the
+        // fix belongs at the WRITE side (make hot manifests partition-tight so
+        // by-reference graduation yields tight leaves) or at the cold tier.
+        let index_tight: Vec<ManifestFile> = leaves
+            .iter()
+            .filter(|l| leaf_is_tight(l, &partition_type))
+            .cloned()
+            .collect();
+        let index_wide = leaves.len() - index_tight.len();
         let index_partitions =
-            crate::transaction::graduate_buckets::distinct_summary_partitions(&leaves);
+            crate::transaction::graduate_buckets::distinct_summary_partitions(&index_tight);
 
         let target_partitions: HashSet<Struct> =
             self.added.iter().map(|df| df.partition.clone()).collect();
@@ -463,7 +495,8 @@ impl CompactColdTierAction {
         log::info!(
             "compact_cold_tier leaf scan: leaves={} pruned_by_partition={} loaded={} \
              loaded_matched={} loaded_unprunable={} \
-             empty_leaves={} entries_seen={} alive_entries={} index_partitions={:?} \
+             empty_leaves={} entries_seen={} alive_entries={} \
+             index_wide={} index_partitions_tight={:?} \
              target_partitions={} scan_ms={}",
             pruned_count + candidate_count,
             pruned_count,
@@ -473,6 +506,7 @@ impl CompactColdTierAction {
             empty_leaves,
             entries_seen,
             alive_entries,
+            index_wide,
             index_partitions,
             target_partitions.len(),
             scan_start.elapsed().as_millis() as u64,
@@ -998,6 +1032,32 @@ mod tests {
             upper_bound: None,
         }]);
         assert!(leaf_may_hold_partitions(&leaf_with(half), &targets, &pt));
+    }
+
+    // Tightness is the property that makes a leaf prunable at all, and it is
+    // independent of any target — a wide leaf is loaded on every compaction of
+    // every partition, forever.
+    #[test]
+    fn tightness_is_independent_of_any_target() {
+        let pt = long_partition_type();
+        assert!(leaf_is_tight(&leaf_with(tight_summary(7)), &pt));
+        assert!(!leaf_is_tight(&leaf_with(None), &pt));
+        assert!(!leaf_is_tight(&leaf_with(Some(vec![])), &pt));
+        let wide = Some(vec![crate::spec::FieldSummary {
+            contains_null: false,
+            contains_nan: Some(false),
+            lower_bound: Some(Datum::long(1).to_bytes().unwrap()),
+            upper_bound: Some(Datum::long(99).to_bytes().unwrap()),
+        }]);
+        assert!(!leaf_is_tight(&leaf_with(wide), &pt));
+        // A missing bound is not tight either — absence is not equality.
+        let half = Some(vec![crate::spec::FieldSummary {
+            contains_null: false,
+            contains_nan: Some(false),
+            lower_bound: Some(Datum::long(7).to_bytes().unwrap()),
+            upper_bound: None,
+        }]);
+        assert!(!leaf_is_tight(&leaf_with(half), &pt));
     }
 
     // The two keep-reasons must stay distinguishable. Conflating them made

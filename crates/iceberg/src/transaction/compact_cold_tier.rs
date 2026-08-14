@@ -346,6 +346,14 @@ impl CompactColdTierAction {
         // Conservative by construction: the prune skips a leaf only when the
         // summary PROVES it can't match. No target partitions (pure-removal
         // caller), an absent summary, or a wide one ⇒ load it.
+        // Whole-index shape, derived from partition summaries only — no loads.
+        // This is the number that decides the fix: if the index holds ~1 leaf
+        // per partition, leaf count is just history and the append path is at
+        // fault; if it holds many leaves per partition, same-partition leaves
+        // need merging. Reported for the ENTIRE index, not just the target.
+        let index_partitions =
+            crate::transaction::graduate_buckets::distinct_summary_partitions(&leaves);
+
         let target_partitions: HashSet<Struct> =
             self.added.iter().map(|df| df.partition.clone()).collect();
         let (candidates, pruned): (Vec<ManifestFile>, Vec<ManifestFile>) = leaves
@@ -385,6 +393,7 @@ impl CompactColdTierAction {
         // `empty_leaves` separates them, riding the load we already do.
         let mut empty_leaves: usize = 0;
         let mut entries_seen: usize = 0;
+        let mut alive_entries: usize = 0;
         while let Some((leaf, manifest)) = loaded.next().await {
             let manifest = manifest?;
             let files: Vec<DataFile> = manifest
@@ -394,6 +403,7 @@ impl CompactColdTierAction {
                 .map(|e| e.data_file().clone())
                 .collect();
             entries_seen += manifest.entries().len();
+            alive_entries += files.len();
             if files.is_empty() {
                 empty_leaves += 1;
             }
@@ -411,12 +421,15 @@ impl CompactColdTierAction {
         }
         log::info!(
             "compact_cold_tier leaf scan: leaves={} pruned_by_partition={} loaded={} \
-             empty_leaves={} entries_seen={} target_partitions={} scan_ms={}",
+             empty_leaves={} entries_seen={} alive_entries={} index_partitions={:?} \
+             target_partitions={} scan_ms={}",
             pruned_count + candidate_count,
             pruned_count,
             candidate_count,
             empty_leaves,
             entries_seen,
+            alive_entries,
+            index_partitions,
             target_partitions.len(),
             scan_start.elapsed().as_millis() as u64,
         );

@@ -443,7 +443,7 @@ fn effective_graduation_cap(
 /// partition-tight manifest already advertises its partition in the bucket-index
 /// / root, so questions about *which* partition a manifest belongs to are
 /// answerable without reading it. Pure.
-fn distinct_summary_partitions(nodes: &[ManifestFile]) -> Option<usize> {
+pub(crate) fn distinct_summary_partitions(nodes: &[ManifestFile]) -> Option<usize> {
     let mut keys: HashSet<Vec<u8>> = HashSet::with_capacity(nodes.len());
     for mf in nodes {
         let parts = mf.partitions.as_ref()?;
@@ -1095,8 +1095,31 @@ pub(crate) async fn fold_closed_into_bucket_index(
             fold_write_start.elapsed().as_millis() as u64,
         );
     } else if removed_paths.is_empty() {
+        // BLIND APPEND — no liveness check at all. The validation exists in the
+        // `else` branch below (`GraduatedNodePlan::Skip` drops a node whose
+        // files were all merged away), but it is gated on `removed_paths` being
+        // non-empty, and rebalance Phase C sweeps removed_paths into MDVs — so
+        // this branch is the COMMON path, not the exception. Suspected cause of
+        // sri-olly logs holding 4,280 cold leaves against ~50 live data files.
+        // Logged so the branch taken is visible per graduation.
+        log::info!(
+            "graduation append: nodes={} mode=blind removed_paths=0 \
+             distinct_partitions={:?} cold_leaves_before={}",
+            graduated_nodes.len(),
+            distinct_summary_partitions(&graduated_nodes),
+            cold_leaves.len(),
+        );
         cold_leaves.extend(graduated_nodes);
     } else {
+        log::info!(
+            "graduation append: nodes={} mode=validated removed_paths={} \
+             distinct_partitions={:?} cold_leaves_before={}",
+            graduated_nodes.len(),
+            removed_paths.len(),
+            distinct_summary_partitions(&graduated_nodes),
+            cold_leaves.len(),
+        );
+        let (mut plan_by_ref, mut plan_skipped, mut plan_materialized) = (0usize, 0usize, 0usize);
         for mf in graduated_nodes {
             // Best-effort: a load failure (e.g. an already-corrupt/absent
             // manifest) must not fail the whole collapse commit — fall back to
@@ -1114,13 +1137,17 @@ pub(crate) async fn fold_closed_into_bucket_index(
             };
             match plan_graduated_node(manifest.entries(), removed_paths) {
                 // Clean node → move by reference (fast path preserved).
-                GraduatedNodePlan::ByReference => cold_leaves.push(mf),
+                GraduatedNodePlan::ByReference => {
+                    plan_by_ref += 1;
+                    cold_leaves.push(mf)
+                }
                 // Every file merged away → fully orphaned manifest; drop it (its
                 // data files are already tombstoned by the merge). The stale
                 // manifest object leaks; the reachability backstop reclaims it.
-                GraduatedNodePlan::Skip => {}
+                GraduatedNodePlan::Skip => plan_skipped += 1,
                 // Mixed → materialize a clean cold leaf without the removed files.
                 GraduatedNodePlan::Materialize(kept) => {
+                    plan_materialized += 1;
                     let rewritten = write_entries_clustered(
                         table,
                         &schema,
@@ -1138,6 +1165,12 @@ pub(crate) async fn fold_closed_into_bucket_index(
                 }
             }
         }
+        log::info!(
+            "graduation append plan: by_reference={} skipped_orphaned={} materialized={}",
+            plan_by_ref,
+            plan_skipped,
+            plan_materialized,
+        );
     }
 
     let bucket_index_path = format!(

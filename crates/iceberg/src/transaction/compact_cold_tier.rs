@@ -221,30 +221,43 @@ const COLD_LEAF_FETCH_CONCURRENCY: usize = 32;
 /// the manifest writer used to build the summary. Equality only — no ordering
 /// — because byte order does not track value order for every primitive type,
 /// and a range test would be silently wrong for signed integers. Pure.
-fn leaf_may_hold_partitions(
+/// Why a leaf survived the prune. The two reasons are operationally very
+/// different and must not be conflated: `Matched` is the prune working as
+/// intended, `Unprunable` is a leaf whose summary is too wide to rule out —
+/// which on a tiered table means it was moved into cold by reference from a
+/// hot manifest that was never partition-tight to begin with. Reporting only
+/// the total made 191 unprunable leaves read as 191 leaves in one partition.
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) enum LeafKeepReason {
+    Matched,
+    Unprunable,
+    Pruned,
+}
+
+fn leaf_keep_reason(
     leaf: &ManifestFile,
     targets: &HashSet<Struct>,
     partition_type: &StructType,
-) -> bool {
+) -> LeafKeepReason {
     if targets.is_empty() {
-        return true;
+        return LeafKeepReason::Unprunable;
     }
     let Some(summary) = leaf.partitions.as_ref() else {
-        return true;
+        return LeafKeepReason::Unprunable;
     };
     let fields = partition_type.fields();
     if summary.len() != fields.len() {
-        return true;
+        return LeafKeepReason::Unprunable;
     }
     // Every field must be tight, else we cannot rule the leaf out at all.
     let mut pinned: Vec<&[u8]> = Vec::with_capacity(summary.len());
     for fs in summary.iter() {
         match (&fs.lower_bound, &fs.upper_bound) {
             (Some(lo), Some(hi)) if lo == hi => pinned.push(lo.as_ref()),
-            _ => return true,
+            _ => return LeafKeepReason::Unprunable,
         }
     }
-    targets.iter().any(|target| {
+    let matched = targets.iter().any(|target| {
         let values = target.fields();
         if values.len() != fields.len() {
             return true;
@@ -266,7 +279,21 @@ fn leaf_may_hold_partitions(
             }
         }
         true
-    })
+    });
+    if matched {
+        LeafKeepReason::Matched
+    } else {
+        LeafKeepReason::Pruned
+    }
+}
+
+/// Back-compat wrapper: a leaf is loaded unless it is provably Pruned.
+fn leaf_may_hold_partitions(
+    leaf: &ManifestFile,
+    targets: &HashSet<Struct>,
+    partition_type: &StructType,
+) -> bool {
+    leaf_keep_reason(leaf, targets, partition_type) != LeafKeepReason::Pruned
 }
 
 fn existing_entry(df: DataFile) -> ManifestEntry {
@@ -356,9 +383,23 @@ impl CompactColdTierAction {
 
         let target_partitions: HashSet<Struct> =
             self.added.iter().map(|df| df.partition.clone()).collect();
+        let mut loaded_matched = 0usize;
+        let mut loaded_unprunable = 0usize;
         let (candidates, pruned): (Vec<ManifestFile>, Vec<ManifestFile>) = leaves
             .into_iter()
-            .partition(|leaf| leaf_may_hold_partitions(leaf, &target_partitions, &partition_type));
+            .partition(|leaf| {
+                match leaf_keep_reason(leaf, &target_partitions, &partition_type) {
+                    LeafKeepReason::Matched => {
+                        loaded_matched += 1;
+                        true
+                    }
+                    LeafKeepReason::Unprunable => {
+                        loaded_unprunable += 1;
+                        true
+                    }
+                    LeafKeepReason::Pruned => false,
+                }
+            });
         let pruned_count = pruned.len();
         // A pruned leaf is unaffected by definition — carry it forward as-is.
         for leaf in pruned {
@@ -421,11 +462,14 @@ impl CompactColdTierAction {
         }
         log::info!(
             "compact_cold_tier leaf scan: leaves={} pruned_by_partition={} loaded={} \
+             loaded_matched={} loaded_unprunable={} \
              empty_leaves={} entries_seen={} alive_entries={} index_partitions={:?} \
              target_partitions={} scan_ms={}",
             pruned_count + candidate_count,
             pruned_count,
             candidate_count,
+            loaded_matched,
+            loaded_unprunable,
             empty_leaves,
             entries_seen,
             alive_entries,
@@ -954,6 +998,46 @@ mod tests {
             upper_bound: None,
         }]);
         assert!(leaf_may_hold_partitions(&leaf_with(half), &targets, &pt));
+    }
+
+    // The two keep-reasons must stay distinguishable. Conflating them made
+    // 191 unprunable leaves read as "191 leaves in one partition", which is a
+    // completely different diagnosis with a completely different fix.
+    #[test]
+    fn keep_reason_separates_matched_from_unprunable() {
+        let pt = long_partition_type();
+        let targets: HashSet<Struct> = [long_partition(7)].into_iter().collect();
+
+        assert!(matches!(
+            leaf_keep_reason(&leaf_with(tight_summary(7)), &targets, &pt),
+            LeafKeepReason::Matched
+        ));
+        assert!(matches!(
+            leaf_keep_reason(&leaf_with(tight_summary(9)), &targets, &pt),
+            LeafKeepReason::Pruned
+        ));
+        // Wide summary: kept, but NOT because it matched — this is the case
+        // that inflates `loaded` on a table whose cold leaves arrived by
+        // reference from non-partition-tight hot manifests.
+        let wide = Some(vec![crate::spec::FieldSummary {
+            contains_null: false,
+            contains_nan: Some(false),
+            lower_bound: Some(Datum::long(1).to_bytes().unwrap()),
+            upper_bound: Some(Datum::long(99).to_bytes().unwrap()),
+        }]);
+        assert!(matches!(
+            leaf_keep_reason(&leaf_with(wide), &targets, &pt),
+            LeafKeepReason::Unprunable
+        ));
+        assert!(matches!(
+            leaf_keep_reason(&leaf_with(None), &targets, &pt),
+            LeafKeepReason::Unprunable
+        ));
+        // No targets at all is also "cannot decide", not "matched".
+        assert!(matches!(
+            leaf_keep_reason(&leaf_with(tight_summary(7)), &HashSet::new(), &pt),
+            LeafKeepReason::Unprunable
+        ));
     }
 
     // Any ONE matching target keeps the leaf — a batched swap spans several

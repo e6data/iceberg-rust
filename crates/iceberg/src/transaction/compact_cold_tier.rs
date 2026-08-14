@@ -204,15 +204,45 @@ fn apply_removals(files: Vec<DataFile>, removed: &HashSet<String>) -> (Vec<DataF
     (survivors, affected)
 }
 
-/// Max wide leaves one commit absorbs into its clustered rewrite.
+/// Default max wide leaves one commit absorbs into its clustered rewrite.
 ///
-/// Bounds the extra write a single commit takes on: the leaves are already in
-/// memory, but their entries still have to be re-encoded, so an unbounded batch
-/// would turn a small compaction into a large one. The remainder carry forward
-/// by reference and are tightened by later commits, which is why the backlog
-/// drains incrementally rather than in one spike. At 32 per commit and ~10
-/// commits per tick, sri-olly logs' 352 wide leaves clear in roughly one tick.
-const MAX_TIGHTEN_LEAVES_PER_COMMIT: usize = 32;
+/// **What actually bounds this is the WRITE, not the leaf count.** The leaves
+/// are already in memory — the load is paid — but `write_entries_clustered`
+/// emits one manifest per partition **sequentially**, so absorbing leaves that
+/// span P partitions costs P sequential S3 PUTs. On sri-olly logs, 352 wide
+/// leaves span ~210 partitions; absorbing them in one commit would be ~210
+/// serial writes (~8s). That, not the entry count, is the ceiling.
+///
+/// Contrast rebalance's `max_manifests_per_commit` (100 on sri-olly): that
+/// bounds load+write rewrites, whereas this is write-only, so this can safely
+/// run HIGHER once the clustered write is parallelised. Until then the default
+/// stays moderate and the remainder carry forward to later commits, draining
+/// the backlog incrementally.
+const DEFAULT_MAX_TIGHTEN_LEAVES_PER_COMMIT: usize = 128;
+
+/// Env override for [`DEFAULT_MAX_TIGHTEN_LEAVES_PER_COMMIT`]. `0` disables
+/// tightening entirely (leaves carry forward exactly as before), which is the
+/// no-rebuild way back if the extra writes ever cost more than they save.
+const MAX_TIGHTEN_ENV: &str = "ICEBERG_COLD_TIGHTEN_MAX_LEAVES_PER_COMMIT";
+
+fn max_tighten_leaves_per_commit() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_max_tighten(std::env::var(MAX_TIGHTEN_ENV).ok().as_deref())
+    })
+}
+
+/// Pure parser. Unset / empty / non-numeric ⇒ default. `0` is honoured
+/// exactly — it is the documented off switch — so this cannot use the
+/// `filter(|n| *n > 0)` shape the other knobs use.
+fn parse_max_tighten(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        Some(v) if !v.is_empty() => v
+            .parse::<usize>()
+            .unwrap_or(DEFAULT_MAX_TIGHTEN_LEAVES_PER_COMMIT),
+        _ => DEFAULT_MAX_TIGHTEN_LEAVES_PER_COMMIT,
+    }
+}
 
 /// Should this wide leaf be absorbed into the clustered rewrite, or carried
 /// forward by reference?
@@ -624,7 +654,7 @@ impl CompactColdTierAction {
                 will_commit,
                 !files.is_empty(),
                 tightened_leaves,
-                MAX_TIGHTEN_LEAVES_PER_COMMIT,
+                max_tighten_leaves_per_commit(),
             ) {
                 tightened_leaves += 1;
                 tightened_entries += files.len();
@@ -641,7 +671,7 @@ impl CompactColdTierAction {
                 "compact_cold_tier tighten: leaves={} entries={} cap={}",
                 tightened_leaves,
                 tightened_entries,
-                MAX_TIGHTEN_LEAVES_PER_COMMIT,
+                max_tighten_leaves_per_commit(),
             );
         }
 
@@ -1125,6 +1155,27 @@ mod tests {
             upper_bound: None,
         }]);
         assert!(leaf_may_hold_partitions(&leaf_with(half), &targets, &pt));
+    }
+
+    #[test]
+    fn tighten_cap_parses_and_zero_disables() {
+        assert_eq!(
+            parse_max_tighten(None),
+            DEFAULT_MAX_TIGHTEN_LEAVES_PER_COMMIT
+        );
+        assert_eq!(
+            parse_max_tighten(Some("")),
+            DEFAULT_MAX_TIGHTEN_LEAVES_PER_COMMIT
+        );
+        assert_eq!(
+            parse_max_tighten(Some("nope")),
+            DEFAULT_MAX_TIGHTEN_LEAVES_PER_COMMIT
+        );
+        assert_eq!(parse_max_tighten(Some(" 256 ")), 256);
+        // 0 is the documented off switch and must be honoured, not defaulted —
+        // it is the no-rebuild way back to carrying every leaf forward.
+        assert_eq!(parse_max_tighten(Some("0")), 0);
+        assert!(!should_tighten(true, true, 0, parse_max_tighten(Some("0"))));
     }
 
     // Tightening must never manufacture work of its own, and must never both

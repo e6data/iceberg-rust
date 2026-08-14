@@ -3274,6 +3274,26 @@ mod test_v4_commit {
         df
     }
 
+    /// Cold leaves whose partition summary is NOT tight — the population that
+    /// can never be pruned and so is loaded by every compaction of every
+    /// partition.
+    async fn cold_wide_leaf_count(table: &crate::table::Table) -> usize {
+        let (meta, _) = read_head_root(table).await;
+        let Some(bp) = &meta.bucket_index_path else {
+            return 0;
+        };
+        let bytes = table.file_io().new_input(bp).unwrap().read().await.unwrap();
+        let bi = crate::spec::bucket_index::read_bucket_index(bytes).unwrap();
+        let spec = table.metadata().default_partition_spec();
+        let ptype = spec.partition_type(table.metadata().current_schema()).unwrap();
+        bi.leaves()
+            .iter()
+            .filter(|l| {
+                !crate::transaction::compact_cold_tier::leaf_is_tight(l, &ptype)
+            })
+            .count()
+    }
+
     /// Count leaves in a table's current cold bucket-index (0 if none yet).
     async fn cold_leaf_count(table: &crate::table::Table) -> usize {
         let (meta, _) = read_head_root(table).await;
@@ -3390,6 +3410,148 @@ mod test_v4_commit {
         assert_eq!(ref_before, fold_before, "same setup on both paths");
         assert_eq!(ref_files, fold_files, "folding must not change the data");
         assert_eq!(fold_files, 8, "no data file may be lost in the fold");
+    }
+
+    /// A tiered table PARTITIONED on `part` (identity). Deliberately does NOT
+    /// set `write.manifest.partition-scoped`, so `commit_v4`'s flush groups a
+    /// multi-partition append into ONE manifest — which is exactly how a WIDE
+    /// leaf is produced in the field.
+    fn tiered_partitioned_table_creation(name: &str) -> TableCreation {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "part", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        TableCreation::builder()
+            .name(name.to_string())
+            .schema(schema)
+            .format_version(FormatVersion::V4)
+            .partition_spec(
+                crate::spec::UnboundPartitionSpec::builder()
+                    .add_partition_field(2, "part".to_string(), crate::spec::Transform::Identity)
+                    .unwrap()
+                    .build(),
+            )
+            .properties(HashMap::from([
+                ("root-manifest.incremental".to_string(), "true".to_string()),
+                ("tiered-metadata.enabled".to_string(), "true".to_string()),
+                ("tiered-metadata.bucket-window-secs".to_string(), "3600".to_string()),
+                ("tiered-metadata.timestamp-field".to_string(), "id".to_string()),
+                // Force the inline->child flush (default threshold is 100), so
+                // the append lands in a CHILD MANIFEST rather than staying
+                // inline. Inline entries are materialized by graduation through
+                // the partition-scoped clustered write and come out tight — the
+                // wide case only exists for entries that reached a child
+                // manifest first. Without this the fixture is silently vacuous.
+                ("root-manifest.inline-threshold".to_string(), "1".to_string()),
+            ]))
+            .build()
+    }
+
+    fn partitioned_ts_file(path: &str, ts: i64, part: i64) -> DataFile {
+        let mut df = test_data_file(path);
+        df.upper_bounds = HashMap::from([(1, crate::spec::Datum::long(ts))]);
+        df.partition = Struct::from_iter([Some(crate::spec::Literal::Primitive(
+            crate::spec::PrimitiveLiteral::Long(part),
+        ))]);
+        df
+    }
+
+    /// A WIDE cold leaf — one whose partition summary spans more than one value
+    /// — can never be proven irrelevant, so `compact_cold_tier` fetches it on
+    /// every compaction of every partition, forever. Live on sri-olly:
+    /// `index_wide=352` of logs' 4,301 leaves, and `loaded_unprunable=352`
+    /// exactly, against `index_wide=0` and a 23× faster scan on a clean table.
+    ///
+    /// Tightening re-emits such a leaf through the partition-scoped clustered
+    /// write. The property that must hold is that **no data file is lost**:
+    /// absorbing a leaf and carrying its ref forward are mutually exclusive, so
+    /// a bug on either side either duplicates rows or drops them.
+    #[tokio::test]
+    async fn test_v4_cold_tighten_preserves_every_data_file() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_cold_tighten".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let mut table = catalog
+            .create_table(&ns, tiered_partitioned_table_creation("v4tighten"))
+            .await
+            .unwrap();
+
+        // One commit carrying several partitions ⇒ a single WIDE child manifest.
+        //
+        // The event time must keep these files HOT through the append. A tiered
+        // table runs a collapse-fold on commit, and anything already past the
+        // bucket window is graduated right there — through the partition-scoped
+        // clustered write, which materialises INLINE files tight. The wide case
+        // only exists for files that reached a CHILD MANIFEST while hot and were
+        // then moved across by reference. `i64::MAX / 4` is far in the future so
+        // the append leaves them hot; the graduation cutoff below is
+        // `i64::MAX / 2`, which closes them.
+        const HOT_TS: i64 = i64::MAX / 4;
+        let wide: Vec<DataFile> = (0..6)
+            .map(|i| partitioned_ts_file(&format!("s3://bucket/data/wide{i}.parquet"), HOT_TS, i))
+            .collect();
+        let expected: HashSet<String> = wide.iter().map(|f| f.file_path.clone()).collect();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(wide)
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        // Close them: the cutoff is above HOT_TS, so the WIDE child manifest
+        // graduates into the cold tier BY REFERENCE — arriving wide.
+        let tx = Transaction::new(&table);
+        let tx = tx.graduate_buckets(1, i64::MAX / 2).apply(tx).unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        let before = cold_paths(&table).await;
+        assert!(
+            expected.is_subset(&before),
+            "setup: all six files must be in cold before tightening"
+        );
+        // Guard against a vacuous pass: the setup MUST have produced a wide
+        // leaf, else this test proves nothing about tightening.
+        assert!(
+            cold_wide_leaf_count(&table).await > 0,
+            "setup: expected a wide cold leaf to tighten"
+        );
+
+        // A compaction touching ONE file makes will_commit true, so the
+        // tightening rides it — which is the only way it ever runs.
+        let victim = format!("s3://bucket/data/wide0.parquet");
+        let merged = partitioned_ts_file("s3://bucket/data/merged0.parquet", HOT_TS, 0);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .compact_cold_tier()
+            .remove_files([victim.clone()])
+            .add_files([merged])
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        let after = cold_paths(&table).await;
+        // Every file except the compacted-away one survives, and the merged
+        // output is present. A tightening bug shows up here as missing paths.
+        for path in expected.iter().filter(|p| **p != victim) {
+            assert!(
+                after.contains(path),
+                "tightening dropped {path}; cold now holds {after:?}"
+            );
+        }
+        assert!(after.contains("s3://bucket/data/merged0.parquet"));
+        assert!(!after.contains(&victim), "compacted-away file must be gone");
+        // And the point of the exercise: the wide leaf is gone, so it will not
+        // be fetched on every future compaction of every partition.
+        assert_eq!(
+            cold_wide_leaf_count(&table).await,
+            0,
+            "tightening must leave no wide leaf behind"
+        );
     }
 
     /// Regression for the graduate-durability bug. The old standalone graduate

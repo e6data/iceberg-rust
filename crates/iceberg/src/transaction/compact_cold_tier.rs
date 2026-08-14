@@ -375,6 +375,16 @@ impl CompactColdTierAction {
         }))
         .buffered(COLD_LEAF_FETCH_CONCURRENCY);
 
+        // Diagnostic for the leaf-count investigation: sri-olly logs carries
+        // 4,280 cold leaves against ~50 live data files (~85 leaves per live
+        // file), and the two candidate explanations need different fixes.
+        // Either those leaves hold nothing live — in which case the append path
+        // must validate before adding, since graduation's existing
+        // `GraduatedNodePlan::Skip` only runs when `removed_paths` is non-empty
+        // — or they do hold data, and the fix is merging same-partition leaves.
+        // `empty_leaves` separates them, riding the load we already do.
+        let mut empty_leaves: usize = 0;
+        let mut entries_seen: usize = 0;
         while let Some((leaf, manifest)) = loaded.next().await {
             let manifest = manifest?;
             let files: Vec<DataFile> = manifest
@@ -383,6 +393,10 @@ impl CompactColdTierAction {
                 .filter(|e| e.is_alive_and_kept(&removed_paths_set))
                 .map(|e| e.data_file().clone())
                 .collect();
+            entries_seen += manifest.entries().len();
+            if files.is_empty() {
+                empty_leaves += 1;
+            }
             let (leaf_survivors, affected) = apply_removals(files, &self.removed);
             if affected {
                 any_affected = true;
@@ -397,10 +411,12 @@ impl CompactColdTierAction {
         }
         log::info!(
             "compact_cold_tier leaf scan: leaves={} pruned_by_partition={} loaded={} \
-             target_partitions={} scan_ms={}",
+             empty_leaves={} entries_seen={} target_partitions={} scan_ms={}",
             pruned_count + candidate_count,
             pruned_count,
             candidate_count,
+            empty_leaves,
+            entries_seen,
             target_partitions.len(),
             scan_start.elapsed().as_millis() as u64,
         );

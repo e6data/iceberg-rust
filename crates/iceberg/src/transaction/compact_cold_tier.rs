@@ -204,6 +204,33 @@ fn apply_removals(files: Vec<DataFile>, removed: &HashSet<String>) -> (Vec<DataF
     (survivors, affected)
 }
 
+/// Max wide leaves one commit absorbs into its clustered rewrite.
+///
+/// Bounds the extra write a single commit takes on: the leaves are already in
+/// memory, but their entries still have to be re-encoded, so an unbounded batch
+/// would turn a small compaction into a large one. The remainder carry forward
+/// by reference and are tightened by later commits, which is why the backlog
+/// drains incrementally rather than in one spike. At 32 per commit and ~10
+/// commits per tick, sri-olly logs' 352 wide leaves clear in roughly one tick.
+const MAX_TIGHTEN_LEAVES_PER_COMMIT: usize = 32;
+
+/// Should this wide leaf be absorbed into the clustered rewrite, or carried
+/// forward by reference?
+///
+/// Exactly one of the two must happen for every candidate — absorbing AND
+/// carrying would duplicate its rows into the new bucket-index, doing neither
+/// would drop them. The caller's if/else makes that structural; this decides
+/// which side. Pure.
+fn should_tighten(will_commit: bool, has_survivors: bool, done: usize, cap: usize) -> bool {
+    // Never manufacture a commit: tightening rides a write that is happening
+    // regardless, so a pass with nothing to compact stays a no-op.
+    will_commit
+        // A leaf with no survivors has nothing to re-emit; carrying its ref
+        // forward preserves existing behaviour for that (already odd) case.
+        && has_survivors
+        && done < cap
+}
+
 /// Concurrency for the cold-leaf load that survives the partition prune.
 /// Matches the fold's fanout in `graduate_buckets`; well inside S3's
 /// per-client budget.
@@ -417,21 +444,23 @@ impl CompactColdTierAction {
             self.added.iter().map(|df| df.partition.clone()).collect();
         let mut loaded_matched = 0usize;
         let mut loaded_unprunable = 0usize;
-        let (candidates, pruned): (Vec<ManifestFile>, Vec<ManifestFile>) = leaves
-            .into_iter()
-            .partition(|leaf| {
-                match leaf_keep_reason(leaf, &target_partitions, &partition_type) {
-                    LeafKeepReason::Matched => {
-                        loaded_matched += 1;
-                        true
-                    }
-                    LeafKeepReason::Unprunable => {
-                        loaded_unprunable += 1;
-                        true
-                    }
-                    LeafKeepReason::Pruned => false,
+        let mut candidates: Vec<(ManifestFile, bool)> = Vec::new();
+        let mut pruned: Vec<ManifestFile> = Vec::new();
+        for leaf in leaves {
+            match leaf_keep_reason(&leaf, &target_partitions, &partition_type) {
+                LeafKeepReason::Matched => {
+                    loaded_matched += 1;
+                    candidates.push((leaf, false));
                 }
-            });
+                LeafKeepReason::Unprunable => {
+                    loaded_unprunable += 1;
+                    // `true` = wide: a tightening candidate, since it is only
+                    // here because its summary could not rule it out.
+                    candidates.push((leaf, true));
+                }
+                LeafKeepReason::Pruned => pruned.push(leaf),
+            }
+        }
         let pruned_count = pruned.len();
         // A pruned leaf is unaffected by definition — carry it forward as-is.
         for leaf in pruned {
@@ -447,11 +476,11 @@ impl CompactColdTierAction {
         // `buffered`, not `_unordered`: leaf order drives the resulting
         // bucket-index, and a deterministic index is worth the head-of-line
         // wait at this concurrency.
-        let mut loaded = stream_iter(candidates.into_iter().map(|leaf| {
+        let mut loaded = stream_iter(candidates.into_iter().map(|(leaf, wide)| {
             let file_io = file_io.clone();
             async move {
                 let res = leaf.load_manifest(&file_io).await;
-                (leaf, res)
+                (leaf, wide, res)
             }
         }))
         .buffered(COLD_LEAF_FETCH_CONCURRENCY);
@@ -467,7 +496,10 @@ impl CompactColdTierAction {
         let mut empty_leaves: usize = 0;
         let mut entries_seen: usize = 0;
         let mut alive_entries: usize = 0;
-        while let Some((leaf, manifest)) = loaded.next().await {
+        // Wide leaves that this pass could tighten. Collected, not applied —
+        // the decision needs `any_affected`, which is only known after the loop.
+        let mut tighten_candidates: Vec<(ManifestFile, Vec<DataFile>)> = Vec::new();
+        while let Some((leaf, wide, manifest)) = loaded.next().await {
             let manifest = manifest?;
             let files: Vec<DataFile> = manifest
                 .entries()
@@ -484,6 +516,14 @@ impl CompactColdTierAction {
             if affected {
                 any_affected = true;
                 survivors.extend(leaf_survivors.into_iter().map(existing_entry));
+            } else if wide && !leaf_survivors.is_empty() {
+                // Unaffected, but WIDE — it is loaded on every compaction of
+                // every partition because its summary can never rule it out.
+                // We already hold its entries, so re-emitting it partition-tight
+                // costs one write on a read already paid for, and removes it
+                // from every future scan permanently. Deferred until we know
+                // this commit is happening at all.
+                tighten_candidates.push((leaf, leaf_survivors));
             } else {
                 // Unaffected — keep the leaf as-is (no rewrite, no re-read cost).
                 kept_leaf_refs.push(RootManifestEntry::ManifestRef {
@@ -551,6 +591,59 @@ impl CompactColdTierAction {
 
         let mut rewrite_entries = survivors;
         rewrite_entries.extend(self.added.iter().cloned().map(existing_entry));
+
+        // Lazy wide-leaf tightening.
+        //
+        // A wide leaf is one whose partition summary spans more than one value,
+        // so `leaf_keep_reason` can never prove it irrelevant — it is fetched on
+        // EVERY compaction of EVERY partition, forever. Measured on sri-olly:
+        // logs `index_wide=352` of 4,301 leaves, and `loaded_unprunable=352`
+        // exactly, i.e. the wide population IS the scan cost. The control is
+        // metrics_1m, freshly reset: `index_wide=0`, scan 25ms against logs'
+        // 569ms.
+        //
+        // Three properties make fixing it here the cheap place:
+        //   * we already loaded them — the entries are in memory;
+        //   * re-emitting through the same partition-scoped clustered write the
+        //     survivors take yields tight leaves, so each one fixed leaves every
+        //     future scan permanently;
+        //   * it is pure metadata reshaping. A wide leaf returns correct results,
+        //     it just cannot be skipped, so there is no correctness reason to pay
+        //     for this synchronously at the graduation boundary — where gating
+        //     has already deadlocked this system once (hot root ~14k).
+        //
+        // Bounded, and deliberately NOT allowed to create work of its own: only
+        // runs when the commit is happening regardless, and caps how many leaves
+        // one commit absorbs. The remainder carry forward and get their turn on
+        // later commits, so the backlog drains incrementally.
+        let will_commit = any_affected || !self.added.is_empty();
+        let mut tightened_leaves = 0usize;
+        let mut tightened_entries = 0usize;
+        for (leaf, files) in tighten_candidates {
+            if should_tighten(
+                will_commit,
+                !files.is_empty(),
+                tightened_leaves,
+                MAX_TIGHTEN_LEAVES_PER_COMMIT,
+            ) {
+                tightened_leaves += 1;
+                tightened_entries += files.len();
+                rewrite_entries.extend(files.into_iter().map(existing_entry));
+            } else {
+                kept_leaf_refs.push(RootManifestEntry::ManifestRef {
+                    manifest_file: leaf,
+                    mdv: None,
+                });
+            }
+        }
+        if tightened_leaves > 0 {
+            log::info!(
+                "compact_cold_tier tighten: leaves={} entries={} cap={}",
+                tightened_leaves,
+                tightened_entries,
+                MAX_TIGHTEN_LEAVES_PER_COMMIT,
+            );
+        }
 
         let new_leaves = write_entries_clustered(
             table,
@@ -1032,6 +1125,45 @@ mod tests {
             upper_bound: None,
         }]);
         assert!(leaf_may_hold_partitions(&leaf_with(half), &targets, &pt));
+    }
+
+    // Tightening must never manufacture work of its own, and must never both
+    // absorb and carry the same leaf. The cap is what keeps one commit from
+    // swallowing the whole backlog.
+    #[test]
+    fn tighten_rides_an_existing_commit_and_stays_bounded() {
+        // Rides a commit that is happening anyway.
+        assert!(should_tighten(true, true, 0, 32));
+        // Never turns a no-op pass into a write.
+        assert!(!should_tighten(false, true, 0, 32));
+        // Nothing to re-emit ⇒ carry the ref forward instead.
+        assert!(!should_tighten(true, false, 0, 32));
+        // Cap is exclusive: 32 already done means stop at 32.
+        assert!(should_tighten(true, true, 31, 32));
+        assert!(!should_tighten(true, true, 32, 32));
+        assert!(!should_tighten(true, true, 99, 32));
+        // A zero cap disables tightening entirely.
+        assert!(!should_tighten(true, true, 0, 0));
+    }
+
+    /// Every candidate goes exactly one way — absorbed or carried, never both
+    /// and never neither. Absorbing AND carrying would duplicate rows into the
+    /// new bucket-index; doing neither would drop them.
+    #[test]
+    fn every_candidate_is_absorbed_xor_carried() {
+        let cap = 3usize;
+        let candidates = vec![true, true, true, true, true, false];
+        let (mut absorbed, mut carried, mut done) = (0usize, 0usize, 0usize);
+        for has_survivors in candidates.iter().copied() {
+            if should_tighten(true, has_survivors, done, cap) {
+                done += 1;
+                absorbed += 1;
+            } else {
+                carried += 1;
+            }
+        }
+        assert_eq!(absorbed, 3, "cap bounds the absorbed set");
+        assert_eq!(absorbed + carried, 6, "no candidate is lost or double-counted");
     }
 
     // Tightness is the property that makes a leaf prunable at all, and it is

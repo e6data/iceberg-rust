@@ -37,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::{iter as stream_iter, StreamExt};
+use futures::stream::{StreamExt, iter as stream_iter};
 use uuid::Uuid;
 
 /// Concurrency for the parallel `load_manifest` fallback in the collapse-fold
@@ -150,18 +150,18 @@ use super::rebalance_root_manifest::write_entries_clustered;
 use crate::error::Result;
 use crate::spec::bucket_index::{read_bucket_index, write_bucket_index};
 use crate::spec::root_manifest::{
-    read_root_manifest, reconstruct_root, write_root_manifest, RootManifestEntry,
-    RootManifestMetadata,
+    RootManifestEntry, RootManifestMetadata, read_root_manifest, reconstruct_root,
+    write_root_manifest,
 };
 use crate::spec::{
-    DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
-    Operation, PartitionSpec, PrimitiveLiteral, Snapshot, SnapshotReference, SnapshotRetention,
-    Summary, Transform, MAIN_BRANCH,
+    DataFile, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile,
+    ManifestStatus, Operation, PartitionSpec, PrimitiveLiteral, Snapshot, SnapshotReference,
+    SnapshotRetention, Summary, Transform,
 };
 use crate::table::Table;
-use crate::transaction::action::TransactionAction;
-use crate::transaction::snapshot::{max_chain_depth, SnapshotProducer};
 use crate::transaction::ActionCommit;
+use crate::transaction::action::TransactionAction;
+use crate::transaction::snapshot::{SnapshotProducer, max_chain_depth};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
@@ -420,18 +420,14 @@ fn plan_graduated_node(
     }
 }
 
-/// Per-pass graduation bound: the tighter of the caller's per-collapse cap and
-/// the fold batch size. `None` on both ⇒ unbounded (manual/maintenance use).
-/// Pure.
-fn effective_graduation_cap(
-    max_graduate: Option<usize>,
-    fold_leaves: Option<usize>,
-) -> Option<usize> {
-    match (max_graduate, fold_leaves) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, b) => b,
-    }
+/// How many of the graduating nodes a pass will FOLD. The remainder still
+/// graduate — by reference, exactly as they did before folding existed.
+///
+/// This must never bound graduation itself. Conflating the two capped an
+/// unbounded graduation at the fold batch size and starved the cold tier; see
+/// the call site for the measured 5-hour lag. Pure.
+fn fold_batch_size(fold_leaves: Option<usize>, graduating: usize) -> usize {
+    fold_leaves.map(|n| n.min(graduating)).unwrap_or(0)
 }
 
 /// Distinct partition keys among `nodes`, read from their partition SUMMARIES —
@@ -593,8 +589,9 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // that referenced them), bounded by `max_ttl_drop_files`. `ttl_budget_left`
     // returns whether another leaf/entry may still be dropped this fold.
     let mut ttl_dropped_paths: Vec<String> = Vec::new();
-    let ttl_budget_left =
-        |dropped: &Vec<String>| retention_cutoff_micros.is_some() && dropped.len() < max_ttl_drop_files;
+    let ttl_budget_left = |dropped: &Vec<String>| {
+        retention_cutoff_micros.is_some() && dropped.len() < max_ttl_drop_files
+    };
 
     // Existing cold leaves (graduated nodes get appended to these).
     let bi_load_start = std::time::Instant::now();
@@ -746,8 +743,15 @@ pub(crate) async fn fold_closed_into_bucket_index(
         // already-pruned cold tier (cold_total low).
         log::info!(
             "ttl cold-leaf prune: ts_field_id={} cutoff_us={} cold_leaves={} with_ts={} none_ts={} oldest_max_ts={:?} newest_max_ts={:?} dropped_leaves={} dropped_paths={}",
-            ts_field_id, retention_cutoff, cold_total, with_ts_count, none_ts_count,
-            oldest_max_ts, newest_max_ts, dropped_leaves, ttl_dropped_paths.len()
+            ts_field_id,
+            retention_cutoff,
+            cold_total,
+            with_ts_count,
+            none_ts_count,
+            oldest_max_ts,
+            newest_max_ts,
+            dropped_leaves,
+            ttl_dropped_paths.len()
         );
         cold_leaves = surviving;
     }
@@ -840,7 +844,10 @@ pub(crate) async fn fold_closed_into_bucket_index(
                 if expired && ttl_budget_left(&ttl_dropped_paths) {
                     let manifest = manifest_file.load_manifest(table.file_io()).await?;
                     for e in manifest.entries().iter().filter(|e| e.is_alive()) {
-                        push_data_file_and_sidecar(&mut ttl_dropped_paths, e.data_file().file_path());
+                        push_data_file_and_sidecar(
+                            &mut ttl_dropped_paths,
+                            e.data_file().file_path(),
+                        );
                     }
                     ttl_dropped_paths.push(manifest_file.manifest_path.clone());
                     continue;
@@ -872,11 +879,24 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // graduation can otherwise move most of the table in one commit; cap it and
     // graduate the COLDEST refs first — the rest stay hot and graduate on later
     // collapses (eventually consistent, bounded per-commit work).
-    // Two independent bounds, whichever is tighter: the caller's per-collapse
-    // graduation cap, and (when folding) the per-pass fold batch. Deferring a
-    // node keeps it HOT, so it is folded on the pass that finally graduates it —
-    // nothing crosses into cold unfolded.
-    if let Some(cap) = effective_graduation_cap(max_graduate, fold_leaves) {
+    // GRADUATION is bounded ONLY by the caller's cap. The fold batch must NOT
+    // bound it.
+    //
+    // An earlier version took the tighter of the two, on the reasoning that
+    // deferring a node kept it hot until a pass could fold it, so "nothing
+    // crosses into cold unfolded". That safety property was invented: folding
+    // is an optimisation, and moving a node across BY REFERENCE is the
+    // original, correct behaviour. What the merged cap actually did was turn an
+    // UNBOUNDED graduation (the standalone action passes `max_graduate: None`)
+    // into 256 nodes per tick.
+    //
+    // Measured on sri-olly: two of three tables graduated exactly 256 nodes
+    // every tick — pinned at the bound — so the cold tier fell ~5 hours behind
+    // the graduate cutoff. The cold-compaction sweep window tracks that same
+    // cutoff (`[cutoff-5, cutoff]`), so it never overlapped the newest cold
+    // data (newest cold hour 496332 vs window start 496333): Phase 6b walked
+    // 0 of 13,099 leaves and compacted nothing.
+    if let Some(cap) = max_graduate {
         if closed_refs.len() > cap {
             closed_refs.sort_by_key(|(_, mx)| *mx);
             for (mf, _) in closed_refs.split_off(cap) {
@@ -894,9 +914,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
     // Nothing to do only if no graduation AND no TTL prune happened. A TTL-only
     // fold (cold leaves dropped, nothing graduated) still must persist the
     // pruned bucket-index and return the dropped paths.
-    if graduated_nodes.is_empty()
-        && closed_inline_files.is_empty()
-        && ttl_dropped_paths.is_empty()
+    if graduated_nodes.is_empty() && closed_inline_files.is_empty() && ttl_dropped_paths.is_empty()
     {
         // Opportunistically warm the max-ts sidecar for the CURRENT
         // bucket-index if it's missing / incomplete. Steady-state folds
@@ -909,9 +927,9 @@ pub(crate) async fn fold_closed_into_bucket_index(
             // A leaf is "covered" only by a REAL cached value; a `None` entry is
             // poison and must be rewritten with a real value if we now have one.
             let covers_all = !cold_leaves.is_empty()
-                && cold_leaves.iter().all(|leaf| {
-                    sidecar_hit(sidecar_max_ts.get(&leaf.manifest_path)).is_some()
-                });
+                && cold_leaves
+                    .iter()
+                    .all(|leaf| sidecar_hit(sidecar_max_ts.get(&leaf.manifest_path)).is_some());
             if !covers_all {
                 let mut new_sidecar: HashMap<String, Option<i64>> =
                     HashMap::with_capacity(cold_leaves.len());
@@ -1032,12 +1050,19 @@ pub(crate) async fn fold_closed_into_bucket_index(
     }
     if fold_this_pass {
         let default_spec_id = spec.spec_id();
-        let (to_fold, by_ref): (Vec<ManifestFile>, Vec<ManifestFile>) =
+        let (mut to_fold, by_ref): (Vec<ManifestFile>, Vec<ManifestFile>) =
             graduated_nodes.into_iter().partition(|mf| {
-                mf.content == ManifestContentType::Data
-                    && mf.partition_spec_id == default_spec_id
+                mf.content == ManifestContentType::Data && mf.partition_spec_id == default_spec_id
             });
         cold_leaves.extend(by_ref);
+        // Bound the FOLD, not the graduation. Nodes past the batch still cross
+        // into cold this pass — by reference, which is what they did before
+        // folding existed. Capping graduation here instead is what starved the
+        // cold tier (see the graduation-cap comment above).
+        let batch = fold_batch_size(fold_leaves, to_fold.len());
+        if to_fold.len() > batch {
+            cold_leaves.extend(to_fold.split_off(batch));
+        }
 
         let load_start = std::time::Instant::now();
         let file_io = table.file_io();
@@ -1052,8 +1077,9 @@ pub(crate) async fn fold_closed_into_bucket_index(
         .buffer_unordered(FOLD_MANIFEST_FETCH_CONCURRENCY);
         while let Some((mf, res)) = s.next().await {
             match res {
-                Ok(manifest) => folded_entries
-                    .extend(fold_surviving_entries(manifest.entries(), removed_paths)),
+                Ok(manifest) => {
+                    folded_entries.extend(fold_surviving_entries(manifest.entries(), removed_paths))
+                }
                 // Best-effort, mirroring the materialize path below: a node we
                 // can't read still has to graduate, so fall back to moving it
                 // by reference rather than failing the whole commit.
@@ -1222,12 +1248,15 @@ pub(crate) async fn fold_closed_into_bucket_index(
             new_sidecar.insert(leaf.manifest_path.clone(), Some(v));
         }
     }
-    if let Err(e) =
-        write_maxts_sidecar(table.file_io(), &bucket_index_path, ts_field_id, new_sidecar).await
+    if let Err(e) = write_maxts_sidecar(
+        table.file_io(),
+        &bucket_index_path,
+        ts_field_id,
+        new_sidecar,
+    )
+    .await
     {
-        log::warn!(
-            "tiered collapse-fold: max-ts sidecar write failed (non-fatal): {e}"
-        );
+        log::warn!("tiered collapse-fold: max-ts sidecar write failed (non-fatal): {e}");
     }
     let write_ms = write_start.elapsed().as_millis() as u64;
 
@@ -1289,8 +1318,7 @@ impl GraduateBucketsAction {
         // Fold closed entries into the cold bucket-index. Returns the entries
         // that stay hot plus the updated bucket-index; None ⇒ nothing closed
         // this pass.
-        let removed_set: HashSet<String> =
-            rm_metadata.removed_paths.iter().cloned().collect();
+        let removed_set: HashSet<String> = rm_metadata.removed_paths.iter().cloned().collect();
         let (kept, fold) = fold_closed_into_bucket_index(
             table,
             entries,
@@ -1329,11 +1357,7 @@ impl GraduateBucketsAction {
     /// head. Runs on every `commit()` attempt. Cost: ~500 ms on the delta
     /// path (metadata-only parquet write), or flat-base serialize+PUT when
     /// `chain_depth >= MAX_CHAIN`.
-    async fn finalize(
-        &self,
-        table: &Table,
-        prep: &PreparedGraduation,
-    ) -> Result<ActionCommit> {
+    async fn finalize(&self, table: &Table, prep: &PreparedGraduation) -> Result<ActionCommit> {
         let current_snapshot = table.metadata().current_snapshot().ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -1718,15 +1742,40 @@ mod tests {
         assert!(!fold_would_consolidate(&under));
     }
 
-    // The two bounds compose as a min, and either one alone still binds. The
-    // tighter-of-the-two rule is what keeps a node from graduating unfolded.
+    // The fold batch and the graduation cap are INDEPENDENT. Folding is an
+    // optimisation; graduating by reference is the correct fallback. Binding
+    // them together capped an unbounded graduation at the fold size.
     #[test]
-    fn graduation_cap_takes_the_tighter_bound() {
-        assert_eq!(effective_graduation_cap(Some(16), Some(256)), Some(16));
-        assert_eq!(effective_graduation_cap(Some(512), Some(256)), Some(256));
-        assert_eq!(effective_graduation_cap(Some(16), None), Some(16));
-        assert_eq!(effective_graduation_cap(None, Some(256)), Some(256));
-        assert_eq!(effective_graduation_cap(None, None), None);
+    fn fold_batch_bounds_folding_not_graduation() {
+        // The fold batch bounds FOLDING only; graduation is bounded solely by
+        // the caller's cap. The old `effective_graduation_cap` took the tighter
+        // of the two, which silently capped an unbounded graduation at 256
+        // nodes/tick and left the cold tier ~5 hours behind the sweep window.
+        assert_eq!(
+            fold_batch_size(Some(256), 1000),
+            256,
+            "fold batch caps folding"
+        );
+        assert_eq!(
+            fold_batch_size(Some(256), 10),
+            10,
+            "never exceeds what is graduating"
+        );
+        assert_eq!(
+            fold_batch_size(None, 1000),
+            0,
+            "no fold configured => fold nothing"
+        );
+        assert_eq!(fold_batch_size(Some(0), 1000), 0, "0 disables folding");
+        // The property that regressed: with no caller cap, an arbitrarily large
+        // set still graduates in full — only the FOLDED subset is bounded.
+        let graduating = 1000usize;
+        let folded = fold_batch_size(Some(256), graduating);
+        assert_eq!(
+            graduating - folded,
+            744,
+            "the remainder graduates by reference in the SAME pass, not later"
+        );
     }
 
     // Folding is opt-in per writer: `with_leaf_fold(0)` means "off", so the
@@ -1735,11 +1784,15 @@ mod tests {
     fn leaf_fold_is_opt_in_and_zero_disables() {
         assert_eq!(GraduateBucketsAction::new(1, 0).fold_leaves, None);
         assert_eq!(
-            GraduateBucketsAction::new(1, 0).with_leaf_fold(256).fold_leaves,
+            GraduateBucketsAction::new(1, 0)
+                .with_leaf_fold(256)
+                .fold_leaves,
             Some(256)
         );
         assert_eq!(
-            GraduateBucketsAction::new(1, 0).with_leaf_fold(0).fold_leaves,
+            GraduateBucketsAction::new(1, 0)
+                .with_leaf_fold(0)
+                .fold_leaves,
             None
         );
     }
@@ -1801,7 +1854,11 @@ mod tests {
         let real = Some(900i64);
         let poison = None::<i64>;
         assert_eq!(sidecar_hit(Some(&real)), Some(900), "real value → hit");
-        assert_eq!(sidecar_hit(Some(&poison)), None, "cached None → miss (poison)");
+        assert_eq!(
+            sidecar_hit(Some(&poison)),
+            None,
+            "cached None → miss (poison)"
+        );
         assert_eq!(sidecar_hit(None), None, "absent → miss");
     }
 
@@ -1843,7 +1900,10 @@ mod tests {
         );
         // identity on a timestamp column: bound IS the max event time (micros).
         assert_eq!(
-            transform_upper_micros(&Transform::Identity, &1_700_000_000_000_000i64.to_le_bytes()),
+            transform_upper_micros(
+                &Transform::Identity,
+                &1_700_000_000_000_000i64.to_le_bytes()
+            ),
             Some(1_700_000_000_000_000)
         );
         // variable-width / non-time transforms fall back (None → load manifest).
@@ -1853,6 +1913,9 @@ mod tests {
         );
         // truncated/garbage bytes → None (safe fallback), never a bogus bound.
         assert_eq!(transform_upper_micros(&Transform::Hour, &[1u8, 2]), None);
-        assert_eq!(transform_upper_micros(&Transform::Identity, &[1u8, 2, 3, 4]), None);
+        assert_eq!(
+            transform_upper_micros(&Transform::Identity, &[1u8, 2, 3, 4]),
+            None
+        );
     }
 }

@@ -363,6 +363,20 @@ fn ref_max_event_micros(mf: &ManifestFile, spec: &PartitionSpec, ts_field_id: i3
     None
 }
 
+/// Drop leaves whose `manifest_path` already appeared, keeping the first
+/// occurrence (so ordering is preserved). Returns how many were removed.
+///
+/// Pure so it can be tested directly: the first version of this guard ran
+/// AFTER `write_bucket_index`, which meant it mutated only the in-memory vec
+/// and the persisted index still held every duplicate — while the log line
+/// claimed they had been dropped. Keep the call site above the write.
+fn dedupe_leaves_by_path(leaves: &mut Vec<ManifestFile>) -> usize {
+    let before = leaves.len();
+    let mut seen: HashSet<String> = HashSet::with_capacity(before);
+    leaves.retain(|mf| seen.insert(mf.manifest_path.clone()));
+    before - leaves.len()
+}
+
 /// Outcome of a graduation fold when something was actually moved to cold.
 pub(crate) struct FoldOutcome {
     /// Path of the freshly-written bucket-index (existing cold leaves + newly
@@ -1225,6 +1239,24 @@ pub(crate) async fn fold_closed_into_bucket_index(
         );
     }
 
+    // Defence in depth: never let the same leaf appear twice in the index.
+    // The tombstone fix removes the cause (refs replayed from the base root);
+    // this makes the corruption structurally impossible whichever path replays
+    // a ref.
+    //
+    // MUST run before `write_bucket_index` below — deduping after the write
+    // mutates only the in-memory vec, so the persisted index keeps every
+    // duplicate while the log claims they were dropped. That is exactly what
+    // the first version of this guard did.
+    let deduped = dedupe_leaves_by_path(&mut cold_leaves);
+    if deduped > 0 {
+        log::warn!(
+            "tiered collapse-fold: dropped {deduped} duplicate leaf refs before writing the \
+             bucket-index ({} distinct remain) — a ref reached the index twice",
+            cold_leaves.len(),
+        );
+    }
+
     let bucket_index_path = format!(
         "{}/{}/bucket-index-{}-{}.parquet",
         table.metadata().location(),
@@ -1285,25 +1317,6 @@ pub(crate) async fn fold_closed_into_bucket_index(
         log::warn!("tiered collapse-fold: max-ts sidecar write failed (non-fatal): {e}");
     }
     let write_ms = write_start.elapsed().as_millis() as u64;
-
-    // Defence in depth: never let the same leaf appear twice in the index. The
-    // tombstone fix removes the cause (refs replayed from the base root); this
-    // makes the corruption structurally impossible whichever path replays a
-    // ref. O(n) on a set already in hand; keeps first occurrence so ordering
-    // is preserved.
-    {
-        let before = cold_leaves.len();
-        let mut seen: HashSet<String> = HashSet::with_capacity(before);
-        cold_leaves.retain(|mf| seen.insert(mf.manifest_path.clone()));
-        let dropped = before - cold_leaves.len();
-        if dropped > 0 {
-            log::warn!(
-                "tiered collapse-fold: dropped {dropped} duplicate leaf refs from the \
-                 bucket-index ({before} -> {} distinct) — a ref reached the index twice",
-                cold_leaves.len(),
-            );
-        }
-    }
 
     let cold_leaves_total = cold_leaves.len();
     log::info!(
@@ -1805,6 +1818,47 @@ mod tests {
     // The fold batch and the graduation cap are INDEPENDENT. Folding is an
     // optimisation; graduating by reference is the correct fallback. Binding
     // them together capped an unbounded graduation at the fold size.
+    /// The guard must remove duplicates and report the count. Its first
+    /// version ran after `write_bucket_index`, so the persisted index kept
+    /// every duplicate while the log claimed otherwise — measured live as
+    /// "dropped 262473 (281795 -> 19322)" against an index still holding
+    /// 281,795 rows. Ordering is preserved (first occurrence wins) because the
+    /// index is written in leaf order.
+    #[test]
+    fn dedupe_leaves_keeps_first_occurrence_and_counts_drops() {
+        let mf = |p: &str| ManifestFile {
+            manifest_path: p.to_string(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        };
+        let mut leaves = vec![mf("a"), mf("b"), mf("a"), mf("c"), mf("b"), mf("a")];
+        let dropped = dedupe_leaves_by_path(&mut leaves);
+        assert_eq!(dropped, 3, "three redundant entries removed");
+        let paths: Vec<&str> = leaves.iter().map(|m| m.manifest_path.as_str()).collect();
+        assert_eq!(paths, vec!["a", "b", "c"], "first occurrence order preserved");
+
+        let mut clean = vec![mf("x"), mf("y")];
+        assert_eq!(
+            dedupe_leaves_by_path(&mut clean),
+            0,
+            "a clean index is untouched and reports zero"
+        );
+        assert_eq!(clean.len(), 2);
+    }
+
     #[test]
     fn fold_batch_bounds_folding_not_graduation() {
         // The fold batch bounds FOLDING only; graduation is bounded solely by

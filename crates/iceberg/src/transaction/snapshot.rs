@@ -3961,6 +3961,124 @@ mod test_v4_commit {
     ///   3. Root paths DIFFER (each attempt writes its own delta root with
     ///      the current head as prev_root_path).
     ///   4. Head after apply is a delta (chain_depth > 0, prev_root_path=Some).
+    /// Graduating twice with NO new data in between must leave the cold
+    /// bucket-index exactly as it was. Nothing asserted this, and the gap ran
+    /// in production.
+    ///
+    /// The delta root a graduation writes carries NO entries
+    /// (`entries_to_write = &[]`), so tombstones are its only way to express a
+    /// removal. It emitted an empty `removed_paths`, and `finalize_reconstruct`
+    /// returned every `ManifestRef` verbatim regardless of tombstones — so the
+    /// base root beneath the delta kept offering the already-graduated refs and
+    /// each later tick re-graduated them into the index again.
+    ///
+    /// sri-olly 2026-08-16, metrics_1m: 230,456 index rows for 18,053 distinct
+    /// leaves — 92.2% duplicates, one leaf repeated 74x, +3,938 rows/tick and
+    /// unbounded. 100% of the duplicated paths were resident in the base root.
+    #[tokio::test]
+    async fn test_v4_graduate_twice_does_not_duplicate_cold_leaves() {
+        let catalog = new_memory_catalog().await;
+        let ns = NamespaceIdent::new("test_grad_idempotent".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let mut table = catalog
+            .create_table(&ns, tiered_table_creation("v4gradidem", 3600))
+            .await
+            .unwrap();
+
+        // Closed (old-timestamp) files, each flushed into its own child
+        // manifest ref by the tiered writer.
+        const N: usize = 8;
+        for i in 0..N {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![ts_data_file(
+                    &format!("s3://bucket/data/idem{i}.parquet"),
+                    1000,
+                )])
+                .apply(tx)
+                .unwrap();
+            table = tx.commit(&catalog).await.unwrap();
+        }
+
+        let ts_field_id: i32 = 1;
+        let cutoff_micros: i64 = i64::MAX / 2; // everything below is closed
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .graduate_buckets(ts_field_id, cutoff_micros)
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        let leaves_after_first = cold_leaf_count(&table).await;
+        let visible_after_first = visible_paths(&table).await;
+        assert!(
+            leaves_after_first > 0,
+            "first graduation must actually move something into cold, \
+             otherwise this test proves nothing"
+        );
+
+        // Second graduation, NOTHING added in between: no closed data is left
+        // in the hot root, so the index must not change.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .graduate_buckets(ts_field_id, cutoff_micros)
+            .apply(tx)
+            .unwrap();
+        table = tx.commit(&catalog).await.unwrap();
+
+        assert_eq!(
+            cold_leaf_count(&table).await,
+            leaves_after_first,
+            "re-graduating with no new data must not grow the bucket-index \
+             (before the fix every already-cold ref was re-appended per tick)"
+        );
+
+        let (meta, _) = read_head_root(&table).await;
+        let bp = meta
+            .bucket_index_path
+            .as_ref()
+            .expect("cold bucket-index exists");
+        let bytes = table.file_io().new_input(bp).unwrap().read().await.unwrap();
+        let bi = crate::spec::bucket_index::read_bucket_index(bytes).unwrap();
+
+        let mut seen: HashSet<String> = HashSet::new();
+        for leaf in bi.leaves() {
+            assert!(
+                seen.insert(leaf.manifest_path.clone()),
+                "leaf {} appears twice in the bucket-index",
+                leaf.manifest_path
+            );
+        }
+
+        // Stronger than leaf identity: no DATA file may be reachable through
+        // two leaves. Re-graduation re-materialized already-cold content into a
+        // fresh leaf, which double-counts the file at read time rather than
+        // merely bloating metadata.
+        let mut owner: HashMap<String, String> = HashMap::new();
+        for leaf in bi.leaves() {
+            let manifest = leaf.load_manifest(table.file_io()).await.unwrap();
+            for e in manifest.entries().iter().filter(|e| e.is_alive()) {
+                let f = e.data_file().file_path().to_string();
+                if let Some(prev) = owner.insert(f.clone(), leaf.manifest_path.clone()) {
+                    panic!(
+                        "data file {f} is reachable through two cold leaves \
+                         ({prev} and {}) — it would be counted twice",
+                        leaf.manifest_path
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            visible_paths(&table).await,
+            visible_after_first,
+            "a no-op graduation must not change what is visible"
+        );
+    }
+
     #[tokio::test]
     async fn test_v4_graduate_buckets_reuses_prep_across_retries() {
         let catalog = new_memory_catalog().await;

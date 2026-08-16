@@ -1261,10 +1261,11 @@ pub async fn chain_root_paths(
 }
 
 /// Apply the chain's tombstones to the reconstructed entries: drop any INLINE
-/// entry whose data file was removed (materializing the removal), and set
-/// `meta.removed_paths` to the removals that did NOT match an inline entry —
-/// these reference files living inside child manifest refs, so they remain a
-/// tombstone the scan must apply when it reads those manifests. Pure.
+/// entry whose data file was removed, and any leaf REF whose manifest path was
+/// removed (materializing both removals), then set `meta.removed_paths` to the
+/// removals that matched neither — these reference files living inside child
+/// manifest refs, so they remain a tombstone the scan must apply when it reads
+/// those manifests. Pure.
 fn finalize_reconstruct(
     mut meta: RootManifestMetadata,
     entries: Vec<RootManifestEntry>,
@@ -1286,7 +1287,26 @@ fn finalize_reconstruct(
                     true
                 }
             }
-            RootManifestEntry::ManifestRef { .. } => true,
+            // A leaf ref is tombstoned by its MANIFEST path. Graduation moves a
+            // ref into the cold bucket-index and records its path here; without
+            // this arm the ref survives in the base root beneath the delta and
+            // is re-graduated on every later tick, appending a duplicate to the
+            // bucket-index each time. Measured on sri-olly 2026-08-16:
+            // 230,456 index rows for 18,053 distinct leaves (92.2% duplicates),
+            // one leaf repeated 74x, growing ~3,938 rows/tick unbounded.
+            //
+            // Widening the match is inert for every other consumer: they all
+            // compare `removed_paths` against DATA-file paths, which never
+            // collide with manifest paths, and nothing physically deletes off
+            // this set (reclaim runs off the JSONL tombstone ledger).
+            RootManifestEntry::ManifestRef { manifest_file, .. } => {
+                if removed.contains(&manifest_file.manifest_path) {
+                    matched.insert(manifest_file.manifest_path.clone());
+                    false
+                } else {
+                    true
+                }
+            }
         })
         .collect();
     let mut for_refs: Vec<String> = removed.difference(&matched).cloned().collect();
@@ -2068,6 +2088,90 @@ mod tests {
             hours,
             vec![495484, 495484, 495486, 495533, 495533],
             "refs sorted by hour bucket => same-hour refs contiguous"
+        );
+    }
+
+    /// A leaf REF must be suppressible by tombstone, exactly like an inline
+    /// entry. Before the fix `finalize_reconstruct` matched tombstones against
+    /// inline data-file paths only and returned every `ManifestRef` verbatim,
+    /// so graduation had NO way to retire a ref: its delta writes no entries,
+    /// the base root beneath kept listing the ref, and each later chain walk
+    /// re-offered it to be graduated (and duplicated into the bucket-index)
+    /// again. sri-olly 2026-08-16: 230,456 index rows for 18,053 distinct
+    /// leaves, one repeated 74x, +3,938/tick and unbounded.
+    #[test]
+    fn finalize_reconstruct_tombstones_leaf_refs_not_only_inline() {
+        let schema = test_schema();
+        let spec = test_partition_spec(&schema);
+        let graduated = "s3://b/leaf-graduated-m0.parquet";
+        let still_hot = "s3://b/leaf-hot-m0.parquet";
+
+        let entries = vec![
+            RootManifestEntry::ManifestRef {
+                manifest_file: test_manifest_file(graduated),
+                mdv: None,
+            },
+            RootManifestEntry::ManifestRef {
+                manifest_file: test_manifest_file(still_hot),
+                mdv: None,
+            },
+            RootManifestEntry::Inline(test_inline_entry("s3://b/d-live.parquet", 1)),
+        ];
+        // Graduation stamped the moved ref's MANIFEST path as a tombstone.
+        let removed: HashSet<String> = [graduated.to_string()].into_iter().collect();
+
+        let (meta_out, kept) = finalize_reconstruct(test_metadata(&schema, &spec), entries, removed);
+
+        let kept_refs: Vec<&str> = kept
+            .iter()
+            .filter_map(|e| match e {
+                RootManifestEntry::ManifestRef { manifest_file, .. } => {
+                    Some(manifest_file.manifest_path.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept_refs,
+            vec![still_hot],
+            "the graduated ref must be suppressed; the hot ref must survive"
+        );
+        assert_eq!(
+            kept.iter()
+                .filter(|e| matches!(e, RootManifestEntry::Inline(_)))
+                .count(),
+            1,
+            "an untombstoned inline entry is untouched"
+        );
+        // Matched tombstones are materialized, so they must not also be carried
+        // forward as scan tombstones (that is what grew removed_paths unbounded).
+        assert!(
+            !meta_out.removed_paths.contains(&graduated.to_string()),
+            "a ref tombstone that matched is retired, not carried forward"
+        );
+    }
+
+    /// The tombstone must not be dropped when it matches nothing in THIS walk —
+    /// it has to keep suppressing the ref on later reconstructs, since the base
+    /// root still lists it until a flat collapse rewrites the chain.
+    #[test]
+    fn finalize_reconstruct_carries_unmatched_ref_tombstone_forward() {
+        let schema = test_schema();
+        let spec = test_partition_spec(&schema);
+        let absent = "s3://b/leaf-not-in-this-walk-m0.parquet";
+
+        let entries = vec![RootManifestEntry::ManifestRef {
+            manifest_file: test_manifest_file("s3://b/leaf-other-m0.parquet"),
+            mdv: None,
+        }];
+        let removed: HashSet<String> = [absent.to_string()].into_iter().collect();
+
+        let (meta_out, kept) = finalize_reconstruct(test_metadata(&schema, &spec), entries, removed);
+
+        assert_eq!(kept.len(), 1, "unrelated ref survives");
+        assert!(
+            meta_out.removed_paths.contains(&absent.to_string()),
+            "an unmatched tombstone stays live for later walks"
         );
     }
 

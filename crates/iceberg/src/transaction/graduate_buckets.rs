@@ -196,6 +196,11 @@ struct PreparedGraduation {
     /// only for the flat-base fallback (delta path emits empty `removed_paths`
     /// so ancestor tombstones stay live via chain walk).
     ancestor_removed_paths: Vec<String>,
+    /// Leaf refs this graduation moved to cold. Stamped onto the delta root's
+    /// `removed_paths` so the chain walk stops re-emitting them from the base
+    /// root beneath — the delta writes no entries, so without this it has no
+    /// way to express the removal at all.
+    graduated_ref_paths: Vec<String>,
     /// Snapshot id allocated once at prep and reused across retries so leaves
     /// have consistent lineage regardless of which retry wins the CAS.
     snapshot_id: i64,
@@ -373,6 +378,12 @@ pub(crate) struct FoldOutcome {
     /// caller surfaces these to the sole tombstone writer (laminar) so they are
     /// reclaimed after grace. Empty unless a retention cutoff was supplied.
     pub ttl_dropped_paths: Vec<String>,
+    /// Manifest paths of every leaf ref this fold moved out of the hot root.
+    /// The caller stamps them onto the new delta root's `removed_paths` so the
+    /// chain walk stops re-emitting them from the base beneath. These are
+    /// LOGICAL read-side tombstones only — the leaves themselves stay LIVE in
+    /// the cold bucket-index and must never be reclaimed.
+    pub graduated_ref_paths: Vec<String>,
 }
 
 /// Per-node graduation decision, accounting for incremental delta path-tombstones
@@ -909,6 +920,21 @@ pub(crate) async fn fold_closed_into_bucket_index(
     }
     let graduated_nodes: Vec<ManifestFile> = closed_refs.into_iter().map(|(mf, _)| mf).collect();
 
+    // Path-tombstones for every ref leaving the hot root this pass, captured
+    // BEFORE `graduated_nodes` is consumed below (folded / by-reference /
+    // materialized all remove the source ref from the root either way).
+    //
+    // The caller stamps these onto the delta root's `removed_paths`. Without
+    // them the delta — which writes NO entries (`entries_to_write = &[]`) —
+    // cannot express a removal at all, so the base root beneath keeps listing
+    // these refs and `reconstruct_root` re-emits them every later tick. Each
+    // re-emission re-graduates the same ref and appends another copy to the
+    // bucket-index. See the `ManifestRef` arm of `finalize_reconstruct`.
+    let graduated_ref_paths: Vec<String> = graduated_nodes
+        .iter()
+        .map(|mf| mf.manifest_path.clone())
+        .collect();
+
     let classify_ms = classify_start.elapsed().as_millis() as u64;
 
     // Nothing to do only if no graduation AND no TTL prune happened. A TTL-only
@@ -1260,6 +1286,25 @@ pub(crate) async fn fold_closed_into_bucket_index(
     }
     let write_ms = write_start.elapsed().as_millis() as u64;
 
+    // Defence in depth: never let the same leaf appear twice in the index. The
+    // tombstone fix removes the cause (refs replayed from the base root); this
+    // makes the corruption structurally impossible whichever path replays a
+    // ref. O(n) on a set already in hand; keeps first occurrence so ordering
+    // is preserved.
+    {
+        let before = cold_leaves.len();
+        let mut seen: HashSet<String> = HashSet::with_capacity(before);
+        cold_leaves.retain(|mf| seen.insert(mf.manifest_path.clone()));
+        let dropped = before - cold_leaves.len();
+        if dropped > 0 {
+            log::warn!(
+                "tiered collapse-fold: dropped {dropped} duplicate leaf refs from the \
+                 bucket-index ({before} -> {} distinct) — a ref reached the index twice",
+                cold_leaves.len(),
+            );
+        }
+    }
+
     let cold_leaves_total = cold_leaves.len();
     log::info!(
         "tiered collapse-fold sub-phase: total_ms={} bi_load_ms={} ttl_prune_ms={} classify_ms={} write_ms={} entries={} cold_leaves={} nodes_moved={} folded_leaves={} inline_leaves={} ttl_fallback_loads={} classify_fallback_loads={} sidecar_hits={} sidecar_misses={} outcome=changed",
@@ -1286,6 +1331,7 @@ pub(crate) async fn fold_closed_into_bucket_index(
             inline_leaves,
             cold_leaves_total,
             ttl_dropped_paths,
+            graduated_ref_paths,
         }),
     ))
 }
@@ -1345,6 +1391,7 @@ impl GraduateBucketsAction {
             bucket_index_path: fold.bucket_index_path,
             prep_bucket_index_path,
             ancestor_removed_paths: rm_metadata.removed_paths,
+            graduated_ref_paths: fold.graduated_ref_paths,
             snapshot_id,
             nodes_moved: fold.nodes_moved,
             inline_leaves: fold.inline_leaves,
@@ -1416,9 +1463,18 @@ impl GraduateBucketsAction {
                 0
             },
             node_level: 0,
-            // Delta: no new tombstones from this action (graduation only moves
-            // refs into the cold tier, doesn't remove data files). Ancestor
-            // tombstones live on prior roots and are unioned by
+            // Delta: stamp a path-tombstone for every ref this graduation moved
+            // into the cold tier. The delta writes NO entries, so tombstones are
+            // its ONLY way to express a removal; emitting an empty set here is
+            // what let the base root keep re-offering already-graduated refs —
+            // re-graduating them every tick and duplicating them into the
+            // bucket-index (sri-olly 2026-08-16, metrics_1m: 230,456 index rows
+            // for 18,053 distinct leaves, one repeated 74x, +3,938/tick).
+            //
+            // Read-side tombstones ONLY: the leaf objects stay live in the cold
+            // bucket-index, and nothing reclaims off `removed_paths`.
+            //
+            // Ancestor tombstones live on prior roots and are unioned by
             // reconstruct_root — do NOT copy them onto the delta.
             //
             // Flat-base fallback: carry forward the merged ancestor set from
@@ -1429,8 +1485,12 @@ impl GraduateBucketsAction {
             // which under laminar-only writes matches the tombstone-add
             // invariant too.)
             removed_paths: if do_delta {
-                Vec::new()
+                prep.graduated_ref_paths.clone()
             } else {
+                // Flat base writes `prep.kept` in full (already excluding the
+                // graduated refs) and ends the chain with prev_root_path=None,
+                // so no ref tombstone is needed — adding one would just grow
+                // the carried set forever with nothing left to match.
                 prep.ancestor_removed_paths.clone()
             },
         };

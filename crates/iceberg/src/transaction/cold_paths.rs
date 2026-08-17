@@ -626,6 +626,86 @@ pub(crate) fn newly_added_leaves(old: &[ManifestFile], new: &[ManifestFile]) -> 
         .collect()
 }
 
+/// What a maintenance pass decided, for the caller's telemetry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MaintainOutcome {
+    /// No bucket index — nothing to maintain, and nothing to veto either.
+    NoColdTier,
+    /// A valid, unsaturated sidecar is already in place.
+    Healthy {
+        /// Paths currently in the filter.
+        paths: u64,
+        /// Filter items over live paths; 1.0 is a filter holding exactly the
+        /// live set.
+        saturation: f64,
+    },
+    /// Rebuilt: either seeded for the first time or cleared of drift.
+    Rebuilt {
+        /// Cold leaves read — the O(tier) cost, so it is measurable.
+        leaves_scanned: usize,
+        /// Paths indexed into the fresh filter.
+        paths_indexed: u64,
+        /// Sidecar size on the wire.
+        filter_bytes: usize,
+        /// Why the rebuild happened.
+        reason: &'static str,
+    },
+}
+
+/// Seed or refresh the cold-paths sidecar for a table's current bucket index.
+///
+/// This is the entry point for the maintenance service (tessellate). It is
+/// cheap when nothing is needed — one index read plus one sidecar read — and
+/// pays the full O(cold tier) scan **only** when the sidecar is missing (first
+/// seed) or saturated past [`REBUILD_SATURATION_THRESHOLD`] (drift recovery).
+///
+/// Must not be called from the ingest commit path: the rebuild is precisely the
+/// cost this design moves off it.
+///
+/// Safe to call every tick — the saturation check is what decides, not a
+/// schedule, so it needs no cadence tuned against the retention setting.
+pub async fn maintain_cold_paths_sidecar(
+    file_io: &crate::io::FileIO,
+    bucket_index_path: Option<&str>,
+) -> crate::error::Result<MaintainOutcome> {
+    let Some(bip) = bucket_index_path else {
+        return Ok(MaintainOutcome::NoColdTier);
+    };
+
+    let bytes = file_io.new_input(bip)?.read().await?;
+    let leaves = crate::spec::bucket_index::read_bucket_index(bytes)?
+        .leaves()
+        .to_vec();
+    if leaves.is_empty() {
+        return Ok(MaintainOutcome::NoColdTier);
+    }
+
+    let existing = load_cold_paths_sidecar(file_io, bip, &leaves).await;
+    let items = existing.as_ref().map(|f| f.len());
+
+    // Distinguish the two reasons so a table that keeps rebuilding (churn set
+    // too high) is not confused with one that has never been seeded.
+    let reason = match items {
+        None => "seed",
+        Some(_) => "saturated",
+    };
+    if !needs_rebuild(items, &leaves) {
+        let live = live_path_estimate(&leaves);
+        return Ok(MaintainOutcome::Healthy {
+            paths: items.unwrap_or(0),
+            saturation: saturation(items.unwrap_or(0), live).unwrap_or(0.0),
+        });
+    }
+
+    let out = rebuild_cold_paths_sidecar(file_io, bip).await?;
+    Ok(MaintainOutcome::Rebuilt {
+        leaves_scanned: out.leaves_scanned,
+        paths_indexed: out.paths_indexed,
+        filter_bytes: out.filter_bytes,
+        reason,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

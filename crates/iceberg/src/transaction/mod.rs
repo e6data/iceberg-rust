@@ -54,7 +54,11 @@ mod action;
 
 pub use action::*;
 mod append;
-mod cold_paths;
+/// Cold-presence sidecar. Public so the rebuild/seed pass can be driven from
+/// tessellate, which is where the one remaining O(cold tier) scan belongs —
+/// off laminar's ingest commit path. Only the rebuild surface is exported; the
+/// filter internals stay crate-private.
+pub mod cold_paths;
 mod compact_cold_tier;
 mod drop_cold_buckets;
 mod graduate_buckets;

@@ -39,10 +39,30 @@
 //! | lookup says          | action           | risk                              |
 //! |----------------------|------------------|-----------------------------------|
 //! | definitely NOT present | safe to retire | none — no false negatives         |
-//! | maybe present          | veto retirement| conservative; lingers one cycle   |
+//! | maybe present          | veto retirement| conservative — see the caveat     |
 //!
-//! A false positive costs one tombstone one extra cycle. A false negative would
-//! cost data. The structure cannot produce the latter.
+//! A false negative would cost data, and the structure cannot produce one.
+//!
+//! # Why rebuilds are mandatory, not a tuning detail
+//!
+//! A false positive is **not** transient. A Bloom only ever *sets* bits, so a
+//! collision is deterministic and monotonic: the same path collides on every
+//! subsequent pass, and that tombstone is stuck until the filter is rebuilt.
+//! Inserts make it strictly worse.
+//!
+//! TTL drift compounds it. Removals are skipped (that is what preserves the
+//! superset), so the tier fully turning over every retention period keeps
+//! inserting into a filter that never forgets:
+//!
+//! ```text
+//! after 30 days at 3-day retention:  ~10x overload  →  FPP ≈ 99.5%
+//!                                    →  retirement stops entirely, silently
+//! ```
+//!
+//! Which is the same silent degradation this module exists to remove. Hence
+//! [`saturation`] and [`rebuild_cold_paths_sidecar`]: the trigger is measured
+//! from data already in the bucket index, not scheduled against a retention
+//! setting someone has to remember to keep in sync.
 //!
 //! # The invariant, and why staleness fails closed
 //!
@@ -158,6 +178,11 @@ impl ColdPathFilter {
 
     pub(crate) fn len(&self) -> u64 {
         self.n_items
+    }
+
+    /// Serialized bitset size — surfaced so growth at scale is observable.
+    pub(crate) fn byte_len(&self) -> usize {
+        self.bits.len()
     }
 }
 
@@ -374,6 +399,125 @@ pub(crate) async fn resolve_cold_presence(
     }
 }
 
+/// Saturation above which the filter should be rebuilt.
+///
+/// 1.5 means "half the paths in the filter are dead". Chosen low enough that
+/// false positives stay near target and high enough that a steadily-churning
+/// tier does not trigger a rebuild every pass.
+pub const REBUILD_SATURATION_THRESHOLD: f64 = 1.5;
+
+/// Live data-file paths reachable from a leaf set, taken straight from the
+/// bucket index — no manifest reads.
+///
+/// This is what makes the rebuild trigger self-measuring: the denominator is
+/// free, so nothing has to be tuned against the retention setting.
+pub fn live_path_estimate(leaves: &[ManifestFile]) -> u64 {
+    leaves
+        .iter()
+        .map(|l| {
+            l.added_files_count.unwrap_or(0) as u64 + l.existing_files_count.unwrap_or(0) as u64
+        })
+        .sum()
+}
+
+/// How overloaded the filter is: inserted paths over live paths.
+///
+/// `1.0` is a filter holding exactly the live set. Above
+/// [`REBUILD_SATURATION_THRESHOLD`] the dead weight is inflating false
+/// positives enough to start stranding tombstones permanently.
+///
+/// Returns `None` when there is nothing to compare against (an empty tier),
+/// where the ratio is meaningless rather than zero.
+pub fn saturation(filter_items: u64, live_paths: u64) -> Option<f64> {
+    (live_paths > 0).then(|| filter_items as f64 / live_paths as f64)
+}
+
+/// Whether a sidecar covering `leaves` warrants a rebuild. `true` when the
+/// filter is absent (nothing to reuse) or saturated past the threshold.
+pub fn needs_rebuild(filter_items: Option<u64>, leaves: &[ManifestFile]) -> bool {
+    let Some(items) = filter_items else {
+        return true;
+    };
+    match saturation(items, live_path_estimate(leaves)) {
+        Some(r) => r > REBUILD_SATURATION_THRESHOLD,
+        None => false,
+    }
+}
+
+/// Concurrency for the rebuild's leaf reads. This is the one place that still
+/// pays O(cold tier), which is exactly why it belongs off the ingest path.
+const REBUILD_LEAF_FETCH_CONCURRENCY: usize = 32;
+
+/// Outcome of a rebuild, for the caller's telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildOutcome {
+    /// Cold leaves read during the rebuild — the O(tier) cost, surfaced so it
+    /// is measurable rather than assumed.
+    pub leaves_scanned: usize,
+    /// Data-file paths inserted into the filter.
+    pub paths_indexed: u64,
+    /// Filter size on the wire, so growth at scale is observable rather than
+    /// discovered when an object gets too big.
+    pub filter_bytes: usize,
+}
+
+/// Rebuild the cold-paths sidecar for `bucket_index_path` from scratch.
+///
+/// Loads every cold leaf — the full O(tier) pass — and writes a filter stamped
+/// with the leaf set it covers. Serves BOTH purposes the design needs: the
+/// initial seed (no prior filter to extend) and drift recovery (clearing the
+/// accumulated false positives that no incremental update can remove).
+///
+/// **Must run off the ingest commit path.** It is the cost being removed from
+/// laminar; tessellate is the right home, where leaves are already being loaded
+/// during compaction.
+///
+/// Fails rather than writing a partial filter: a filter missing paths is a false
+/// negative, which is the one error that resurrects data. `?` on every load is
+/// deliberate — partial knowledge must never be persisted.
+pub async fn rebuild_cold_paths_sidecar(
+    file_io: &crate::io::FileIO,
+    bucket_index_path: &str,
+) -> crate::error::Result<RebuildOutcome> {
+    use futures::StreamExt;
+
+    let bytes = file_io.new_input(bucket_index_path)?.read().await?;
+    let leaves = crate::spec::bucket_index::read_bucket_index(bytes)?
+        .leaves()
+        .to_vec();
+
+    // Size from the index's own counts so the filter is right-sized on the
+    // first try rather than resized mid-build.
+    let mut filter = ColdPathFilter::with_capacity(live_path_estimate(&leaves) as usize);
+
+    let mut loaded = futures::stream::iter(
+        leaves
+            .iter()
+            .cloned()
+            .map(|mf| async move { mf.load_manifest(file_io).await }),
+    )
+    .buffered(REBUILD_LEAF_FETCH_CONCURRENCY);
+
+    let mut leaves_scanned = 0usize;
+    while let Some(res) = loaded.next().await {
+        let manifest = res?;
+        leaves_scanned += 1;
+        for me in manifest.entries() {
+            // Every entry, alive or not: a tombstoned-but-listed file is
+            // precisely the case that must veto retirement.
+            filter.insert(me.data_file.file_path.as_str());
+        }
+    }
+
+    write_cold_paths_sidecar(file_io, bucket_index_path, &filter, &leaves).await?;
+
+    Ok(RebuildOutcome {
+        leaves_scanned,
+        paths_indexed: filter.len(),
+        filter_bytes: filter.byte_len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,6 +665,93 @@ mod tests {
         );
         assert!(!p.may_contain("s3://b/data/never-inserted.parquet"));
         assert!(p.is_authoritative());
+    }
+
+    fn leaf_with_files(path: &str, added: u32, existing: u32) -> ManifestFile {
+        let mut l = leaf(path);
+        l.added_files_count = Some(added);
+        l.existing_files_count = Some(existing);
+        l
+    }
+
+    /// The denominator must come from the index for free — that is what makes
+    /// the rebuild trigger self-measuring instead of a cadence tuned against a
+    /// retention setting someone has to keep in sync.
+    #[test]
+    fn live_path_estimate_sums_index_counts_without_reading_leaves() {
+        let leaves = vec![
+            leaf_with_files("s3://b/m/a-m0.parquet", 3, 7),
+            leaf_with_files("s3://b/m/b-m0.parquet", 1, 0),
+        ];
+        assert_eq!(live_path_estimate(&leaves), 11);
+        assert_eq!(live_path_estimate(&[]), 0);
+    }
+
+    /// Drift is the failure this guards. TTL removals are skipped to preserve
+    /// the superset, so a churning tier keeps inserting into a filter that never
+    /// forgets — and past ~1.5x the dead weight starts stranding tombstones
+    /// permanently, because Bloom false positives never clear on their own.
+    #[test]
+    fn rebuild_triggers_on_drift_and_on_a_missing_filter() {
+        let leaves = vec![leaf_with_files("s3://b/m/a-m0.parquet", 100, 0)];
+
+        assert!(needs_rebuild(None, &leaves), "no filter at all must seed");
+        assert!(
+            !needs_rebuild(Some(100), &leaves),
+            "a filter holding exactly the live set is healthy"
+        );
+        assert!(
+            !needs_rebuild(Some(140), &leaves),
+            "1.4x is under threshold — churn alone must not trigger every pass"
+        );
+        assert!(
+            needs_rebuild(Some(160), &leaves),
+            "1.6x dead weight must trigger a rebuild"
+        );
+        // 10x is the 30-days-without-rebuild case from the module docs.
+        assert!(needs_rebuild(Some(1_000), &leaves));
+    }
+
+    #[test]
+    fn saturation_is_none_when_there_is_nothing_to_compare() {
+        assert_eq!(saturation(0, 0), None);
+        assert_eq!(
+            saturation(500, 0),
+            None,
+            "empty tier has no meaningful ratio"
+        );
+        assert_eq!(saturation(150, 100), Some(1.5));
+        // An empty tier must not be read as "needs rebuild" — there is nothing
+        // to rebuild from.
+        assert!(!needs_rebuild(Some(0), &[]));
+    }
+
+    /// A saturated filter really does strand tombstones: at 10x overload nearly
+    /// every absent path reads as present, so retirement stops. This is the
+    /// behaviour the threshold exists to prevent, pinned so it cannot regress
+    /// into looking like a healthy sweep that found nothing.
+    #[test]
+    fn oversaturation_makes_absent_paths_read_as_present() {
+        let live = 2_000;
+        let mut f = ColdPathFilter::with_capacity(live);
+        for i in 0..(live * 10) {
+            f.insert(&format!("s3://b/data/churn-{i:08}.parquet"));
+        }
+        let probes = 2_000;
+        let fp = (0..probes)
+            .filter(|i| f.maybe_contains(&format!("s3://b/data/absent-{i:08}.parquet")))
+            .count();
+        let rate = fp as f64 / probes as f64;
+        assert!(
+            rate > 0.5,
+            "10x overload should strand most retirements, got {rate:.3} — \
+             if this drops, the drift argument for mandatory rebuilds is wrong"
+        );
+        assert!(needs_rebuild(Some(f.len()), &[leaf_with_files(
+            "s3://b/m/a-m0.parquet",
+            live as u32,
+            0
+        )]));
     }
 
     #[test]

@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod cold_paths;
 mod compact_cold_tier;
 mod drop_cold_buckets;
 mod graduate_buckets;

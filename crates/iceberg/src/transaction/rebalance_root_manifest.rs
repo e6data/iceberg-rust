@@ -956,11 +956,16 @@ impl TransactionAction for RebalanceRootManifestAction {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(8192);
             let before = swept_removed.len();
+            let cold_owned = crate::transaction::cold_paths::resolve_cold_presence(
+                table.file_io(),
+                rm_metadata.bucket_index_path.as_deref(),
+            )
+            .await;
             match crate::transaction::snapshot::materialize_carried_tombstones(
                 table.file_io(),
                 &mut new_entries,
                 &mut swept_removed,
-                rm_metadata.bucket_index_path.as_deref(),
+                cold_owned.as_ref(),
                 max_manifests,
             )
             .await

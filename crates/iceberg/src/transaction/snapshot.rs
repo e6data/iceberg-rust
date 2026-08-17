@@ -1570,11 +1570,19 @@ impl<'a> SnapshotProducer<'a> {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_TOMBSTONE_MATERIALIZE_MAX_MANIFESTS);
             let before = carried_removed.len();
+            // Resolve cold presence from the sidecar — one small object, no leaf
+            // loads. `Unknown` (missing/stale sidecar) vetoes every cold-absence
+            // retirement, which is the conservative direction.
+            let cold_owned = crate::transaction::cold_paths::resolve_cold_presence(
+                self.table.file_io(),
+                carried_bucket_index_path.as_deref(),
+            )
+            .await;
             let (retired, scanned) = materialize_carried_tombstones(
                 self.table.file_io(),
                 &mut entries,
                 &mut carried_removed,
-                carried_bucket_index_path.as_deref(),
+                cold_owned.as_ref(),
                 max_manifests,
             )
             .await?;
@@ -2482,7 +2490,7 @@ pub(crate) async fn materialize_carried_tombstones(
     file_io: &crate::io::FileIO,
     entries: &mut [RootManifestEntry],
     carried_removed: &mut Vec<String>,
-    bucket_index_path: Option<&str>,
+    cold: crate::transaction::cold_paths::ColdPresence<'_>,
     max_manifests: usize,
 ) -> Result<(usize, usize)> {
     use futures::StreamExt;
@@ -2504,26 +2512,20 @@ pub(crate) async fn materialize_carried_tombstones(
         })
         .collect();
 
-    // Cold-tier leaves, if this table has a bucket index. These are read-only
-    // here: a leaf lives inside the bucket index, not in the root, so it cannot
-    // carry an MDV without rewriting the index. We load them purely to learn
-    // which paths are still reachable — a tombstone matching a cold entry MUST
-    // be kept.
-    let cold_leaves: Vec<ManifestFile> = match bucket_index_path {
-        Some(bp) => {
-            let bytes = file_io.new_input(bp)?.read().await?;
-            crate::spec::bucket_index::read_bucket_index(bytes)?
-                .leaves()
-                .to_vec()
-        }
-        None => Vec::new(),
-    };
-
+    // Cold presence is answered by the sidecar (see `cold_paths`), NOT by
+    // loading the tier. Reading every cold leaf here was O(cold tier) on the
+    // ingest commit path — ~7,300 manifest loads for ~29 s, six times an hour on
+    // sri-olly — for work that is inherently O(tombstones). `ColdPresence`
+    // carries the same guarantee the scan did: it only ever answers "definitely
+    // absent" when that is certain, and vetoes otherwise.
+    //
     // Refuse a partial sweep. Retiring an unmatched tombstone is only sound if
     // we looked EVERYWHERE — miss one manifest and we could drop the tombstone
-    // guarding a file that manifest still lists, resurrecting it. If the tree is
-    // larger than we are willing to read in one commit, do nothing at all.
-    let total_manifests = ref_positions.len() + cold_leaves.len();
+    // guarding a file that manifest still lists, resurrecting it. The cap now
+    // bounds only the HOT refs we materialize MDVs into (single digits to low
+    // tens here); the cold side no longer contributes, so the cliff that made
+    // this silently stop working past 8,192 leaves is gone.
+    let total_manifests = ref_positions.len();
     if total_manifests == 0 || total_manifests > max_manifests {
         return Ok((0, 0));
     }
@@ -2592,25 +2594,6 @@ pub(crate) async fn materialize_carried_tombstones(
         *mdv = Some(new_mdv.serialize()?);
     }
 
-    // --- Cold tier: presence only.
-    let cold_loaded: Vec<Result<crate::spec::Manifest>> = futures::stream::iter(
-        cold_leaves
-            .into_iter()
-            .map(|mf| async move { mf.load_manifest(file_io).await }),
-    )
-    .buffer_unordered(TOMBSTONE_MATERIALIZE_CONCURRENCY)
-    .collect()
-    .await;
-
-    let mut cold_present: HashSet<String> = HashSet::new();
-    for res in cold_loaded {
-        let manifest = res?;
-        scanned += 1;
-        for me in manifest.entries() {
-            cold_present.insert(me.data_file.file_path.clone());
-        }
-    }
-
     // A tombstone may be retired when either:
     //   (a) we materialized it into a hot MDV — the bit now does the suppressing;
     //   (b) it matches nothing anywhere — it guards a file no manifest lists, so
@@ -2621,12 +2604,12 @@ pub(crate) async fn materialize_carried_tombstones(
     // file and only the path tombstone is suppressing it there.
     let mut retired: HashSet<String> = HashSet::new();
     for path in hot_materialized {
-        if !cold_present.contains(&path) {
+        if !cold.may_contain(&path) {
             retired.insert(path);
         }
     }
     for path in carried_removed.iter() {
-        if !hot_present.contains(path) && !cold_present.contains(path) {
+        if !hot_present.contains(path) && !cold.may_contain(path) {
             retired.insert(path.clone());
         }
     }
@@ -4718,7 +4701,7 @@ mod test_v4_commit {
             table.file_io(),
             &mut entries,
             &mut carried,
-            None,
+            crate::transaction::cold_paths::ColdPresence::Empty,
             8192,
         )
         .await
@@ -4748,7 +4731,7 @@ mod test_v4_commit {
             table.file_io(),
             &mut entries,
             &mut carried,
-            None,
+            crate::transaction::cold_paths::ColdPresence::Empty,
             8192,
         )
         .await
@@ -4780,7 +4763,7 @@ mod test_v4_commit {
             table.file_io(),
             &mut entries,
             &mut carried,
-            None,
+            crate::transaction::cold_paths::ColdPresence::Empty,
             1,
         )
         .await
@@ -4805,7 +4788,7 @@ mod test_v4_commit {
             table.file_io(),
             &mut entries,
             &mut carried,
-            None,
+            crate::transaction::cold_paths::ColdPresence::Empty,
             8192,
         )
         .await

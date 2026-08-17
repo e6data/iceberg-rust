@@ -476,6 +476,10 @@ impl CompactColdTierAction {
         let mut loaded_unprunable = 0usize;
         let mut candidates: Vec<(ManifestFile, bool)> = Vec::new();
         let mut pruned: Vec<ManifestFile> = Vec::new();
+        // Snapshot the prior leaf set before `leaves` is consumed — the
+        // cold-paths sidecar needs it to validate the carried filter and to work
+        // out which leaves are new.
+        let prior_leaves: Vec<ManifestFile> = leaves.clone();
         for leaf in leaves {
             match leaf_keep_reason(&leaf, &target_partitions, &partition_type) {
                 LeafKeepReason::Matched => {
@@ -729,6 +733,50 @@ impl CompactColdTierAction {
                 .new_output(&path)?
                 .write(bi_bytes.into())
                 .await?;
+
+            // Maintain the cold-paths sidecar in the SAME operation as the
+            // index write — its coverage digest is a function of the leaf set,
+            // so an index written without one reads as `Unknown` immediately.
+            //
+            // Compaction rewrites leaves, so their contents are new even where
+            // the leaf count barely moves; `newly_added_leaves` catches those by
+            // path. The merged files in `self.added` are already in hand and
+            // cost nothing to insert. Removals are skipped, which is what keeps
+            // the filter a superset.
+            {
+                use crate::transaction::cold_paths::{
+                    CarryOutcome, carry_forward_cold_paths, newly_added_leaves,
+                };
+                let added_leaves = newly_added_leaves(&prior_leaves, &all_leaves);
+                let added_paths: Vec<String> = self
+                    .added
+                    .iter()
+                    .map(|df| df.file_path.clone())
+                    .collect();
+                match carry_forward_cold_paths(
+                    table.file_io(),
+                    prep_bucket_index_path.as_deref(),
+                    &prior_leaves,
+                    &path,
+                    &all_leaves,
+                    &added_leaves,
+                    &added_paths,
+                )
+                .await
+                {
+                    Ok(CarryOutcome::Carried { leaves_indexed, paths_added }) => log::info!(
+                        "cold-paths sidecar: carried forward through cold compaction \
+                         leaves_indexed={leaves_indexed} paths_added={paths_added}"
+                    ),
+                    Ok(other) => log::info!(
+                        "cold-paths sidecar: not carried through cold compaction ({other:?})"
+                    ),
+                    Err(e) => log::warn!(
+                        "cold-paths sidecar: carry-forward failed in cold compaction \
+                         (retirement stays vetoed until rebuild): {e}"
+                    ),
+                }
+            }
             Some(path)
         };
 

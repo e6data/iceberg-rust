@@ -628,6 +628,11 @@ pub(crate) async fn fold_closed_into_bucket_index(
         None => Vec::new(),
     };
     let bi_load_ms = bi_load_start.elapsed().as_millis() as u64;
+    // Snapshot the leaf set the carried cold-paths sidecar was built against.
+    // `cold_leaves` is mutated below (ttl prune removes, graduation adds), so
+    // the prior set has to be captured here to validate the sidecar and to work
+    // out which leaves are new at write time.
+    let prior_cold_leaves: Vec<ManifestFile> = cold_leaves.clone();
 
     // Load the max-ts sidecar (if any) BEFORE the TTL-prune loop, so the
     // hot loop can hit it directly. Missing sidecar or a hit for a leaf
@@ -1285,6 +1290,47 @@ pub(crate) async fn fold_closed_into_bucket_index(
         .new_output(&bucket_index_path)?
         .write(bi_bytes.into())
         .await?;
+
+    // Maintain the cold-paths sidecar in the SAME operation as the index write.
+    // Its coverage digest is a function of the leaf set, so an index written
+    // without a matching sidecar reads as `Unknown` immediately — this cannot
+    // lag behind as periodic maintenance. Only the newly graduated leaves are
+    // read (a handful per commit at steady state), never the tier.
+    //
+    // Non-fatal: on failure we simply leave the new index without a sidecar, so
+    // the sweep retires nothing until a rebuild seeds it. That is the
+    // conservative direction; a partial filter would be a false negative.
+    {
+        use crate::transaction::cold_paths::{CarryOutcome, carry_forward_cold_paths, newly_added_leaves};
+        let added = newly_added_leaves(&prior_cold_leaves, &cold_leaves);
+        match carry_forward_cold_paths(
+            table.file_io(),
+            carried_bucket_index_path,
+            &prior_cold_leaves,
+            &bucket_index_path,
+            &cold_leaves,
+            &added,
+            &[],
+        )
+        .await
+        {
+            Ok(CarryOutcome::Carried { leaves_indexed, paths_added }) => log::info!(
+                "cold-paths sidecar: carried forward leaves_indexed={} paths_added={} cold_leaves={}",
+                leaves_indexed,
+                paths_added,
+                cold_leaves.len(),
+            ),
+            Ok(other) => log::info!(
+                "cold-paths sidecar: not carried ({other:?}) — tombstone retirement \
+                 stays vetoed until a rebuild seeds it (cold_leaves={})",
+                cold_leaves.len(),
+            ),
+            Err(e) => log::warn!(
+                "cold-paths sidecar: carry-forward failed, new index has no sidecar \
+                 (retirement stays vetoed until rebuild): {e}"
+            ),
+        }
+    }
     // Refresh the sidecar to cover the new bucket-index. `computed_max_ts` is
     // keyed by ORIGINAL cold-leaf paths (those we ran the ttl-prune loop
     // over); leaves that were dropped by ttl are naturally excluded from the

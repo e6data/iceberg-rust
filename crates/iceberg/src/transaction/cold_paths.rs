@@ -518,6 +518,114 @@ pub async fn rebuild_cold_paths_sidecar(
     })
 }
 
+/// Concurrency for reading newly-added leaves during a carry-forward. Small:
+/// at steady state this is a handful of leaves per commit, not the tier.
+const CARRY_LEAF_FETCH_CONCURRENCY: usize = 16;
+
+/// What a carry-forward did, for telemetry. A skip is not a failure, but it does
+/// mean the tier stays in `Unknown` until a rebuild — so it must be visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarryOutcome {
+    /// Filter carried forward and re-stamped against the new leaf set.
+    Carried {
+        /// Leaves read to index their contents.
+        leaves_indexed: usize,
+        /// Paths inserted this pass.
+        paths_added: u64,
+    },
+    /// No usable prior filter. The new index gets no sidecar, so the tier reads
+    /// `Unknown` (retire nothing) until a rebuild seeds it.
+    SkippedNoPriorFilter,
+    /// Saturated past the threshold — carrying forward would preserve the dead
+    /// weight, so leave it for a rebuild instead of entrenching it.
+    SkippedSaturated,
+}
+
+/// Maintain the sidecar across a bucket-index write.
+///
+/// **Must be called by every writer that calls `write_bucket_index`**, in the
+/// same operation. The coverage digest is a function of the leaf set, so an
+/// index written without a matching sidecar immediately reads as `Unknown` —
+/// this is not periodic maintenance that can lag.
+///
+/// Semantics per writer:
+/// * graduation — pass the newly-graduated leaves in `added_leaves`; only those
+///   are read, never the tier.
+/// * `compact_cold_tier` — pass the paths it added in `added_paths`; it already
+///   holds them, so nothing is read.
+/// * TTL drop — pass neither; removals are skipped, which is what preserves the
+///   superset invariant.
+///
+/// Never writes a partial filter: on any failure to read an added leaf the error
+/// propagates and no sidecar is written, leaving the previous one in place (now
+/// stale, hence `Unknown`) rather than a filter missing paths — which would be a
+/// false negative.
+pub(crate) async fn carry_forward_cold_paths(
+    file_io: &crate::io::FileIO,
+    prev_bucket_index_path: Option<&str>,
+    prev_leaves: &[ManifestFile],
+    new_bucket_index_path: &str,
+    new_leaves: &[ManifestFile],
+    added_leaves: &[ManifestFile],
+    added_paths: &[String],
+) -> crate::error::Result<CarryOutcome> {
+    use futures::StreamExt;
+
+    let Some(prev_path) = prev_bucket_index_path else {
+        return Ok(CarryOutcome::SkippedNoPriorFilter);
+    };
+    let Some(mut filter) = load_cold_paths_sidecar(file_io, prev_path, prev_leaves).await else {
+        return Ok(CarryOutcome::SkippedNoPriorFilter);
+    };
+
+    // Carrying a saturated filter forward would entrench its dead weight and
+    // its already-stranded retirements. Let a rebuild clear it instead.
+    if needs_rebuild(Some(filter.len()), new_leaves) {
+        return Ok(CarryOutcome::SkippedSaturated);
+    }
+
+    let before = filter.len();
+    for p in added_paths {
+        filter.insert(p);
+    }
+
+    let mut loaded = futures::stream::iter(
+        added_leaves
+            .iter()
+            .cloned()
+            .map(|mf| async move { mf.load_manifest(file_io).await }),
+    )
+    .buffered(CARRY_LEAF_FETCH_CONCURRENCY);
+
+    let mut leaves_indexed = 0usize;
+    while let Some(res) = loaded.next().await {
+        let manifest = res?;
+        leaves_indexed += 1;
+        for me in manifest.entries() {
+            filter.insert(me.data_file.file_path.as_str());
+        }
+    }
+
+    write_cold_paths_sidecar(file_io, new_bucket_index_path, &filter, new_leaves).await?;
+
+    Ok(CarryOutcome::Carried {
+        leaves_indexed,
+        paths_added: filter.len() - before,
+    })
+}
+
+/// Leaves present in `new` but not `old`, by manifest path — the set a carry
+/// forward has to read. Pure, so the "what changed" rule is testable apart from
+/// the I/O.
+pub(crate) fn newly_added_leaves(old: &[ManifestFile], new: &[ManifestFile]) -> Vec<ManifestFile> {
+    let old_paths: std::collections::HashSet<&str> =
+        old.iter().map(|l| l.manifest_path.as_str()).collect();
+    new.iter()
+        .filter(|l| !old_paths.contains(l.manifest_path.as_str()))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +860,42 @@ mod tests {
             live as u32,
             0
         )]));
+    }
+
+    /// The carry-forward must read exactly the leaves that are new — reading
+    /// the whole tier is the cost being removed, and reading too few is a false
+    /// negative.
+    #[test]
+    fn newly_added_leaves_is_the_difference_by_path() {
+        let old = vec![leaf("s3://b/m/a-m0.parquet"), leaf("s3://b/m/b-m0.parquet")];
+        let new = vec![
+            leaf("s3://b/m/b-m0.parquet"),
+            leaf("s3://b/m/c-m0.parquet"),
+            leaf("s3://b/m/d-m0.parquet"),
+        ];
+        let added: Vec<String> = newly_added_leaves(&old, &new)
+            .into_iter()
+            .map(|l| l.manifest_path)
+            .collect();
+        assert_eq!(added, vec![
+            "s3://b/m/c-m0.parquet".to_string(),
+            "s3://b/m/d-m0.parquet".to_string()
+        ]);
+
+        // TTL drops leaves and adds none — nothing to read, and the filter is
+        // carried forward untouched, which is what preserves the superset.
+        // (after must be a SUBSET of before for this to model a TTL drop.)
+        let ttl_before = vec![
+            leaf("s3://b/m/a-m0.parquet"),
+            leaf("s3://b/m/b-m0.parquet"),
+            leaf("s3://b/m/c-m0.parquet"),
+        ];
+        let ttl_after = vec![leaf("s3://b/m/b-m0.parquet"), leaf("s3://b/m/c-m0.parquet")];
+        assert!(newly_added_leaves(&ttl_before, &ttl_after).is_empty());
+        // A pure re-cluster adds nothing either.
+        let mut reordered = old.clone();
+        reordered.reverse();
+        assert!(newly_added_leaves(&old, &reordered).is_empty());
     }
 
     #[test]

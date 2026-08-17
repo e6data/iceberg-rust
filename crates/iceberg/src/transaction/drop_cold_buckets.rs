@@ -195,6 +195,9 @@ impl TransactionAction for DropColdBucketsAction {
             None => None,
         };
 
+        // Snapshot the prior leaf set before `leaves` is consumed — the
+        // cold-paths sidecar needs it to validate the carried filter.
+        let prior_leaves: Vec<ManifestFile> = leaves.clone();
         for leaf in leaves {
             // Sidecar first; only pay the S3 GET on a miss.
             let cached = maxts_sidecar
@@ -280,6 +283,42 @@ impl TransactionAction for DropColdBucketsAction {
                 .new_output(&path)?
                 .write(bi_bytes.into())
                 .await?;
+            // Maintain the cold-paths sidecar in the SAME operation as the index
+            // write. TTL only REMOVES leaves, and removals are deliberately skipped
+            // — that is what keeps the filter a superset of the real cold set, which
+            // is the invariant the whole design rests on. So nothing is read here;
+            // the filter is carried forward untouched and simply re-stamped against
+            // the smaller leaf set.
+            //
+            // The dead paths left behind are exactly the drift that
+            // `needs_rebuild` measures and a rebuild clears.
+            {
+                use crate::transaction::cold_paths::{CarryOutcome, carry_forward_cold_paths};
+                match carry_forward_cold_paths(
+                    table.file_io(),
+                    rm_metadata.bucket_index_path.as_deref(),
+                    &prior_leaves,
+                    &path,
+                    &kept,
+                    &[],
+                    &[],
+                )
+                .await
+                {
+                    Ok(CarryOutcome::Carried { paths_added, .. }) => log::info!(
+                        "cold-paths sidecar: carried forward through ttl drop \
+                         (dropped_leaves={} paths_added={paths_added})",
+                        prior_leaves.len() - kept.len(),
+                    ),
+                    Ok(other) => log::info!(
+                        "cold-paths sidecar: not carried through ttl drop ({other:?})"
+                    ),
+                    Err(e) => log::warn!(
+                        "cold-paths sidecar: carry-forward failed in ttl drop \
+                         (retirement stays vetoed until rebuild): {e}"
+                    ),
+                }
+            }
             Some(path)
         };
 

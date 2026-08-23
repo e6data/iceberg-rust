@@ -275,7 +275,45 @@ impl Snapshot {
             if let Some(bucket_index) =
                 crate::spec::bucket_index::load_bucket_index_for_root(file_io, &rm_meta).await?
             {
-                manifest_files.extend(bucket_index.leaves().iter().cloned());
+                // Dedup against the root's own refs. Graduation moves a ref OUT
+                // of the root and INTO the index, so the two sets should be
+                // disjoint — but when a ref reaches both (a replay from the base
+                // root beneath a delta, say) a plain `extend` lists that manifest
+                // twice and every data file under it is scanned, and returned,
+                // twice.
+                //
+                // Root entries win: a root `ManifestRef` can carry an MDV bitmap
+                // (collected above) while a bucket-index leaf cannot, so keeping
+                // the leaf copy would silently drop MDV filtering for it.
+                //
+                // Warn rather than swallow it — an overlap means an upstream
+                // invariant leaked (graduation should have removed the root
+                // copy), and that is worth seeing.
+                let seen: std::collections::HashSet<&str> = manifest_files
+                    .iter()
+                    .map(|m| m.manifest_path.as_str())
+                    .collect();
+                let mut dropped = 0usize;
+                let fresh: Vec<_> = bucket_index
+                    .leaves()
+                    .iter()
+                    .filter(|leaf| {
+                        let keep = !seen.contains(leaf.manifest_path.as_str());
+                        if !keep {
+                            dropped += 1;
+                        }
+                        keep
+                    })
+                    .cloned()
+                    .collect();
+                if dropped > 0 {
+                    log::warn!(
+                        "V4 read: dropped {dropped} bucket-index leaf ref(s) already present in \
+                         the root — a ref reached both tiers; graduation should have removed it \
+                         from the root"
+                    );
+                }
+                manifest_files.extend(fresh);
             }
 
             // Incremental path tombstones: `reconstruct_root` already dropped any

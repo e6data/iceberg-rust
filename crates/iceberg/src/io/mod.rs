@@ -66,12 +66,22 @@
 //! - `new_input`: Create input file for reading.
 //! - `new_output`: Create output file for writing.
 
+#[cfg(all(test, feature = "storage-memory"))]
+pub(crate) mod fault_layer;
 mod file_io;
 mod storage;
+mod write_through_cache;
+// Local-cache observability. The layer itself is private (installed via
+// `maybe_wrap` from `storage.rs`), but the host process needs the counters to
+// expose them on its own metrics endpoint — without them a cache that has
+// stopped serving is indistinguishable from one that is working.
+pub use write_through_cache::{local_cache_stats, LocalCacheStats};
 
 pub use file_io::*;
 pub(crate) mod object_cache;
 
+#[cfg(feature = "storage-azdls")]
+mod azdls_wi_layer;
 #[cfg(feature = "storage-azdls")]
 mod storage_azdls;
 #[cfg(feature = "storage-fs")]
@@ -82,6 +92,8 @@ mod storage_gcs;
 mod storage_memory;
 #[cfg(feature = "storage-oss")]
 mod storage_oss;
+#[cfg(feature = "storage-s3")]
+mod s3_credential_cache;
 #[cfg(feature = "storage-s3")]
 mod storage_s3;
 

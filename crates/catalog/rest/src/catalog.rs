@@ -713,6 +713,7 @@ impl Catalog for RestCatalog {
     /// server and the config provided when creating this `RestCatalog` instance, then the value
     /// provided locally to the `RestCatalog` will take precedence.
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
+        let started = std::time::Instant::now();
         let context = self.context().await?;
 
         let request = context
@@ -720,11 +721,24 @@ impl Catalog for RestCatalog {
             .request(Method::GET, context.config.table_endpoint(table_ident))
             .build()?;
 
+        let rpc_started = std::time::Instant::now();
         let http_response = context.client.query_catalog(request).await?;
+        let rpc_ms = rpc_started.elapsed().as_millis() as u64;
+        let response_bytes = http_response.content_length().unwrap_or(0);
 
+        let deser_started = std::time::Instant::now();
         let response = match http_response.status() {
             StatusCode::OK | StatusCode::NOT_MODIFIED => {
-                deserialize_catalog_response::<LoadTableResult>(http_response).await?
+                let r = deserialize_catalog_response::<LoadTableResult>(http_response).await?;
+                tracing::info!(
+                    table = %table_ident,
+                    response_bytes,
+                    rpc_ms,
+                    deser_ms = deser_started.elapsed().as_millis() as u64,
+                    total_ms = started.elapsed().as_millis() as u64,
+                    "rest load_table timing"
+                );
+                r
             }
             StatusCode::NOT_FOUND => {
                 // Definitive "table does not exist" from the catalog.
@@ -899,8 +913,13 @@ impl Catalog for RestCatalog {
     }
 
     async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
+        let started = std::time::Instant::now();
         let context = self.context().await?;
 
+        let updates = commit.take_updates();
+        let requirements = commit.take_requirements();
+        let n_updates = updates.len();
+        let n_requirements = requirements.len();
         let request = context
             .client
             .request(
@@ -909,52 +928,82 @@ impl Catalog for RestCatalog {
             )
             .json(&CommitTableRequest {
                 identifier: Some(commit.identifier().clone()),
-                requirements: commit.take_requirements(),
-                updates: commit.take_updates(),
+                requirements,
+                updates,
             })
             .build()?;
+        let request_bytes = request
+            .body()
+            .and_then(|b| b.as_bytes())
+            .map(|b| b.len())
+            .unwrap_or(0);
+        let build_ms = started.elapsed().as_millis() as u64;
 
+        // query_catalog resolves when response HEADERS arrive, so rpc_ms
+        // is auth + request upload + lakekeeper server processing (the
+        // CAS + metadata write). Body download + parse is deser_ms below.
+        let rpc_started = std::time::Instant::now();
         let http_response = context.client.query_catalog(request).await?;
+        let rpc_ms = rpc_started.elapsed().as_millis() as u64;
+        let status = http_response.status();
+        let response_bytes = http_response.content_length().unwrap_or(0);
 
-        let response: CommitTableResponse = match http_response.status() {
-            StatusCode::OK => deserialize_catalog_response(http_response).await?,
-            StatusCode::NOT_FOUND => {
-                return Err(Error::new(
-                    ErrorKind::TableNotFound,
-                    "Tried to update a table that does not exist",
-                ));
-            }
-            StatusCode::CONFLICT => {
-                return Err(Error::new(
-                    ErrorKind::CatalogCommitConflicts,
-                    "CatalogCommitConflicts, one or more requirements failed. The client may retry.",
-                )
-                .with_retryable(true));
-            }
-            StatusCode::INTERNAL_SERVER_ERROR => {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "An unknown server-side problem occurred; the commit state is unknown.",
-                ));
-            }
-            StatusCode::BAD_GATEWAY => {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "A gateway or proxy received an invalid response from the upstream server; the commit state is unknown.",
-                ));
-            }
-            StatusCode::GATEWAY_TIMEOUT => {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "A server-side gateway timeout occurred; the commit state is unknown.",
-                ));
-            }
-            _ => return Err(deserialize_unexpected_catalog_error(http_response).await),
+        let deser_started = std::time::Instant::now();
+        let response_result: Result<CommitTableResponse> = match status {
+            StatusCode::OK => deserialize_catalog_response(http_response).await,
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::TableNotFound,
+                "Tried to update a table that does not exist",
+            )),
+            StatusCode::CONFLICT => Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                "CatalogCommitConflicts, one or more requirements failed. The client may retry.",
+            )
+            .with_retryable(true)),
+            StatusCode::INTERNAL_SERVER_ERROR => Err(Error::new(
+                ErrorKind::Unexpected,
+                "An unknown server-side problem occurred; the commit state is unknown.",
+            )),
+            StatusCode::BAD_GATEWAY => Err(Error::new(
+                ErrorKind::Unexpected,
+                "A gateway or proxy received an invalid response from the upstream server; the commit state is unknown.",
+            )),
+            StatusCode::GATEWAY_TIMEOUT => Err(Error::new(
+                ErrorKind::Unexpected,
+                "A server-side gateway timeout occurred; the commit state is unknown.",
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(http_response).await),
         };
+        let deser_ms = deser_started.elapsed().as_millis() as u64;
 
+        tracing::info!(
+            table = %commit.identifier(),
+            status = %status,
+            updates = n_updates,
+            requirements = n_requirements,
+            request_bytes,
+            response_bytes,
+            build_ms,
+            rpc_ms,
+            deser_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            ok = response_result.is_ok(),
+            "rest update_table timing"
+        );
+        let response = response_result?;
+
+        let file_io_started = std::time::Instant::now();
         let file_io = self
             .load_file_io(Some(&response.metadata_location), None)
             .await?;
+        let file_io_ms = file_io_started.elapsed().as_millis() as u64;
+        if file_io_ms > 100 {
+            tracing::info!(
+                table = %commit.identifier(),
+                file_io_ms,
+                "rest update_table slow file_io rebuild"
+            );
+        }
 
         Table::builder()
             .identifier(commit.identifier().clone())

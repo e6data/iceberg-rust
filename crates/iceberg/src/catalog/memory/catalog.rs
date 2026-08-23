@@ -122,6 +122,19 @@ impl MemoryCatalog {
         })
     }
 
+    /// Creates a memory catalog backed by a caller-supplied `FileIO` (DST helper —
+    /// used to inject a byte-level fault layer under the store). The catalog shares
+    /// this `FileIO` with every table it creates or loads, so the injected faults
+    /// cover both catalog metadata writes and table manifest/data writes.
+    #[cfg(all(test, feature = "storage-memory"))]
+    pub(crate) fn new_with_file_io(warehouse: impl Into<String>, file_io: FileIO) -> Self {
+        Self {
+            root_namespace_state: Mutex::new(NamespaceState::default()),
+            file_io,
+            warehouse_location: warehouse.into(),
+        }
+    }
+
     /// Loads a table from the locked namespace state.
     async fn load_table_from_locked_state(
         &self,

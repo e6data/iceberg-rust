@@ -37,6 +37,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::spec::root_manifest::{write_root_manifest, RootManifestEntry, RootManifestMetadata};
 use crate::spec::{
     DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile,
     ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Operation, Snapshot,
@@ -44,6 +45,102 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
+
+/// Write the consolidated manifest list for a rewrite and return its path.
+///
+/// On an incremental-root (V4) table this writes a **V4 Parquet root BASE**, so
+/// the delta chain anchors to a V4 root rather than a standard Avro manifest-list.
+/// Anchoring to Avro is what wedged ingestion: laminar's V4 deltas chained onto
+/// the compaction snapshot, and the `chain_depth == 64` collapse then tried to
+/// parse the Avro base as Parquet ("corrupt footer"). A V4 base reconstructs
+/// cleanly. Non-incremental tables keep the standard Avro manifest-list. The
+/// property is operator-stamped in lakekeeper (same accessor as `commit_v4`).
+async fn write_rewrite_consolidated_list(
+    table: &Table,
+    all_manifests: Vec<ManifestFile>,
+    snapshot_id: i64,
+    commit_uuid: Uuid,
+    next_seq_num: i64,
+    format_version: FormatVersion,
+) -> Result<String> {
+    let incremental = table
+        .metadata()
+        .properties()
+        .get("root-manifest.incremental")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if incremental {
+        let schema = table.metadata().current_schema().clone();
+        let spec = table.metadata().default_partition_spec().clone();
+        let partition_type = spec.partition_type(table.metadata().current_schema())?;
+        let entries: Vec<RootManifestEntry> = all_manifests
+            .iter()
+            .map(|mf| RootManifestEntry::ManifestRef {
+                manifest_file: mf.clone(),
+                mdv: None,
+            })
+            .collect();
+        let rm_metadata = RootManifestMetadata {
+            schema: schema.clone(),
+            schema_id: table.metadata().current_schema_id(),
+            partition_spec: spec.clone(),
+            format_version: FormatVersion::V4,
+            snapshot_id,
+            sequence_number: next_seq_num,
+            parent_snapshot_id: table.metadata().current_snapshot_id(),
+            bucket_index_path: None,
+            prev_root_path: None,
+            chain_depth: 0,
+            node_level: 0,
+            removed_paths: Vec::new(),
+        };
+        let root_path = format!(
+            "{}/metadata/root-{}-{}.parquet",
+            table.metadata().location(),
+            snapshot_id,
+            commit_uuid,
+        );
+        let root_bytes = write_root_manifest(&entries, &rm_metadata, &partition_type)?;
+        table
+            .file_io()
+            .new_output(&root_path)?
+            .write(root_bytes.into())
+            .await?;
+        Ok(root_path)
+    } else {
+        let manifest_list_path = format!(
+            "{}/metadata/snap-{}-0-{}.{}",
+            table.metadata().location(),
+            snapshot_id,
+            commit_uuid,
+            DataFileFormat::Avro,
+        );
+        let mut manifest_list_writer = match format_version {
+            FormatVersion::V1 => ManifestListWriter::v1(
+                table.file_io().new_output(manifest_list_path.clone())?,
+                snapshot_id,
+                table.metadata().current_snapshot_id(),
+            ),
+            FormatVersion::V2 => ManifestListWriter::v2(
+                table.file_io().new_output(manifest_list_path.clone())?,
+                snapshot_id,
+                table.metadata().current_snapshot_id(),
+                next_seq_num,
+            ),
+            FormatVersion::V3 | FormatVersion::V4 => ManifestListWriter::v3(
+                table.file_io().new_output(manifest_list_path.clone())?,
+                snapshot_id,
+                table.metadata().current_snapshot_id(),
+                next_seq_num,
+                None,
+            ),
+        };
+        manifest_list_writer.add_manifests(all_manifests.into_iter())?;
+        manifest_list_writer.close().await?;
+        Ok(manifest_list_path)
+    }
+}
 use crate::transaction::action::TransactionAction;
 use crate::transaction::snapshot::SnapshotProducer;
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
@@ -61,6 +158,19 @@ pub struct RewriteManifestsAction {
     /// of aborting. Live data files from valid manifests are preserved;
     /// broken manifests are dropped from the rewritten manifest list.
     skip_missing_manifests: bool,
+    /// Caller-provided override for the new snapshot's id. Mirrors
+    /// `FastAppendAction.with_snapshot_id` and
+    /// `ReplaceDataFilesAction.with_snapshot_id`. Set via
+    /// [`Self::with_snapshot_id`]; pair with
+    /// [`crate::transaction::generate_unique_snapshot_id`] to pre-allocate
+    /// an id the caller can also use in `StatisticsFile` entries within
+    /// the same transaction (manifest compaction is a metadata-only
+    /// rewrite, so per-snapshot Puffin stats from the parent stay valid
+    /// and should be carried forward under the new snapshot id — otherwise
+    /// the executor's `metadata.statistics_for_snapshot(current)` returns
+    /// None on the compaction snapshot and the label_values fast path
+    /// falls back to a parquet scan until the next FastAppend lands).
+    snapshot_id_override: Option<i64>,
 }
 
 impl RewriteManifestsAction {
@@ -69,6 +179,7 @@ impl RewriteManifestsAction {
         Self {
             target_entries_per_manifest: 1000,
             skip_missing_manifests: false,
+            snapshot_id_override: None,
         }
     }
 
@@ -83,6 +194,22 @@ impl RewriteManifestsAction {
     /// readable manifests are preserved in the rewritten output.
     pub fn skip_missing_manifests(mut self, skip: bool) -> Self {
         self.skip_missing_manifests = skip;
+        self
+    }
+
+    /// Pre-allocate the new snapshot's id, overriding the random id that
+    /// `execute()` / `commit()` would otherwise generate. Mirror of
+    /// [`super::append::FastAppendAction::with_snapshot_id`] and
+    /// [`super::replace_data_files::ReplaceDataFilesAction::with_snapshot_id`];
+    /// same use case (referencing the snapshot_id elsewhere in the same
+    /// transaction — most commonly to attach carry-forward `StatisticsFile`
+    /// entries to the new compaction snapshot so per-snapshot Puffin
+    /// stats don't orphan).
+    ///
+    /// Pair with [`crate::transaction::generate_unique_snapshot_id`] to
+    /// generate the id before the action is built.
+    pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id_override = Some(snapshot_id);
         self
     }
 
@@ -130,10 +257,18 @@ impl RewriteManifestsAction {
         // in flight, plus one manifest's entries being loaded.
 
         let commit_uuid = Uuid::now_v7();
-        let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
+        // Use caller-provided override when present (lets the caller pre-key
+        // a carry-forward StatisticsFile entry to the same snapshot id we'll
+        // commit here). Falls back to the random id otherwise.
+        let snapshot_id = self
+            .snapshot_id_override
+            .unwrap_or_else(|| SnapshotProducer::generate_unique_snapshot_id_static(table));
         let format_version = table.metadata().format_version();
         let use_parquet_manifests = {
-            let prop = table.metadata().properties().get("write.parquet.metadata-codec");
+            let prop = table
+                .metadata()
+                .properties()
+                .get("write.parquet.metadata-codec");
             match prop.map(|v| v.as_str()) {
                 Some(v) if v.eq_ignore_ascii_case("avro") => false,
                 _ => matches!(format_version, FormatVersion::V2 | FormatVersion::V3),
@@ -152,7 +287,9 @@ impl RewriteManifestsAction {
                             spec_id: i32,
                             counter: &mut u64,
                             output: &mut Vec<ManifestFile>|
-         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+         -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
+        > {
             // Can't use async closure, so we'll flush inline below
             Box::pin(async { Ok(()) })
         };
@@ -167,8 +304,7 @@ impl RewriteManifestsAction {
                     skipped_manifests += 1;
                     eprintln!(
                         "WARN: Skipping unreadable manifest {}: {}",
-                        mf.manifest_path,
-                        e,
+                        mf.manifest_path, e,
                     );
                     continue;
                 }
@@ -182,17 +318,22 @@ impl RewriteManifestsAction {
 
                     // Flush when buffer reaches target size
                     if buffer.len() >= self.target_entries_per_manifest {
-                        let spec = table
-                            .metadata()
-                            .partition_spec_by_id(spec_id)
-                            .ok_or_else(|| {
-                                Error::new(
-                                    ErrorKind::DataInvalid,
-                                    format!("partition spec {spec_id} not found"),
-                                )
-                            })?;
+                        let spec =
+                            table
+                                .metadata()
+                                .partition_spec_by_id(spec_id)
+                                .ok_or_else(|| {
+                                    Error::new(
+                                        ErrorKind::DataInvalid,
+                                        format!("partition spec {spec_id} not found"),
+                                    )
+                                })?;
 
-                        let ext = if use_parquet_manifests { "parquet" } else { "avro" };
+                        let ext = if use_parquet_manifests {
+                            "parquet"
+                        } else {
+                            "avro"
+                        };
                         let manifest_path = format!(
                             "{}/metadata/{}-m{}.{}",
                             table.metadata().location(),
@@ -213,7 +354,7 @@ impl RewriteManifestsAction {
                         let mut writer = match format_version {
                             FormatVersion::V1 => builder.build_v1(),
                             FormatVersion::V2 => builder.build_v2_data(),
-                            FormatVersion::V3 => builder.build_v3_data(),
+                            FormatVersion::V3 | FormatVersion::V4 => builder.build_v3_data(),
                         };
 
                         let to_flush = std::mem::take(buffer);
@@ -264,7 +405,11 @@ impl RewriteManifestsAction {
                     )
                 })?;
 
-            let ext_m = if use_parquet_manifests { "parquet" } else { "avro" };
+            let ext_m = if use_parquet_manifests {
+                "parquet"
+            } else {
+                "avro"
+            };
             for chunk in entries.chunks(self.target_entries_per_manifest) {
                 let manifest_path = format!(
                     "{}/metadata/{}-m{}.{}",
@@ -286,7 +431,7 @@ impl RewriteManifestsAction {
                 let mut writer = match format_version {
                     FormatVersion::V1 => builder.build_v1(),
                     FormatVersion::V2 => builder.build_v2_data(),
-                    FormatVersion::V3 => builder.build_v3_data(),
+                    FormatVersion::V3 | FormatVersion::V4 => builder.build_v3_data(),
                 };
 
                 for e in chunk {
@@ -353,48 +498,24 @@ impl RewriteManifestsAction {
             // Reuse the snapshot_id generated in Phase 1 (manifests already carry it)
             let _ = snapshot_id;
             let next_seq_num = current_table.metadata().next_sequence_number();
-            let manifest_list_path = format!(
-                "{}/metadata/snap-{}-0-{}.{}",
-                current_table.metadata().location(),
-                snapshot_id,
-                commit_uuid,
-                DataFileFormat::Avro,
-            );
 
-            let mut manifest_list_writer = match format_version {
-                FormatVersion::V1 => ManifestListWriter::v1(
-                    current_table
-                        .file_io()
-                        .new_output(manifest_list_path.clone())?,
-                    snapshot_id,
-                    current_table.metadata().current_snapshot_id(),
-                ),
-                FormatVersion::V2 => ManifestListWriter::v2(
-                    current_table
-                        .file_io()
-                        .new_output(manifest_list_path.clone())?,
-                    snapshot_id,
-                    current_table.metadata().current_snapshot_id(),
-                    next_seq_num,
-                ),
-                FormatVersion::V3 => ManifestListWriter::v3(
-                    current_table
-                        .file_io()
-                        .new_output(manifest_list_path.clone())?,
-                    snapshot_id,
-                    current_table.metadata().current_snapshot_id(),
-                    next_seq_num,
-                    None,
-                ),
-            };
-
-            let all_manifests = compacted_data_manifests
+            let all_manifests: Vec<ManifestFile> = compacted_data_manifests
                 .iter()
                 .cloned()
                 .chain(new_manifests.into_iter())
-                .chain(delete_manifests.iter().cloned());
-            manifest_list_writer.add_manifests(all_manifests)?;
-            manifest_list_writer.close().await?;
+                .chain(delete_manifests.iter().cloned())
+                .collect();
+
+            // V4 root base on incremental tables, Avro manifest-list otherwise.
+            let manifest_list_path = write_rewrite_consolidated_list(
+                &current_table,
+                all_manifests,
+                snapshot_id,
+                commit_uuid,
+                next_seq_num,
+                format_version,
+            )
+            .await?;
 
             // Build snapshot
             let summary = Summary {
@@ -428,6 +549,9 @@ impl RewriteManifestsAction {
                 .with_summary(summary)
                 .with_schema_id(current_table.metadata().current_schema_id())
                 .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
+                // first-row-id is required for format-version >= v3 (manifest
+                // consolidation adds no new rows, so the added count is 0).
+                .with_row_range(current_table.metadata().next_row_id(), 0)
                 .build();
 
             let updates = vec![
@@ -484,6 +608,10 @@ impl RewriteManifestsAction {
 // resilience.
 #[async_trait]
 impl TransactionAction for RewriteManifestsAction {
+    fn action_name(&self) -> &'static str {
+        "rewrite_manifests"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         // Fallback: single-phase approach via Transaction framework.
         // For the merge-aware two-phase approach, use execute() directly.
@@ -533,10 +661,18 @@ impl TransactionAction for RewriteManifestsAction {
         }
 
         let commit_uuid = Uuid::now_v7();
-        let snapshot_id = SnapshotProducer::generate_unique_snapshot_id_static(table);
+        // Use caller-provided override when present; see the same branch
+        // in `execute()` above for rationale (carry-forward StatisticsFile
+        // entries keyed to the pre-allocated snapshot id).
+        let snapshot_id = self
+            .snapshot_id_override
+            .unwrap_or_else(|| SnapshotProducer::generate_unique_snapshot_id_static(table));
         let format_version = table.metadata().format_version();
         let use_parquet_manifests = {
-            let prop = table.metadata().properties().get("write.parquet.metadata-codec");
+            let prop = table
+                .metadata()
+                .properties()
+                .get("write.parquet.metadata-codec");
             match prop.map(|v| v.as_str()) {
                 Some(v) if v.eq_ignore_ascii_case("avro") => false,
                 _ => matches!(format_version, FormatVersion::V2 | FormatVersion::V3),
@@ -558,7 +694,11 @@ impl TransactionAction for RewriteManifestsAction {
                     )
                 })?;
 
-            let ext_m = if use_parquet_manifests { "parquet" } else { "avro" };
+            let ext_m = if use_parquet_manifests {
+                "parquet"
+            } else {
+                "avro"
+            };
             for chunk in entries.chunks(self.target_entries_per_manifest) {
                 let manifest_path = format!(
                     "{}/metadata/{}-m{}.{}",
@@ -581,7 +721,7 @@ impl TransactionAction for RewriteManifestsAction {
                 let mut writer = match format_version {
                     FormatVersion::V1 => builder.build_v1(),
                     FormatVersion::V2 => builder.build_v2_data(),
-                    FormatVersion::V3 => builder.build_v3_data(),
+                    FormatVersion::V3 | FormatVersion::V4 => builder.build_v3_data(),
                 };
 
                 for entry in chunk {
@@ -608,40 +748,21 @@ impl TransactionAction for RewriteManifestsAction {
         }
 
         let next_seq_num = table.metadata().next_sequence_number();
-        let manifest_list_path = format!(
-            "{}/metadata/snap-{}-0-{}.{}",
-            table.metadata().location(),
+
+        let all_manifests: Vec<ManifestFile> = new_data_manifests
+            .into_iter()
+            .chain(delete_manifests.into_iter())
+            .collect();
+        // V4 root base on incremental tables, Avro manifest-list otherwise.
+        let manifest_list_path = write_rewrite_consolidated_list(
+            table,
+            all_manifests,
             snapshot_id,
             commit_uuid,
-            DataFileFormat::Avro,
-        );
-
-        let mut manifest_list_writer = match format_version {
-            FormatVersion::V1 => ManifestListWriter::v1(
-                table.file_io().new_output(manifest_list_path.clone())?,
-                snapshot_id,
-                table.metadata().current_snapshot_id(),
-            ),
-            FormatVersion::V2 => ManifestListWriter::v2(
-                table.file_io().new_output(manifest_list_path.clone())?,
-                snapshot_id,
-                table.metadata().current_snapshot_id(),
-                next_seq_num,
-            ),
-            FormatVersion::V3 => ManifestListWriter::v3(
-                table.file_io().new_output(manifest_list_path.clone())?,
-                snapshot_id,
-                table.metadata().current_snapshot_id(),
-                next_seq_num,
-                None,
-            ),
-        };
-
-        let all_manifests = new_data_manifests
-            .into_iter()
-            .chain(delete_manifests.into_iter());
-        manifest_list_writer.add_manifests(all_manifests)?;
-        manifest_list_writer.close().await?;
+            next_seq_num,
+            format_version,
+        )
+        .await?;
 
         let summary = Summary {
             operation: Operation::Replace,
@@ -669,6 +790,8 @@ impl TransactionAction for RewriteManifestsAction {
             .with_summary(summary)
             .with_schema_id(table.metadata().current_schema_id())
             .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
+            // first-row-id is required for format-version >= v3.
+            .with_row_range(table.metadata().next_row_id(), 0)
             .build();
 
         let updates = vec![
@@ -695,5 +818,52 @@ impl TransactionAction for RewriteManifestsAction {
         ];
 
         Ok(ActionCommit::new(updates, requirements))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::transaction::Transaction;
+    use crate::transaction::rewrite_manifests::RewriteManifestsAction;
+
+    /// Mirrors `append::tests::test_with_snapshot_id_overrides_random_generation`.
+    ///
+    /// The `execute()` / `commit()` paths both require live catalog or S3
+    /// IO (loading the manifest list, etc.) which a unit test can't supply,
+    /// so we verify the override is plumbed onto the action struct. Both
+    /// commit paths consume `self.snapshot_id_override` directly — see
+    /// the `unwrap_or_else` branches at the top of `execute()` and the
+    /// `TransactionAction::commit()` impl.
+    #[test]
+    fn test_with_snapshot_id_overrides_random_generation() {
+        use crate::transaction::generate_unique_snapshot_id;
+        use crate::transaction::tests::make_v2_table;
+
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+
+        // Pre-allocate the snapshot_id the caller wants the commit to use.
+        // This is the pattern laminar's maintenance loop uses to attach a
+        // carry-forward StatisticsFile entry under the same snapshot id
+        // the rewrite-manifests action will land.
+        let snapshot_id = generate_unique_snapshot_id(&table);
+
+        let action = tx.rewrite_manifests().with_snapshot_id(snapshot_id);
+
+        assert_eq!(
+            Some(snapshot_id),
+            action.snapshot_id_override,
+            "RewriteManifestsAction.with_snapshot_id must store the override so \
+             execute()/commit() can adopt it instead of generating a fresh random id"
+        );
+    }
+
+    #[test]
+    fn test_default_has_no_snapshot_id_override() {
+        let action = RewriteManifestsAction::new();
+        assert!(
+            action.snapshot_id_override.is_none(),
+            "default RewriteManifestsAction must not pin a snapshot id"
+        );
     }
 }

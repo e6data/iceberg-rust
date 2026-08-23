@@ -359,14 +359,73 @@ impl TableScan {
         // get the [`ManifestFile`]s from the [`ManifestList`], filtering out any
         // whose partitions cannot match this
         // scan's filter
-        let manifest_file_contexts = plan_context.build_manifest_file_contexts(
-            manifest_list,
-            manifest_entry_data_ctx_tx,
-            delete_file_idx.clone(),
-            manifest_entry_delete_ctx_tx,
-        )?;
+        let (manifest_file_contexts, inline_data_contexts, inline_delete_contexts) =
+            plan_context.build_manifest_file_contexts(
+                manifest_list,
+                manifest_entry_data_ctx_tx.clone(),
+                delete_file_idx.clone(),
+                manifest_entry_delete_ctx_tx.clone(),
+            )?;
 
         let mut channel_for_manifest_error = file_scan_task_tx.clone();
+
+        // Send V4 inline entries directly into the pipeline before starting
+        // manifest loading (they don't need a ManifestFile::load_manifest() call).
+        //
+        // Sender lifecycle: the tx clones passed to build_manifest_file_contexts
+        // live inside each ManifestFileContext and drop after streaming entries.
+        // These original tx handles are moved into this inline task and drop when
+        // it completes. The channels close when both tasks finish.
+        let mut inline_data_tx = manifest_entry_data_ctx_tx;
+        let mut inline_delete_tx = manifest_entry_delete_ctx_tx;
+        spawn(async move {
+            // Send inline delete entries first (same ordering as manifest files)
+            for ctx in inline_delete_contexts {
+                if inline_delete_tx.send(ctx).await.is_err() {
+                    break;
+                }
+            }
+            // Drop the inline-delete tx BEFORE starting the inline-data sends.
+            // Otherwise we deadlock past a critical inline-entry count:
+            //
+            //   - `process_data_manifest_entry` calls
+            //     `into_file_scan_task().await` which awaits
+            //     `DeleteFileIndex::get_deletes_for_data_file`, which itself
+            //     blocks on `notifier.notified().await` until the delete
+            //     index transitions to `Populated`.
+            //   - That transition happens when the delete-process spawn
+            //     drains its rx, which closes only when every
+            //     `manifest_entry_delete_ctx_tx` clone drops.
+            //   - One of those clones is `inline_delete_tx`, held here.
+            //   - Meanwhile this spawn is mid-loop sending inline DATA
+            //     entries; `inline_data_tx.send().await` blocks once the
+            //     data channel (size = concurrency_limit_manifest_files)
+            //     fills, AND the data-process consumer can't drain because
+            //     all its in-flight tasks (concurrency_limit_manifest_entries
+            //     of them) are blocked on the delete-index notifier above.
+            //
+            // Threshold for deadlock: inline_data_contexts.len() >
+            //   concurrency_limit_manifest_files + concurrency_limit_manifest_entries.
+            // Live-confirmed on sri-olly's attribute_index_logs at 66 inline
+            // entries (> 16+16=32) -- 3h probe queries hit the 10s
+            // INDEX_PROBE_TIMEOUT ceiling 100% of the time while 1h probes
+            // (~23 entries, under threshold) completed in 115ms.
+            //
+            // The fix is structural, not a knob: dropping inline_delete_tx
+            // here lets the delete channel close immediately when there are
+            // no child-manifest delete entries (always true on append-only
+            // tables like attribute_index_*, and the dominant case in
+            // V4-on-low-volume), so the DeleteFileIndex populates with an
+            // empty set and `get_deletes_for_data_file` returns Vec::new
+            // instead of blocking forever.
+            drop(inline_delete_tx);
+
+            for ctx in inline_data_contexts {
+                if inline_data_tx.send(ctx).await.is_err() {
+                    break;
+                }
+            }
+        });
 
         // Concurrently load all [`Manifest`]s and stream their [`ManifestEntry`]s
         spawn(async move {
@@ -384,7 +443,25 @@ impl TableScan {
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
-        // Process the delete file [`ManifestEntry`] stream in parallel
+        // Process the delete file [`ManifestEntry`] stream in parallel.
+        //
+        // NOTE: This spawn is intentionally NOT `.await`ed. The sibling
+        // data-process spawn below uses the same fire-and-forget shape on
+        // purpose -- awaiting either spawn here deadlocks when the V4
+        // inline-entries spawn (above, lines ~381) holds BOTH
+        // `inline_delete_tx` and `inline_data_tx` until it finishes
+        // sending every inline data entry. With bounded channels sized
+        // to `concurrency_limit_manifest_files`, the inline spawn blocks
+        // on `inline_data_tx.send().await` once the data channel fills;
+        // the data-process consumer can't run because we're still
+        // waiting here; `inline_delete_tx` stays alive; `delete_rx`
+        // never closes; this spawn never returns. Live-confirmed on
+        // sri-olly's observability.logs (V4 root manifest, 68 inline
+        // entries, concurrency_limit=4, plan_files hung 10+ min with
+        // no progress and no error). Letting this spawn run in
+        // parallel lets the data consumer drain the inline-data
+        // channel; the inline spawn then completes and `delete_rx`
+        // closes naturally, terminating this task on its own.
         spawn(async move {
             let result = manifest_entry_delete_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
@@ -404,8 +481,7 @@ impl TableScan {
                     .send(Err(error))
                     .await;
             }
-        })
-        .await;
+        });
 
         // Process the data file [`ManifestEntry`] stream in parallel
         spawn(async move {

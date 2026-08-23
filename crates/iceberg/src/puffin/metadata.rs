@@ -291,6 +291,23 @@ impl FileMetadata {
                 .await?;
 
         let magic_length = FileMetadata::MAGIC_LENGTH as usize;
+        // Guard against a truncated/empty puffin footer: a corrupt sidecar can
+        // yield fewer bytes than the two magic markers it must contain, and the
+        // slices below (`[..magic_length]` and `[len - magic_length..]`) would
+        // then panic with an out-of-range index — aborting the whole process
+        // (observed crashing laminar's merge_puffin path on an empty sidecar).
+        // A corrupt sidecar must degrade to a skippable DataInvalid error, never
+        // a panic.
+        if footer_bytes.len() < 2 * magic_length {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Puffin footer too short: {} bytes (need at least {} for the two magic markers)",
+                    footer_bytes.len(),
+                    2 * magic_length
+                ),
+            ));
+        }
         // check first four bytes of footer
         FileMetadata::check_magic(&footer_bytes[..magic_length])?;
         // check last four bytes of footer

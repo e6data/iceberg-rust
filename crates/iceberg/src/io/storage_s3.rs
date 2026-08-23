@@ -16,16 +16,15 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use async_trait::async_trait;
 use opendal::services::S3Config;
 use opendal::{Configurator, Operator};
-pub use reqsign::{AwsCredential, AwsCredentialLoad};
-use reqwest::Client;
+use reqsign_aws_v4::DefaultCredentialProvider;
+use reqsign_core::ProvideCredentialChain;
 use url::Url;
 
 use crate::io::is_truthy;
+use crate::io::s3_credential_cache::SharedCachedCredentialProvider;
 use crate::{Error, ErrorKind, Result};
 
 /// Following are arguments for [s3 file io](https://py.iceberg.apache.org/configuration/#s3).
@@ -153,63 +152,99 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
     Ok(cfg)
 }
 
-/// Build new opendal operator from give path.
-pub(crate) fn s3_config_build(
-    cfg: &S3Config,
-    customized_credential_load: &Option<CustomAwsCredentialLoader>,
-    path: &str,
-) -> Result<Operator> {
+/// Extract the bucket name from an `s3[a]://<bucket>/<path>` URL. Kept
+/// separate from `s3_config_build` so callers that want to key a cache by
+/// bucket don't have to construct an `Operator` (and therefore a full
+/// credential-provider chain) just to read `.info().name()`. That
+/// construction is what stampeded 169.254.170.23 on sri-olly's
+/// 2026-08-12 metrics_1m tumble wedge — see `Storage::S3::operators` in
+/// storage.rs for the cache that consumes this.
+pub(crate) fn s3_bucket_from_path(path: &str) -> Result<String> {
     let url = Url::parse(path)?;
-    let bucket = url.host_str().ok_or_else(|| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            format!("Invalid s3 url: {path}, missing bucket"),
-        )
-    })?;
+    url.host_str()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Invalid s3 url: {path}, missing bucket"),
+            )
+        })
+}
 
-    let mut builder = cfg
+/// Build new opendal operator from given path.
+///
+/// opendal 0.57's built-in `credential_provider_chain` covers IRSA, EKS Pod
+/// Identity, EC2 instance metadata, env vars, and shared-credentials files
+/// with native auto-refresh — so this no longer needs to inject a custom
+/// credential loader the way it did under opendal 0.55. The
+/// `CustomAwsCredentialLoader` extension type that used to live in this
+/// module has been removed; consumers that previously plugged a loader in
+/// via `FileIOBuilder::with_file_io_extension` should drop that call and
+/// rely on the native chain.
+///
+/// The Operator returned here should be cached and reused across file
+/// operations targeting the same bucket — see `Storage::S3::operators`.
+/// Each call re-constructs opendal's provider chain and wastes the
+/// intra-chain credential TTL, and on synchronized-flush workloads that
+/// pattern will 429 the pod-identity endpoint.
+pub(crate) fn s3_config_build(cfg: &S3Config, path: &str) -> Result<Operator> {
+    let bucket = s3_bucket_from_path(path)?;
+
+    let builder = cfg
         .clone()
         .into_builder()
         // Set bucket name.
-        .bucket(bucket);
-
-    if let Some(customized_credential_load) = customized_credential_load {
-        builder = builder
-            .customized_credential_load(customized_credential_load.clone().into_opendal_loader());
-    }
+        .bucket(&bucket)
+        // Wrap opendal's default chain so concurrent signers coalesce into a
+        // single request at the pod-identity agent and a 429 is retried
+        // rather than failing the S3 op. See `s3_credential_cache` for the
+        // measured failure this addresses.
+        .credential_provider_chain(ProvideCredentialChain::new().push(
+            SharedCachedCredentialProvider::new(DefaultCredentialProvider::builder().build()),
+        ));
 
     Ok(Operator::new(builder)?.finish())
 }
 
-/// Custom AWS credential loader.
-/// This can be used to load credentials from a custom source, such as the AWS SDK.
-///
-/// This should be set as an extension on `FileIOBuilder`.
-#[derive(Clone)]
-pub struct CustomAwsCredentialLoader(Arc<dyn AwsCredentialLoad>);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl std::fmt::Debug for CustomAwsCredentialLoader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CustomAwsCredentialLoader")
-            .finish_non_exhaustive()
-    }
-}
-
-impl CustomAwsCredentialLoader {
-    /// Create a new custom AWS credential loader.
-    pub fn new(loader: Arc<dyn AwsCredentialLoad>) -> Self {
-        Self(loader)
+    #[test]
+    fn bucket_from_s3_scheme() {
+        assert_eq!(
+            s3_bucket_from_path("s3://my-bucket/data/foo.parquet").unwrap(),
+            "my-bucket"
+        );
     }
 
-    /// Convert this loader into an opendal compatible loader for customized AWS credentials.
-    pub fn into_opendal_loader(self) -> Box<dyn AwsCredentialLoad> {
-        Box::new(self)
+    #[test]
+    fn bucket_from_s3a_scheme() {
+        assert_eq!(
+            s3_bucket_from_path("s3a://another-bucket/x/y/z").unwrap(),
+            "another-bucket"
+        );
     }
-}
 
-#[async_trait]
-impl AwsCredentialLoad for CustomAwsCredentialLoader {
-    async fn load_credential(&self, client: Client) -> anyhow::Result<Option<AwsCredential>> {
-        self.0.load_credential(client).await
+    #[test]
+    fn bucket_from_path_with_no_key() {
+        // Bare `s3://bucket/` still parses — host is present.
+        assert_eq!(s3_bucket_from_path("s3://only-bucket/").unwrap(), "only-bucket");
+    }
+
+    #[test]
+    fn bucket_missing_returns_data_invalid() {
+        // Missing host — url::Url parses `s3:///path` with empty host_str().
+        let err = s3_bucket_from_path("s3:///no/bucket").unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::DataInvalid), "got {err:?}");
+    }
+
+    #[test]
+    fn malformed_url_returns_error() {
+        // Genuinely unparseable URL should fail (not panic).
+        let err = s3_bucket_from_path("::: not a url :::").unwrap_err();
+        // url::ParseError → whatever ErrorKind Url conversion assigns;
+        // point is the fn doesn't panic.
+        let _ = err;
     }
 }

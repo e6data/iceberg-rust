@@ -82,6 +82,10 @@ impl Default for UpdatePropertiesAction {
 
 #[async_trait]
 impl TransactionAction for UpdatePropertiesAction {
+    fn action_name(&self) -> &'static str {
+        "update_properties"
+    }
+
     async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
         if let Some(overlapping_key) = self.removals.iter().find(|k| self.updates.contains_key(*k))
         {

@@ -37,6 +37,15 @@ pub struct FastAppendAction {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    /// Caller-provided override for the new snapshot's id. When `Some`,
+    /// `commit()` uses this value instead of generating a fresh one via
+    /// `SnapshotProducer::generate_unique_snapshot_id`. Set via
+    /// [`Self::with_snapshot_id`]; pair with
+    /// [`crate::transaction::generate_unique_snapshot_id`] to pre-allocate
+    /// an id the caller can also use in `StatisticsFile` entries within
+    /// the same transaction.
+    snapshot_id_override: Option<i64>,
+    cached_root_entries: Option<(Option<i64>, Vec<crate::spec::root_manifest::RootManifestEntry>)>,
 }
 
 impl FastAppendAction {
@@ -47,6 +56,8 @@ impl FastAppendAction {
             key_metadata: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
+            snapshot_id_override: None,
+            cached_root_entries: None,
         }
     }
 
@@ -79,12 +90,44 @@ impl FastAppendAction {
         self.snapshot_properties = snapshot_properties;
         self
     }
+
+    /// Pre-allocate the new snapshot's id, overriding the random id that
+    /// `commit()` would otherwise generate.
+    ///
+    /// Use this when the caller needs to reference the snapshot_id elsewhere
+    /// in the same transaction — e.g. attaching a `StatisticsFile` via
+    /// `Transaction::update_statistics().set_statistics(...)`, which keys the
+    /// statistics map on snapshot_id and would otherwise pin to a stale or
+    /// zero value because the action sees the real id only after this commit
+    /// runs.
+    ///
+    /// Combine with [`crate::transaction::generate_unique_snapshot_id`] to
+    /// generate a fresh, non-colliding id before the action is built. Passing
+    /// the same value to both the FastAppend and the StatisticsFile ensures
+    /// the stats entry attaches to the snapshot this action will create.
+    pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id_override = Some(snapshot_id);
+        self
+    }
+
+    /// Pass cached root manifest entries to avoid re-reading from S3 on
+    /// consecutive commits within the same transaction.
+    /// Pass cached root manifest entries (with their source snapshot_id) to
+    /// avoid re-reading from S3 on consecutive commits.
+    pub fn with_cached_root_entries(mut self, snapshot_id: Option<i64>, entries: Vec<crate::spec::root_manifest::RootManifestEntry>) -> Self {
+        self.cached_root_entries = Some((snapshot_id, entries));
+        self
+    }
 }
 
 #[async_trait]
 impl TransactionAction for FastAppendAction {
+    fn action_name(&self) -> &'static str {
+        "fast_append"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        let snapshot_producer = SnapshotProducer::new(
+        let mut snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             self.key_metadata.clone(),
@@ -92,6 +135,12 @@ impl TransactionAction for FastAppendAction {
             self.added_data_files.clone(),
             vec![],
         );
+        if let Some(id) = self.snapshot_id_override {
+            snapshot_producer = snapshot_producer.with_snapshot_id(id);
+        }
+        if let Some((snapshot_id, ref cached)) = self.cached_root_entries {
+            snapshot_producer = snapshot_producer.with_cached_root_entries(snapshot_id, cached.clone());
+        }
 
         // validate added files
         snapshot_producer.validate_added_data_files()?;
@@ -163,6 +212,50 @@ mod tests {
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![]);
         assert!(Arc::new(action).commit(&table).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_with_snapshot_id_overrides_random_generation() {
+        use crate::transaction::generate_unique_snapshot_id;
+
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/with_id.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        // Pre-allocate the snapshot_id the caller wants the commit to use.
+        // This is the pattern laminar uses to attach StatisticsFile entries
+        // to the same snapshot the commit will create.
+        let snapshot_id = generate_unique_snapshot_id(&table);
+
+        let action = tx
+            .fast_append()
+            .with_snapshot_id(snapshot_id)
+            .add_data_files(vec![data_file]);
+
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+
+        let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
+            snapshot
+        } else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            snapshot_id,
+            new_snapshot.snapshot_id(),
+            "FastAppendAction.with_snapshot_id must override the random id used by commit()"
+        );
     }
 
     #[tokio::test]

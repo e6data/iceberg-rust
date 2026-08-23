@@ -346,8 +346,15 @@ impl ParquetWriter {
         Ok(data_files)
     }
 
-    /// `ParquetMetadata` to data file builder
-    pub(crate) fn parquet_to_data_file_builder(
+    /// `ParquetMetadata` to data file builder.
+    ///
+    /// Exposed as `pub` (rather than `pub(crate)`) so external compaction
+    /// tooling that copies row groups verbatim — without going through
+    /// `ParquetWriter`'s decode/re-encode path — can construct an
+    /// `iceberg::spec::DataFile` purely from the output file's parquet
+    /// footer. Specifically used by tessellate's streaming row-group
+    /// concat path; see `o11y/tessellate/STREAMING_CONCAT_PLAN.md`.
+    pub fn parquet_to_data_file_builder(
         schema: SchemaRef,
         metadata: Arc<ParquetMetaData>,
         written_size: usize,

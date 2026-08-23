@@ -53,6 +53,35 @@ pub(crate) static INITIAL_SEQUENCE_NUMBER: i64 = 0;
 pub const INITIAL_ROW_ID: u64 = 0;
 /// Minimum format version that supports row lineage (v3).
 pub const MIN_FORMAT_VERSION_ROW_LINEAGE: FormatVersion = FormatVersion::V3;
+
+/// Custom table property that opts a table into V4 behaviour even when its
+/// catalog-declared `format-version` is V1/V2/V3. Read by
+/// [`TableMetadata::effective_format_version`].
+///
+/// Why this exists: REST catalogs that pre-date V4 (e.g. Lakekeeper at commit
+/// `bb70173`) validate the declared `format-version` against `{V1, V2, V3}`
+/// at `CREATE TABLE` time and reject anything outside that set. But the
+/// catalog doesn't need to understand V4 internals: it stores `metadata.json`
+/// blobs, the snapshot's `manifest_list` field as an opaque S3 path, and
+/// table properties verbatim. The V4 mechanics (single-file Parquet root
+/// manifest, MDV-based compaction) live entirely inside object storage; the
+/// catalog never reads them.
+///
+/// This property lets us declare V3 to such catalogs and route every
+/// e6-controlled writer/reader through the V4 paths via
+/// [`TableMetadata::effective_format_version`].
+///
+/// IMPORTANT: the opt-in is invisible to non-e6 readers (Trino, Spark via
+/// upstream iceberg lib). Those readers will see `format-version=3`, try to
+/// read the `manifest_list` as Avro, and fail because it is actually a
+/// Parquet root manifest. Tables using this property MUST only be served by
+/// readers that honour [`TableMetadata::effective_format_version`].
+pub const E6_ACTUAL_FORMAT_VERSION_KEY: &str = "e6.actual-format-version";
+
+/// Property value that opts a table into V4 behaviour. Anything else is
+/// ignored so a typo can never silently promote or demote a table.
+pub const E6_ACTUAL_FORMAT_VERSION_V4_VALUE: &str = "4";
+
 /// Reference to [`TableMetadata`].
 pub type TableMetadataRef = Arc<TableMetadata>;
 
@@ -126,8 +155,21 @@ pub struct TableMetadata {
     /// There is always a main branch reference pointing to the current-snapshot-id
     /// even if the refs map is null.
     pub(crate) refs: HashMap<String, SnapshotReference>,
-    /// Mapping of snapshot ids to statistics files.
-    pub(crate) statistics: HashMap<i64, StatisticsFile>,
+    /// Mapping of `(snapshot_id, statistics_path)` to statistics files.
+    ///
+    /// The Iceberg spec models `statistics` as a list keyed by the
+    /// `(snapshot_id, statistics_path)` pair — multiple files with the
+    /// same `snapshot_id` are allowed as long as their `statistics_path`
+    /// differs. Tessellate compaction commits up to N puffin files per
+    /// snapshot (one per partition), and laminar's per-output merge
+    /// sidecar registration registers one per compacted file. Storing
+    /// this as a `(snapshot_id, statistics_path)` keyed map preserves
+    /// each distinct entry instead of collapsing them like the prior
+    /// `HashMap<i64, _>` did.
+    ///
+    /// Use [`Self::statistics_for_snapshot`] (back-compat: first match)
+    /// or [`Self::all_statistics_for_snapshot`] (full list per spec).
+    pub(crate) statistics: HashMap<(i64, String), StatisticsFile>,
     /// Mapping of snapshot ids to partition statistics files.
     pub(crate) partition_statistics: HashMap<i64, PartitionStatisticsFile>,
     /// Encryption Keys - map of key id to the actual key
@@ -167,6 +209,46 @@ impl TableMetadata {
     /// Returns format version of this metadata.
     #[inline]
     pub fn format_version(&self) -> FormatVersion {
+        self.format_version
+    }
+
+    /// Returns the format version that should drive **behaviour** dispatch
+    /// (which commit path, which read path, whether rebalance is available).
+    /// This is NOT the version used for catalog wire-format serialisation --
+    /// use [`Self::format_version`] for that.
+    ///
+    /// Precedence:
+    ///
+    /// 1. If the declared `format_version` is already
+    ///    [`FormatVersion::V4`], return V4. (Lets file-system / V4-aware
+    ///    REST catalogs skip the property dance.)
+    /// 2. If the table property [`E6_ACTUAL_FORMAT_VERSION_KEY`] equals
+    ///    [`E6_ACTUAL_FORMAT_VERSION_V4_VALUE`], return V4. (The
+    ///    portable-with-V3-catalog path -- e.g. Lakekeeper pre-V4, which
+    ///    validates `format-version` at create time but stores arbitrary
+    ///    table properties verbatim.)
+    /// 3. Otherwise return the declared `format_version` as-is.
+    ///
+    /// Bogus property values (anything other than the literal V4 value)
+    /// are ignored so a typo can never silently promote or demote a table.
+    ///
+    /// IMPORTANT: tables opted in via the property are only readable by
+    /// e6-controlled clients that honour this method. A non-e6 reader
+    /// (Trino, Spark via upstream iceberg-rust) will see V3 declared, try
+    /// to parse the V4 Parquet root manifest as Avro, and fail.
+    #[inline]
+    pub fn effective_format_version(&self) -> FormatVersion {
+        if self.format_version == FormatVersion::V4 {
+            return FormatVersion::V4;
+        }
+        if self
+            .properties
+            .get(E6_ACTUAL_FORMAT_VERSION_KEY)
+            .map(String::as_str)
+            == Some(E6_ACTUAL_FORMAT_VERSION_V4_VALUE)
+        {
+            return FormatVersion::V4;
+        }
         self.format_version
     }
 
@@ -374,10 +456,42 @@ impl TableMetadata {
         self.partition_statistics.values()
     }
 
-    /// Get a statistics file for a snapshot id.
+    /// Get **a** statistics file for a snapshot id (back-compat: first
+    /// match found in HashMap iteration order, which is non-
+    /// deterministic). Returns `None` if no entry exists for the
+    /// snapshot.
+    ///
+    /// Iceberg allows multiple `StatisticsFile` entries per snapshot
+    /// (keyed by `statistics_path`). Callers that need the full set
+    /// should use [`Self::all_statistics_for_snapshot`] instead — this
+    /// method is kept for back-compat with downstreams that only ever
+    /// expected one. Tessellate's consolidated-puffin commit path
+    /// produces one entry per snapshot and continues to work
+    /// unchanged here; laminar's per-output merge-sidecar registration
+    /// produces N per snapshot and SHOULD migrate to the new method.
     #[inline]
     pub fn statistics_for_snapshot(&self, snapshot_id: i64) -> Option<&StatisticsFile> {
-        self.statistics.get(&snapshot_id)
+        self.statistics
+            .iter()
+            .find(|((sid, _), _)| *sid == snapshot_id)
+            .map(|(_, s)| s)
+    }
+
+    /// Get **every** statistics file attached to a snapshot id. Returns
+    /// an empty Vec if there are none. Order is non-deterministic
+    /// (HashMap iteration).
+    ///
+    /// Iceberg spec allows multiple `StatisticsFile` entries per
+    /// snapshot when their `statistics_path` differs. Tessellate's
+    /// future per-partition puffin path and laminar's per-output
+    /// merge-sidecar path both rely on this.
+    #[inline]
+    pub fn all_statistics_for_snapshot(&self, snapshot_id: i64) -> Vec<&StatisticsFile> {
+        self.statistics
+            .iter()
+            .filter(|((sid, _), _)| *sid == snapshot_id)
+            .map(|(_, s)| s)
+            .collect()
     }
 
     /// Get a partition statistics file for a snapshot id.
@@ -719,6 +833,7 @@ pub(super) mod _serde {
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(untagged)]
     pub(super) enum TableMetadataEnum {
+        V4(TableMetadataV4),
         V3(TableMetadataV3),
         V2(TableMetadataV2),
         V1(TableMetadataV1),
@@ -727,6 +842,20 @@ pub(super) mod _serde {
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "kebab-case")]
     /// Defines the structure of a v2 table metadata for serialization/deserialization
+    /// V4 metadata — structurally identical to V3 but serializes format-version as 4.
+    pub(super) struct TableMetadataV4 {
+        pub format_version: VersionNumber<4>,
+        #[serde(flatten)]
+        pub shared: TableMetadataV2V3Shared,
+        pub next_row_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub encryption_keys: Option<Vec<EncryptedKey>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub snapshots: Option<Vec<SnapshotV3>>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
     pub(super) struct TableMetadataV3 {
         pub format_version: VersionNumber<3>,
         #[serde(flatten)]
@@ -861,6 +990,18 @@ pub(super) mod _serde {
         type Error = Error;
         fn try_from(value: TableMetadataEnum) -> Result<Self, Error> {
             match value {
+                TableMetadataEnum::V4(value) => {
+                    let v3 = TableMetadataV3 {
+                        format_version: VersionNumber::<3>,
+                        shared: value.shared,
+                        next_row_id: value.next_row_id,
+                        encryption_keys: value.encryption_keys,
+                        snapshots: value.snapshots,
+                    };
+                    let mut meta: TableMetadata = v3.try_into()?;
+                    meta.format_version = FormatVersion::V4;
+                    Ok(meta)
+                }
                 TableMetadataEnum::V3(value) => value.try_into(),
                 TableMetadataEnum::V2(value) => value.try_into(),
                 TableMetadataEnum::V1(value) => value.try_into(),
@@ -872,6 +1013,7 @@ pub(super) mod _serde {
         type Error = Error;
         fn try_from(value: TableMetadata) -> Result<Self, Error> {
             Ok(match value.format_version {
+                FormatVersion::V4 => TableMetadataEnum::V4(value.try_into()?),
                 FormatVersion::V3 => TableMetadataEnum::V3(value.try_into()?),
                 FormatVersion::V2 => TableMetadataEnum::V2(value.into()),
                 FormatVersion::V1 => TableMetadataEnum::V1(value.try_into()?),
@@ -1261,6 +1403,38 @@ pub(super) mod _serde {
         }
     }
 
+    impl TryFrom<TableMetadata> for TableMetadataV4 {
+        type Error = Error;
+
+        fn try_from(mut v: TableMetadata) -> Result<Self, Self::Error> {
+            let next_row_id = v.next_row_id;
+            let encryption_keys = std::mem::take(&mut v.encryption_keys);
+            let snapshots = std::mem::take(&mut v.snapshots);
+            let shared = v.into();
+
+            Ok(TableMetadataV4 {
+                format_version: VersionNumber::<4>,
+                shared,
+                next_row_id,
+                encryption_keys: if encryption_keys.is_empty() {
+                    None
+                } else {
+                    Some(encryption_keys.into_values().collect())
+                },
+                snapshots: if snapshots.is_empty() {
+                    None
+                } else {
+                    Some(
+                        snapshots
+                            .into_values()
+                            .map(|s| SnapshotV3::try_from(Arc::unwrap_or_clone(s)))
+                            .collect::<Result<_, _>>()?,
+                    )
+                },
+            })
+        }
+    }
+
     impl TryFrom<TableMetadata> for TableMetadataV3 {
         type Error = Error;
 
@@ -1448,11 +1622,19 @@ pub(super) mod _serde {
         }
     }
 
-    fn index_statistics(statistics: Vec<StatisticsFile>) -> HashMap<i64, StatisticsFile> {
+    fn index_statistics(
+        statistics: Vec<StatisticsFile>,
+    ) -> HashMap<(i64, String), StatisticsFile> {
+        // Key on the full `(snapshot_id, statistics_path)` pair per
+        // spec — multiple entries with the same snapshot_id but
+        // different paths are valid and must all be preserved. The
+        // prior implementation keyed on snapshot_id alone and
+        // collapsed duplicates via HashMap::insert last-write-wins
+        // (with `.rev()` to make it FIRST-write-wins), silently
+        // losing N-1 entries per snapshot in the catalog.
         statistics
             .into_iter()
-            .rev()
-            .map(|s| (s.snapshot_id, s))
+            .map(|s| ((s.snapshot_id, s.statistics_path.clone()), s))
             .collect()
     }
 
@@ -1477,6 +1659,8 @@ pub enum FormatVersion {
     V2 = 2u8,
     /// Iceberg spec version 3
     V3 = 3u8,
+    /// Iceberg spec version 4 (root manifest, single-file commits)
+    V4 = 4u8,
 }
 
 impl PartialOrd for FormatVersion {
@@ -1497,6 +1681,7 @@ impl Display for FormatVersion {
             FormatVersion::V1 => write!(f, "v1"),
             FormatVersion::V2 => write!(f, "v2"),
             FormatVersion::V3 => write!(f, "v3"),
+            FormatVersion::V4 => write!(f, "v4"),
         }
     }
 }
@@ -2664,20 +2849,23 @@ mod tests {
             properties: HashMap::new(),
             snapshot_log: Vec::new(),
             metadata_log: Vec::new(),
-            statistics: HashMap::from_iter(vec![(3055729675574597004, StatisticsFile {
-                snapshot_id: 3055729675574597004,
-                statistics_path: "s3://a/b/stats.puffin".to_string(),
-                file_size_in_bytes: 413,
-                file_footer_size_in_bytes: 42,
-                key_metadata: None,
-                blob_metadata: vec![BlobMetadata {
+            statistics: HashMap::from_iter(vec![(
+                (3055729675574597004, "s3://a/b/stats.puffin".to_string()),
+                StatisticsFile {
                     snapshot_id: 3055729675574597004,
-                    sequence_number: 1,
-                    fields: vec![1],
-                    r#type: "ndv".to_string(),
-                    properties: HashMap::new(),
-                }],
-            })]),
+                    statistics_path: "s3://a/b/stats.puffin".to_string(),
+                    file_size_in_bytes: 413,
+                    file_footer_size_in_bytes: 42,
+                    key_metadata: None,
+                    blob_metadata: vec![BlobMetadata {
+                        snapshot_id: 3055729675574597004,
+                        sequence_number: 1,
+                        fields: vec![1],
+                        r#type: "ndv".to_string(),
+                        properties: HashMap::new(),
+                    }],
+                },
+            )]),
             partition_statistics: HashMap::new(),
             refs: HashMap::from_iter(vec![("main".to_string(), SnapshotReference {
                 snapshot_id: 3055729675574597004,

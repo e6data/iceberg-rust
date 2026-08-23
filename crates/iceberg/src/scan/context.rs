@@ -28,8 +28,8 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, SchemaRef, SnapshotRef,
-    TableMetadataRef,
+    DataContentType, ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, SchemaRef,
+    SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -47,6 +47,11 @@ pub(crate) struct ManifestFileContext {
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     delete_file_index: DeleteFileIndex,
     case_sensitive: bool,
+    /// V4 manifest delete vector: serialized roaring bitmap of row indices to skip.
+    mdv: Option<Vec<u8>>,
+    /// V4 incremental path tombstones: data-file paths to skip (file-level analogue
+    /// of the MDV). Shared across all manifests of one scan.
+    removed_paths: Arc<std::collections::HashSet<String>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -76,14 +81,58 @@ impl ManifestFileContext {
             mut sender,
             expression_evaluator_cache,
             delete_file_index,
+            mdv,
+            removed_paths,
             ..
         } = self;
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
 
-        for manifest_entry in manifest.entries() {
+        // Parse MDV bitmap if present (V4 soft-deleted entries)
+        let mdv_bitmap = if let Some(ref mdv_bytes) = mdv {
+            Some(
+                crate::spec::root_manifest::ManifestDeleteVector::deserialize(mdv_bytes)
+                    .map_err(|e| {
+                        Error::new(ErrorKind::DataInvalid, "Failed to parse MDV bitmap")
+                            .with_source(e)
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        // Fix #5: a guarded MDV carries the entry count + order-sensitive path
+        // checksum of the child manifest it was computed against. Validate that
+        // the manifest observed now still matches before applying the positional
+        // bitmap — otherwise a manifest rewritten/reordered under a stale MDV
+        // would silently soft-delete the wrong rows. Legacy (guardless) MDVs
+        // validate as Ok, preserving prior behavior.
+        if let Some(ref mdv) = mdv_bitmap {
+            let entry_count = manifest.entries().len() as u32;
+            let checksum = crate::spec::root_manifest::ManifestDeleteVector::compute_checksum(
+                manifest
+                    .entries()
+                    .iter()
+                    .map(|e| e.data_file.file_path.as_str()),
+            );
+            mdv.validate_against(entry_count, checksum)?;
+        }
+
+        for (idx, manifest_entry) in manifest.entries().iter().enumerate() {
+            // Skip entries marked as deleted by manifest delete vector
+            if let Some(ref mdv) = mdv_bitmap {
+                if mdv.is_deleted(idx as u32) {
+                    continue;
+                }
+            }
+            // Skip data files tombstoned by an incremental removal (file-level).
+            if !removed_paths.is_empty()
+                && removed_paths.contains(&manifest_entry.data_file.file_path)
+            {
+                continue;
+            }
+
             let manifest_entry_context = ManifestEntryContext {
-                // TODO: refactor to avoid the expensive ManifestEntry clone
                 manifest_entry: manifest_entry.clone(),
                 expression_evaluator_cache: expression_evaluator_cache.clone(),
                 field_ids: field_ids.clone(),
@@ -194,13 +243,22 @@ impl PlanContext {
         Ok(partition_filter)
     }
 
+    /// Build manifest file contexts for manifest-backed entries, and collect
+    /// inline entry contexts for V4 root manifest inline entries.
+    ///
+    /// Returns (manifest_file_contexts, inline_data_contexts, inline_delete_contexts).
+    /// Inline contexts bypass manifest loading and go directly into the scan pipeline.
     pub(crate) fn build_manifest_file_contexts(
         &self,
         manifest_list: Arc<ManifestList>,
         tx_data: Sender<ManifestEntryContext>,
         delete_file_idx: DeleteFileIndex,
         delete_file_tx: Sender<ManifestEntryContext>,
-    ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>> {
+    ) -> Result<(
+        Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>,
+        Vec<ManifestEntryContext>,
+        Vec<ManifestEntryContext>,
+    )> {
         let mut manifest_files = manifest_list.entries().iter().collect::<Vec<_>>();
         // Sort manifest files to process delete manifests first.
         // This avoids a deadlock where the producer blocks on sending data manifest entries
@@ -212,6 +270,9 @@ impl PlanContext {
             ManifestContentType::Deletes => 0,
             ManifestContentType::Data => 1,
         });
+
+        // Incremental path tombstones, shared (Arc) across every manifest of this scan.
+        let removed_paths = Arc::new(manifest_list.removed_paths().clone());
 
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
@@ -243,17 +304,72 @@ impl PlanContext {
                 None
             };
 
+            let mdv = manifest_list.mdv_for(&manifest_file.manifest_path).map(|b| b.to_vec());
             let mfc = self.create_manifest_file_context(
                 manifest_file,
                 partition_bound_predicate,
                 tx,
                 delete_file_idx.clone(),
+                mdv,
+                removed_paths.clone(),
             );
 
             filtered_mfcs.push(Ok(mfc));
         }
 
-        Ok(Box::new(filtered_mfcs.into_iter()))
+        // V4 inline entries: inject directly as ManifestEntryContext, bypassing
+        // ManifestFile::load_manifest(). These flow through the same filtering
+        // pipeline (partition pruning, metrics evaluation) as manifest-backed entries.
+        let mut inline_data_contexts = Vec::new();
+        let mut inline_delete_contexts = Vec::new();
+        for inline_entry in manifest_list.inline_entries() {
+            let partition_spec_id = inline_entry.data_file.partition_spec_id;
+
+            let bound_predicates = if let Some(ref predicate) = self.predicate {
+                let partition_bound_predicate = self.partition_filter_cache.get(
+                    partition_spec_id,
+                    &self.table_metadata,
+                    &self.snapshot_schema,
+                    self.case_sensitive,
+                    predicate.as_ref().bind(
+                        self.snapshot_schema.clone(),
+                        self.case_sensitive,
+                    )?,
+                )?;
+                if let Some(ref snapshot_bp) = self.snapshot_bound_predicate {
+                    Some(Arc::new(BoundPredicates {
+                        partition_bound_predicate: partition_bound_predicate.as_ref().clone(),
+                        snapshot_bound_predicate: snapshot_bp.as_ref().clone(),
+                    }))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let mec = ManifestEntryContext {
+                manifest_entry: inline_entry.clone(),
+                expression_evaluator_cache: self.expression_evaluator_cache.clone(),
+                field_ids: self.field_ids.clone(),
+                bound_predicates,
+                partition_spec_id,
+                snapshot_schema: self.snapshot_schema.clone(),
+                delete_file_index: delete_file_idx.clone(),
+                case_sensitive: self.case_sensitive,
+            };
+
+            match inline_entry.data_file.content {
+                DataContentType::Data => inline_data_contexts.push(mec),
+                _ => inline_delete_contexts.push(mec),
+            }
+        }
+
+        Ok((
+            Box::new(filtered_mfcs.into_iter()),
+            inline_data_contexts,
+            inline_delete_contexts,
+        ))
     }
 
     fn create_manifest_file_context(
@@ -262,6 +378,8 @@ impl PlanContext {
         partition_filter: Option<Arc<BoundPredicate>>,
         sender: Sender<ManifestEntryContext>,
         delete_file_index: DeleteFileIndex,
+        mdv: Option<Vec<u8>>,
+        removed_paths: Arc<std::collections::HashSet<String>>,
     ) -> ManifestFileContext {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
@@ -285,6 +403,8 @@ impl PlanContext {
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,
             case_sensitive: self.case_sensitive,
+            mdv,
+            removed_paths,
         }
     }
 }

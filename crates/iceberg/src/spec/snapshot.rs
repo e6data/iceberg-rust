@@ -28,7 +28,7 @@ use typed_builder::TypedBuilder;
 use super::table_metadata::SnapshotLog;
 use crate::error::{Result, timestamp_ms_to_utc};
 use crate::io::FileIO;
-use crate::spec::{ManifestList, SchemaId, SchemaRef, TableMetadata};
+use crate::spec::{FormatVersion, ManifestList, SchemaId, SchemaRef, TableMetadata};
 use crate::{Error, ErrorKind};
 
 /// The ref name of the main branch of the table.
@@ -208,10 +208,131 @@ impl Snapshot {
         table_metadata: &TableMetadata,
     ) -> Result<ManifestList> {
         let manifest_list_content = file_io.new_input(&self.manifest_list)?.read().await?;
+
+        // V4 stores a root manifest (Parquet) instead of a manifest list (Avro).
+        // Separate refs (become ManifestFile entries) from inlines (injected
+        // directly into the scan pipeline, bypassing ManifestFile::load_manifest).
+        //
+        // We dispatch on `effective_format_version()` rather than the
+        // catalog-declared `format_version()` so tables that declare V3 to
+        // a strict catalog (e.g. Lakekeeper pre-V4) but carry the
+        // `e6.actual-format-version=4` table property are read as V4 here.
+        // Without this match, a V3-declared-V4-marker table would write a
+        // Parquet root manifest on commit (the writer side already routes
+        // via `Table::effective_format_version`) and then fail on the next
+        // scan trying to parse the Parquet as Avro. See
+        // `crate::spec::table_metadata::E6_ACTUAL_FORMAT_VERSION_KEY`.
+        if table_metadata.effective_format_version() == FormatVersion::V4 {
+            // Incremental (log-structured) root: reconstruct the full live set when
+            // the head is either a delta (`prev_root_path` set — walk the chain) OR a
+            // collapsed balanced-tree base (`node_level > 0` — its direct entries are
+            // interior *node* refs, not data manifests, so they must be recursed to
+            // the leaves). Only a plain flat base (no prev, node_level 0) can use the
+            // single head read. `reconstruct_root` handles all three uniformly.
+            // Missing the `node_level > 0` case surfaced interior tree nodes as data
+            // ManifestFiles; loading them with the data-manifest reader misreads the
+            // node's ref-rows (empty file_format) and wedges every subsequent commit
+            // — the attribute_index tables broke exactly this way once they grew past
+            // the LSM fan-out and collapsed to a tree. The head metadata (its
+            // `bucket_index_path`) is authoritative either way.
+            let (rm_meta, entries) = {
+                let (head_meta, head_entries) =
+                    crate::spec::root_manifest::read_root_manifest(manifest_list_content.clone())?;
+                if head_meta.prev_root_path.is_some() || head_meta.node_level > 0 {
+                    crate::spec::root_manifest::reconstruct_root(file_io, &self.manifest_list)
+                        .await?
+                } else {
+                    (head_meta, head_entries)
+                }
+            };
+
+            let mut manifest_files = Vec::new();
+            let mut inlines = Vec::new();
+            let mut mdv_bitmaps = std::collections::HashMap::new();
+            for entry in entries {
+                match entry {
+                    crate::spec::root_manifest::RootManifestEntry::ManifestRef {
+                        manifest_file,
+                        mdv,
+                    } => {
+                        if let Some(mdv_bytes) = mdv {
+                            mdv_bitmaps
+                                .insert(manifest_file.manifest_path.clone(), mdv_bytes);
+                        }
+                        manifest_files.push(manifest_file);
+                    }
+                    crate::spec::root_manifest::RootManifestEntry::Inline(me) => {
+                        inlines.push(std::sync::Arc::new(me));
+                    }
+                }
+            }
+
+            // Tiered layout (root → bucket-index → leaf): flatten the cold
+            // bucket-index's leaf refs into the manifest list so the planner
+            // prunes them by partition summary exactly like the live refs. The
+            // hot path never touches the bucket-index; this is the only place
+            // the read side recurses into the cold tier.
+            if let Some(bucket_index) =
+                crate::spec::bucket_index::load_bucket_index_for_root(file_io, &rm_meta).await?
+            {
+                // Dedup against the root's own refs. Graduation moves a ref OUT
+                // of the root and INTO the index, so the two sets should be
+                // disjoint — but when a ref reaches both (a replay from the base
+                // root beneath a delta, say) a plain `extend` lists that manifest
+                // twice and every data file under it is scanned, and returned,
+                // twice.
+                //
+                // Root entries win: a root `ManifestRef` can carry an MDV bitmap
+                // (collected above) while a bucket-index leaf cannot, so keeping
+                // the leaf copy would silently drop MDV filtering for it.
+                //
+                // Warn rather than swallow it — an overlap means an upstream
+                // invariant leaked (graduation should have removed the root
+                // copy), and that is worth seeing.
+                let seen: std::collections::HashSet<&str> = manifest_files
+                    .iter()
+                    .map(|m| m.manifest_path.as_str())
+                    .collect();
+                let mut dropped = 0usize;
+                let fresh: Vec<_> = bucket_index
+                    .leaves()
+                    .iter()
+                    .filter(|leaf| {
+                        let keep = !seen.contains(leaf.manifest_path.as_str());
+                        if !keep {
+                            dropped += 1;
+                        }
+                        keep
+                    })
+                    .cloned()
+                    .collect();
+                if dropped > 0 {
+                    log::warn!(
+                        "V4 read: dropped {dropped} bucket-index leaf ref(s) already present in \
+                         the root — a ref reached both tiers; graduation should have removed it \
+                         from the root"
+                    );
+                }
+                manifest_files.extend(fresh);
+            }
+
+            // Incremental path tombstones: `reconstruct_root` already dropped any
+            // tombstoned INLINE data; what remains in `rm_meta.removed_paths` are
+            // files still physically present inside a manifest ref. Pass them to
+            // the scan so it skips those data files as it reads each manifest.
+            let removed_paths: std::collections::HashSet<String> =
+                rm_meta.removed_paths.iter().cloned().collect();
+
+            return Ok(ManifestList::with_inline_entries(
+                manifest_files,
+                inlines,
+                mdv_bitmaps,
+                removed_paths,
+            ));
+        }
+
         ManifestList::parse_with_version(
             &manifest_list_content,
-            // TODO: You don't really need the version since you could just project any Avro in
-            // the version that you'd like to get (probably always the latest)
             table_metadata.format_version(),
         )
     }

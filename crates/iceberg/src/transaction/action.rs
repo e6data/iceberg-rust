@@ -47,6 +47,31 @@ pub(crate) trait TransactionAction: AsAny + Sync + Send {
     /// An `ActionCommit` containing table updates and table requirements,
     /// or an error if the commit fails.
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit>;
+
+    /// Short stable name for logs and metrics.
+    ///
+    /// Exists because `actions_ms` is emitted per transaction with only a
+    /// positional `per_action_ms` array, which makes an expensive action
+    /// impossible to identify without guessing. That cost three
+    /// mis-targeted instrumentation rounds: `replace_data_files`'
+    /// commit_v4 path measures 61-96ms while single-action commits in the
+    /// same tick reach 36s, so the expensive one was a DIFFERENT action all
+    /// along. Naming them removes the guesswork.
+    ///
+    /// Defaulted so no implementor is forced to change; override where the
+    /// action can appear in a hot commit path.
+    fn action_name(&self) -> &'static str {
+        "unknown"
+    }
+
+    /// Whether this action must disable the commit retry loop. An action returns
+    /// `true` when a retry after a commit conflict could reuse now-stale inputs and
+    /// corrupt data. `ReplaceDataFiles` overrides this: a retry with a stale
+    /// delete-file list can duplicate or resurrect data, so the whole transaction
+    /// must fail fast and let the caller re-plan against the fresh table.
+    fn disables_retry(&self) -> bool {
+        false
+    }
 }
 
 /// A helper trait for applying a `TransactionAction` to a `Transaction`.
@@ -69,6 +94,9 @@ pub trait ApplyTransactionAction {
 impl<T: TransactionAction + 'static> ApplyTransactionAction for T {
     fn apply(self, mut tx: Transaction) -> Result<Transaction>
     where Self: Sized {
+        if self.disables_retry() {
+            tx.disable_retry = true;
+        }
         tx.actions.push(Arc::new(self));
         Ok(tx)
     }
@@ -82,6 +110,8 @@ pub struct ActionCommit {
     updates: Vec<TableUpdate>,
     requirements: Vec<TableRequirement>,
     created_manifest_paths: Vec<String>,
+    /// Cached root manifest entries with the snapshot_id they were built for.
+    root_manifest_entries: Option<(Option<i64>, Vec<crate::spec::root_manifest::RootManifestEntry>)>,
 }
 
 impl ActionCommit {
@@ -91,6 +121,7 @@ impl ActionCommit {
             updates,
             requirements,
             created_manifest_paths: Vec::new(),
+            root_manifest_entries: None,
         }
     }
 
@@ -113,6 +144,18 @@ impl ActionCommit {
     /// Consumes and returns the list of created manifest paths.
     pub fn take_manifest_paths(&mut self) -> Vec<String> {
         take(&mut self.created_manifest_paths)
+    }
+
+    /// Sets the cached root manifest entries produced during this action,
+    /// alongside the snapshot_id they were built for (used for cache validation).
+    pub fn with_root_manifest_entries(mut self, snapshot_id: Option<i64>, entries: Vec<crate::spec::root_manifest::RootManifestEntry>) -> Self {
+        self.root_manifest_entries = Some((snapshot_id, entries));
+        self
+    }
+
+    /// Consumes and returns the cached root manifest entries with their snapshot_id.
+    pub fn take_root_manifest_entries(&mut self) -> Option<(Option<i64>, Vec<crate::spec::root_manifest::RootManifestEntry>)> {
+        self.root_manifest_entries.take()
     }
 }
 

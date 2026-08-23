@@ -335,10 +335,14 @@ pub(crate) fn update_snapshot_summaries(
     previous_summary: Option<&Summary>,
     truncate_full_table: bool,
 ) -> Result<Summary> {
-    // Validate that the operation is supported
+    // Validate that the operation is supported. Replace (partial compaction) uses
+    // the same add/delete totals math as Overwrite — only the truncate branch below
+    // is Overwrite-specific (and gated on truncate_full_table), so Replace never
+    // resets the cumulative totals.
     if summary.operation != Operation::Append
         && summary.operation != Operation::Overwrite
         && summary.operation != Operation::Delete
+        && summary.operation != Operation::Replace
     {
         return Err(Error::new(
             ErrorKind::DataInvalid,
@@ -409,13 +413,17 @@ pub(crate) fn update_snapshot_summaries(
 }
 
 #[allow(dead_code)]
-fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i32> {
+fn get_prop(previous_summary: &Summary, prop: &str) -> Result<u64> {
     let value_str = previous_summary
         .additional_properties
         .get(prop)
         .map(String::as_str)
         .unwrap_or("0");
-    value_str.parse::<i32>().map_err(|err| {
+    // u64, not i32: TOTAL_RECORDS / TOTAL_FILE_SIZE on a high-volume table (e.g.
+    // sri-olly observability.logs) cross i32::MAX (2.147 B) within hours of ingest,
+    // and an i32 parse then panics every commit on the truncate path. Matches the
+    // u64 already used by `update_totals` in this file.
+    value_str.parse::<u64>().map_err(|err| {
         Error::new(
             ErrorKind::Unexpected,
             "Failed to parse value from previous summary property.",
@@ -602,6 +610,36 @@ mod tests {
                 .unwrap(),
             "4"
         );
+    }
+
+    #[test]
+    fn truncate_summary_handles_values_past_i32_max() {
+        // Regression: TOTAL_RECORDS / TOTAL_FILE_SIZE on a high-volume table (e.g.
+        // sri-olly observability.logs) cross i32::MAX within hours of ingest. The
+        // old i32 parse in get_prop then panicked on every commit hitting the
+        // truncate path. With u64 it must parse cleanly (no panic).
+        let big = (i32::MAX as u64 + 5_000_000_000).to_string(); // ~7.1 B
+        let prev_props: HashMap<String, String> = [
+            (TOTAL_DATA_FILES.to_string(), "10".to_string()),
+            (TOTAL_DELETE_FILES.to_string(), "0".to_string()),
+            (TOTAL_RECORDS.to_string(), big.clone()),
+            (TOTAL_FILE_SIZE.to_string(), big.clone()),
+            (TOTAL_POSITION_DELETES.to_string(), "0".to_string()),
+            (TOTAL_EQUALITY_DELETES.to_string(), "0".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let previous_summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: prev_props,
+        };
+        let summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: HashMap::new(),
+        };
+        // Must not panic (pre-fix this overflowed i32). Truncate zeroes the totals.
+        let truncated = truncate_table_summary(summary, &previous_summary).unwrap();
+        assert_eq!(truncated.additional_properties.get(TOTAL_RECORDS).unwrap(), "0");
     }
 
     #[test]

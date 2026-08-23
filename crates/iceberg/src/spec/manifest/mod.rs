@@ -23,7 +23,9 @@ mod entry;
 pub use entry::*;
 mod metadata;
 pub use metadata::*;
+pub mod bucket_index;
 pub mod parquet_manifest;
+pub mod root_manifest;
 mod writer;
 use std::sync::Arc;
 
@@ -72,7 +74,7 @@ impl Manifest {
                     .collect::<Result<Vec<_>>>()?
             }
             // Manifest Schema & Manifest Entry did not change between V2 and V3
-            FormatVersion::V2 | FormatVersion::V3 => {
+            FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => {
                 let schema = manifest_schema_v2(&partition_type)?;
                 let reader = AvroReader::with_schema(&schema, bs)?;
                 reader
@@ -111,6 +113,11 @@ impl Manifest {
     pub fn into_parts(self) -> (Vec<ManifestEntryRef>, ManifestMetadata) {
         let Self { entries, metadata } = self;
         (entries, metadata)
+    }
+
+    /// Estimated heap size in bytes for cache weighing.
+    pub fn estimated_size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.entries.len() * 1024
     }
 
     /// Constructor from [`ManifestMetadata`] and [`ManifestEntry`]s.

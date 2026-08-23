@@ -99,6 +99,10 @@ impl Default for ReplaceSortOrderAction {
 
 #[async_trait]
 impl TransactionAction for ReplaceSortOrderAction {
+    fn action_name(&self) -> &'static str {
+        "replace_sort_order"
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let current_schema = table.metadata().current_schema();
         let sort_fields: Result<Vec<SortField>> = self

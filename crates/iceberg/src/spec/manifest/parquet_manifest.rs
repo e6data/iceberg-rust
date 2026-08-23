@@ -107,27 +107,79 @@ pub fn encode_manifest_metadata(metadata: &ManifestMetadata) -> HashMap<String, 
 // ============================================================================
 
 /// Write manifest entries to a Parquet-format byte buffer.
+///
+/// Thin wrapper over `write_parquet_manifest_streaming` that writes the entire
+/// entry slice as one row-group. Retained for backward compat and small-manifest
+/// callers where the extra chunking overhead isn't worth it. On sri-olly's
+/// rebalance path (rewriting 2000-2800 entries per manifest × 12 concurrent
+/// writers), the streaming variant is used from `ManifestWriter::write_manifest_file_parquet`
+/// to bound RecordBatch peak memory.
 pub fn write_parquet_manifest(
     entries: &[ManifestEntry],
     metadata: &ManifestMetadata,
     partition_type: &StructType,
 ) -> Result<Vec<u8>> {
-    // Embed manifest metadata in the Arrow schema's metadata field.
-    // ArrowWriter propagates this to the Parquet file-level key-value metadata.
+    write_parquet_manifest_streaming(entries, metadata, partition_type, entries.len().max(1))
+}
+
+/// Streaming variant of `write_parquet_manifest` — chunks `entries` into
+/// `chunk_size`-sized batches before conversion + write.
+///
+/// Memory profile:
+/// - **Bulk API (`write_parquet_manifest`)** builds ONE giant RecordBatch from
+///   the entire input Vec, holding all Arrow builders (string + binary +
+///   int64 columns) sized for the full N at once. On a rebalance rewriting
+///   a 2800-entry manifest, that RecordBatch is ~10-20 MB. Times 12 concurrent
+///   writers (3 tables × 4 merge_concurrency) = 120-240 MB peak of RecordBatch
+///   alone, and the backon retry future pins it across attempts.
+/// - **This streaming API** builds one RecordBatch per `chunk_size`-entry
+///   chunk, writes it into the parquet writer, and drops it before the next
+///   chunk. Peak in-flight RecordBatch = one chunk (~2-4 MB at chunk_size=2048),
+///   4-10× smaller. The input entry slice itself is not copied — only its
+///   sub-slices are iterated.
+///
+/// Behavioural invariants preserved:
+/// - Entry ORDER is preserved (chunks are consecutive slices, written in
+///   original order).
+/// - Parquet output is byte-identical to the bulk path when chunk_size ≥
+///   entries.len(). At smaller chunk_size, the file's row groups are more
+///   numerous but readers behave the same.
+/// - Compression, schema, kv-metadata all identical.
+pub fn write_parquet_manifest_streaming(
+    entries: &[ManifestEntry],
+    metadata: &ManifestMetadata,
+    partition_type: &StructType,
+    chunk_size: usize,
+) -> Result<Vec<u8>> {
     let kv_metadata = encode_manifest_metadata(metadata);
     let schema = Arc::new(manifest_arrow_schema().with_metadata(kv_metadata));
-    let batch = manifest_entries_to_record_batch(entries, &schema, partition_type, metadata.format_version)?;
 
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .build();
 
     let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))
+    let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
         .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to create parquet writer: {e}")))?;
 
-    writer.write(&batch)
-        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to write batch: {e}")))?;
+    // Empty-input case: still produce a valid parquet file with schema/metadata
+    // but zero row groups. Match the bulk API's behavior (an empty RecordBatch
+    // is written and closed cleanly).
+    if entries.is_empty() {
+        let batch = manifest_entries_to_record_batch(entries, &schema, partition_type, metadata.format_version)?;
+        writer.write(&batch)
+            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to write batch: {e}")))?;
+    } else {
+        // Guard against chunk_size == 0 (would infinite-loop chunks()).
+        let effective = chunk_size.max(1);
+        for chunk in entries.chunks(effective) {
+            let batch = manifest_entries_to_record_batch(chunk, &schema, partition_type, metadata.format_version)?;
+            writer.write(&batch)
+                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to write batch: {e}")))?;
+            // batch (and all its Arrow builders' backing buffers) dropped here.
+        }
+    }
+
     writer.close()
         .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to close writer: {e}")))?;
 
@@ -135,8 +187,8 @@ pub fn write_parquet_manifest(
 }
 
 /// Convert ManifestEntry slice to Arrow RecordBatch.
-fn manifest_entries_to_record_batch(
-    entries: &[ManifestEntry],
+pub(super) fn manifest_entries_to_record_batch<E: std::borrow::Borrow<ManifestEntry>>(
+    entries: &[E],
     schema: &Arc<ArrowSchema>,
     partition_type: &StructType,
     format_version: FormatVersion,
@@ -165,7 +217,8 @@ fn manifest_entries_to_record_batch(
     let mut sort_order_id = Int32Builder::with_capacity(n);
     let mut part_spec_id = Int32Builder::with_capacity(n);
 
-    for entry in entries {
+    for entry_ref in entries {
+        let entry = std::borrow::Borrow::<ManifestEntry>::borrow(entry_ref);
         let df = &entry.data_file;
 
         status.append_value(entry.status as i32);
@@ -243,7 +296,7 @@ fn manifest_entries_to_record_batch(
         .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to build RecordBatch: {e}")))
 }
 
-fn serialize_partition_json(partition: &Struct, partition_type: &StructType) -> String {
+pub(super) fn serialize_partition_json(partition: &Struct, partition_type: &StructType) -> String {
     // Use RawLiteral for proper Iceberg partition value serialization.
     // RawLiteral handles all type conversions (timestamps, decimals, etc.) correctly.
     match RawLiteral::try_from(Literal::Struct(partition.clone()), &Type::Struct(partition_type.clone())) {
@@ -252,7 +305,7 @@ fn serialize_partition_json(partition: &Struct, partition_type: &StructType) -> 
     }
 }
 
-fn serialize_i64_map(m: &HashMap<i32, u64>) -> String {
+pub(super) fn serialize_i64_map(m: &HashMap<i32, u64>) -> String {
     if m.is_empty() {
         return String::new();
     }
@@ -261,7 +314,7 @@ fn serialize_i64_map(m: &HashMap<i32, u64>) -> String {
     serde_json::to_string(&map).unwrap_or_default()
 }
 
-fn serialize_bounds_map(m: &HashMap<i32, Datum>) -> String {
+pub(super) fn serialize_bounds_map(m: &HashMap<i32, Datum>) -> String {
     if m.is_empty() {
         return String::new();
     }
@@ -278,7 +331,7 @@ fn serialize_bounds_map(m: &HashMap<i32, Datum>) -> String {
     serde_json::to_string(&map).unwrap_or_default()
 }
 
-fn append_map_json(builder: &mut BinaryBuilder, json: &str) {
+pub(super) fn append_map_json(builder: &mut BinaryBuilder, json: &str) {
     if json.is_empty() {
         builder.append_null();
     } else {
@@ -286,7 +339,7 @@ fn append_map_json(builder: &mut BinaryBuilder, json: &str) {
     }
 }
 
-fn append_opt_json<T: serde::Serialize>(builder: &mut BinaryBuilder, val: &Option<T>) {
+pub(super) fn append_opt_json<T: serde::Serialize>(builder: &mut BinaryBuilder, val: &Option<T>) {
     match val {
         Some(v) => {
             let json = serde_json::to_string(v).unwrap_or_default();
@@ -428,7 +481,7 @@ fn parse_parquet_manifest_metadata(
     ManifestMetadata::parse(&map)
 }
 
-fn record_batch_to_manifest_entries(
+pub(super) fn record_batch_to_manifest_entries(
     batch: &RecordBatch,
     metadata: &ManifestMetadata,
     partition_type: &StructType,
@@ -466,7 +519,16 @@ fn record_batch_to_manifest_entries(
 
         let content_type: DataContentType = content_arr.value(i).try_into()?;
         let file_path = file_path_arr.value(i).to_string();
-        let file_format: DataFileFormat = file_format_arr.value(i).parse()?;
+        let file_format: DataFileFormat = file_format_arr.value(i).parse().map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "child manifest entry {i}/{n}: bad file_format {:?} (path={file_path}, content={}): {e}",
+                    file_format_arr.value(i),
+                    content_arr.value(i),
+                ),
+            )
+        })?;
         let record_count = record_count_arr.value(i) as u64;
         let file_size = file_size_arr.value(i) as u64;
 
@@ -531,7 +593,7 @@ fn record_batch_to_manifest_entries(
 // JSON deserialization helpers
 // ============================================================================
 
-fn parse_partition_json(json: Option<&str>, partition_type: &StructType) -> Struct {
+pub(super) fn parse_partition_json(json: Option<&str>, partition_type: &StructType) -> Struct {
     let Some(json_str) = json else { return Struct::empty() };
     if json_str == "null" || json_str.is_empty() {
         return Struct::empty();
@@ -549,7 +611,7 @@ fn parse_partition_json(json: Option<&str>, partition_type: &StructType) -> Stru
     }
 }
 
-fn parse_i64_map_json(bytes: Option<&[u8]>) -> HashMap<i32, u64> {
+pub(super) fn parse_i64_map_json(bytes: Option<&[u8]>) -> HashMap<i32, u64> {
     let Some(b) = bytes else { return HashMap::new() };
     let Ok(map) = serde_json::from_slice::<HashMap<String, u64>>(b) else {
         return HashMap::new();
@@ -559,7 +621,7 @@ fn parse_i64_map_json(bytes: Option<&[u8]>) -> HashMap<i32, u64> {
         .collect()
 }
 
-fn parse_bounds_map_json(bytes: Option<&[u8]>, schema: &Schema) -> HashMap<i32, Datum> {
+pub(super) fn parse_bounds_map_json(bytes: Option<&[u8]>, schema: &Schema) -> HashMap<i32, Datum> {
     let Some(b) = bytes else { return HashMap::new() };
     let Ok(map) = serde_json::from_slice::<HashMap<String, String>>(b) else {
         return HashMap::new();
@@ -585,45 +647,45 @@ fn parse_bounds_map_json(bytes: Option<&[u8]>, schema: &Schema) -> HashMap<i32, 
 // Arrow column access helpers
 // ============================================================================
 
-fn col_i32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
+pub(super) fn col_i32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
     batch.column_by_name(name)
         .and_then(|a| a.as_any().downcast_ref::<Int32Array>())
         .ok_or_else(|| Error::new(ErrorKind::DataInvalid, format!("missing column: {name}")))
 }
 
-fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+pub(super) fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
     batch.column_by_name(name)
         .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
         .ok_or_else(|| Error::new(ErrorKind::DataInvalid, format!("missing column: {name}")))
 }
 
-fn col_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+pub(super) fn col_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
     batch.column_by_name(name)
         .and_then(|a| a.as_any().downcast_ref::<StringArray>())
         .ok_or_else(|| Error::new(ErrorKind::DataInvalid, format!("missing column: {name}")))
 }
 
-fn col_i32_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int32Array> {
+pub(super) fn col_i32_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int32Array> {
     batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<Int32Array>())
 }
 
-fn col_i64_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
+pub(super) fn col_i64_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
     batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<Int64Array>())
 }
 
-fn col_str_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
+pub(super) fn col_str_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
     batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<StringArray>())
 }
 
-fn col_binary_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a BinaryArray> {
+pub(super) fn col_binary_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a BinaryArray> {
     batch.column_by_name(name).and_then(|a| a.as_any().downcast_ref::<BinaryArray>())
 }
 
-fn nullable_i64(arr: Option<&Int64Array>, i: usize) -> Option<i64> {
+pub(super) fn nullable_i64(arr: Option<&Int64Array>, i: usize) -> Option<i64> {
     arr.and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) })
 }
 
-fn read_binary_opt<'a>(arr: Option<&'a BinaryArray>, i: usize) -> Option<&'a [u8]> {
+pub(super) fn read_binary_opt<'a>(arr: Option<&'a BinaryArray>, i: usize) -> Option<&'a [u8]> {
     arr.and_then(|a| if Array::is_null(a, i) { None } else { Some(a.value(i)) })
 }
 

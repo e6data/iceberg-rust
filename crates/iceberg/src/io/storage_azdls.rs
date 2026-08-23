@@ -18,11 +18,13 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use opendal::Configurator;
 use opendal::services::AzdlsConfig;
 use url::Url;
 
+use super::azdls_wi_layer::{WiTokenFetcher, read_wi_env, wrap_http_client};
 use crate::{Error, ErrorKind, Result, ensure_data_valid};
 
 /// A connection string.
@@ -225,7 +227,34 @@ fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<o
     }
     builder = builder.filesystem(&path.filesystem);
 
-    Ok(opendal::Operator::new(builder)?.finish())
+    let op = opendal::Operator::new(builder)?.finish();
+
+    // opendal-service-azdls 0.57's AzdlsBuilder pipes only the explicit
+    // adls.* config fields into its credential-chain StaticEnv — it never
+    // forwards AZURE_FEDERATED_TOKEN_FILE from the OS env. The result on
+    // AKS workload identity is that reqsign's WorkloadIdentityCredentialProvider
+    // returns None, the IMDS provider falls through to the node-VM identity
+    // (wrong principal), and writes 403 with AuthorizationPermissionMismatch.
+    //
+    // When we detect the standard WI env vars, do the federated → AAD
+    // exchange ourselves and wrap the HTTP client so every request carries
+    // an Authorization: Bearer header for the right UAMI.
+    if config.client_secret.is_none() && config.account_key.is_none() && config.sas_token.is_none()
+    {
+        if let Some(env) = read_wi_env() {
+            log::info!(
+                "azdls: enabling WI bearer-token http-client wrap (client_id={}, tenant_id={}, federated_token_file={})",
+                env.client_id,
+                env.tenant_id,
+                env.federated_token_file
+            );
+            let fetcher = Arc::new(WiTokenFetcher::new(env));
+            opendal::raw::AccessDyn::info_dyn(&**op.inner())
+                .update_http_client(|c| wrap_http_client(c, fetcher));
+        }
+    }
+
+    Ok(op)
 }
 
 /// Represents a fully qualified path to blob/ file in Azure Storage.

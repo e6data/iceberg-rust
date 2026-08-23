@@ -24,7 +24,7 @@ use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
-use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
+use crate::spec::{FormatVersion, SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -161,6 +161,13 @@ pub struct Table {
     object_cache: Arc<ObjectCache>,
 }
 
+// V4 opt-in property constants live in `crate::spec::table_metadata` next to
+// `TableMetadata::effective_format_version`, which is the single source of
+// truth for the dispatch rule. Re-exported from this module for the historical
+// API (`iceberg::table::E6_ACTUAL_FORMAT_VERSION_KEY` -- some downstream
+// crates already import it from here).
+pub use crate::spec::E6_ACTUAL_FORMAT_VERSION_KEY;
+
 impl Table {
     /// Sets the [`Table`] metadata and returns an updated instance with the new metadata applied.
     pub(crate) fn with_metadata(mut self, metadata: TableMetadataRef) -> Self {
@@ -186,6 +193,21 @@ impl Table {
     /// Returns current metadata.
     pub fn metadata(&self) -> &TableMetadata {
         &self.metadata
+    }
+
+    /// Returns the format version that should drive **behaviour** dispatch for
+    /// this table -- thin delegate to
+    /// [`TableMetadata::effective_format_version`], which is the single
+    /// source of truth for the precedence rule (declared V4 ⇒ V4, else the
+    /// `e6.actual-format-version=4` property ⇒ V4, else declared).
+    ///
+    /// This convenience exists so call sites that already hold a `&Table`
+    /// don't have to chain through `.metadata()`; sites that hold only a
+    /// `&TableMetadata` (e.g. `Snapshot::load_manifest_list`) call the
+    /// method on the metadata directly.
+    #[inline]
+    pub fn effective_format_version(&self) -> FormatVersion {
+        self.metadata.effective_format_version()
     }
 
     /// Returns current metadata ref.
@@ -416,5 +438,102 @@ mod tests {
             .unwrap();
         assert!(!table.readonly());
         assert_eq!(table.identifier.name(), "table");
+    }
+
+    // -- effective_format_version tests -----------------------------------
+
+    /// Build a Table whose metadata declares V2 (from a fixture) but lets the
+    /// caller plug a properties map in. Returns a (table, declared) tuple so
+    /// the assertion side can keep `declared` separate from `effective`.
+    async fn build_v2_table_with_properties(
+        properties: std::collections::HashMap<String, String>,
+    ) -> Table {
+        let metadata_file_name = "TableMetadataV2Valid.json";
+        let metadata_file_path = format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            metadata_file_name
+        );
+        let file_io = FileIO::from_path(&metadata_file_path)
+            .unwrap()
+            .build()
+            .unwrap();
+        let metadata_file = file_io.new_input(&metadata_file_path).unwrap();
+        let metadata_bytes = metadata_file.read().await.unwrap();
+        let table_metadata =
+            serde_json::from_slice::<TableMetadata>(&metadata_bytes).unwrap();
+
+        let new_metadata = table_metadata
+            .into_builder(Some(metadata_file_path.clone()))
+            .set_properties(properties)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+        Table::builder()
+            .metadata(new_metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .build()
+            .unwrap()
+    }
+
+    /// A V2 table without the property reports its declared version.
+    #[tokio::test]
+    async fn effective_format_version_declared_v2_no_property() {
+        let table = build_v2_table_with_properties(Default::default()).await;
+        assert_eq!(table.metadata().format_version(), FormatVersion::V2);
+        assert_eq!(table.effective_format_version(), FormatVersion::V2);
+    }
+
+    /// A V2 table with the `e6.actual-format-version=4` opt-in returns V4
+    /// from `effective_format_version` while leaving `metadata.format_version`
+    /// unchanged (this is the Lakekeeper-friendly path: catalog still sees V2,
+    /// our writers/readers dispatch as V4).
+    #[tokio::test]
+    async fn effective_format_version_property_overrides_v2_to_v4() {
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            E6_ACTUAL_FORMAT_VERSION_KEY.to_string(),
+            "4".to_string(),
+        );
+        let table = build_v2_table_with_properties(props).await;
+        assert_eq!(table.metadata().format_version(), FormatVersion::V2);
+        assert_eq!(table.effective_format_version(), FormatVersion::V4);
+    }
+
+    /// A bogus / unsupported property value MUST NOT silently downgrade or
+    /// promote the format. We only recognise the literal string "4"; anything
+    /// else falls back to the declared version.
+    #[tokio::test]
+    async fn effective_format_version_unknown_property_value_falls_back() {
+        for bogus in &["5", "v4", " 4", "", "true", "false"] {
+            let mut props = std::collections::HashMap::new();
+            props.insert(
+                E6_ACTUAL_FORMAT_VERSION_KEY.to_string(),
+                (*bogus).to_string(),
+            );
+            let table = build_v2_table_with_properties(props).await;
+            assert_eq!(
+                table.effective_format_version(),
+                FormatVersion::V2,
+                "property value {bogus:?} should not opt the table into V4"
+            );
+        }
+    }
+
+    /// The property only OPTS IN to V4 -- a value of "3" doesn't opt a V2
+    /// table into V3 (V3 isn't gated behind this property at all).
+    #[tokio::test]
+    async fn effective_format_version_property_only_opts_into_v4() {
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            E6_ACTUAL_FORMAT_VERSION_KEY.to_string(),
+            "3".to_string(),
+        );
+        let table = build_v2_table_with_properties(props).await;
+        assert_eq!(table.effective_format_version(), FormatVersion::V2);
     }
 }

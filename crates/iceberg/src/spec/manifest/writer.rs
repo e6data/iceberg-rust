@@ -408,7 +408,7 @@ impl ManifestWriter {
         let avro_schema = match self.metadata.format_version {
             FormatVersion::V1 => manifest_schema_v1(&partition_type)?,
             // Manifest schema did not change between V2 and V3
-            FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type)?,
+            FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => manifest_schema_v2(&partition_type)?,
         };
         let mut avro_writer = AvroWriter::new(&avro_schema, Vec::new());
         avro_writer.add_user_metadata(
@@ -439,7 +439,7 @@ impl ManifestWriter {
         )?;
         match self.metadata.format_version {
             FormatVersion::V1 => {}
-            FormatVersion::V2 | FormatVersion::V3 => {
+            FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => {
                 avro_writer
                     .add_user_metadata("content".to_string(), self.metadata.content.to_string())?;
             }
@@ -452,7 +452,7 @@ impl ManifestWriter {
                 FormatVersion::V1 => to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?
                     .resolve(&avro_schema)?,
                 // Manifest entry format did not change between V2 and V3
-                FormatVersion::V2 | FormatVersion::V3 => {
+                FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => {
                     to_value(ManifestEntryV2::try_from(entry, &partition_type)?)?
                         .resolve(&avro_schema)?
                 }
@@ -501,10 +501,23 @@ impl ManifestWriter {
         let partition_summary = self.construct_partition_summaries(&partition_type)?;
 
         let entries = std::mem::take(&mut self.manifest_entries);
-        let content = super::parquet_manifest::write_parquet_manifest(
+        // Chunked write to bound RecordBatch peak memory. Without this, the
+        // whole entries Vec is converted to ONE giant RecordBatch (~10-20 MB
+        // per typical rebalance-produced manifest of ~2000-2800 entries), and
+        // when N such writers run concurrently across tables + backon retry,
+        // peak heap can hit multi-GB. Chunking bounds in-flight RecordBatch
+        // to ~2-4 MB regardless of manifest size. Byte-identical output for
+        // manifests ≤ chunk_size (single row group); larger manifests just
+        // get more row groups.
+        //
+        // 2048 chosen to match parquet's default target row-group cardinality
+        // — reader-side cost is neutral; writer-side memory drops 4-10×.
+        const PARQUET_MANIFEST_WRITE_CHUNK: usize = 2048;
+        let content = super::parquet_manifest::write_parquet_manifest_streaming(
             &entries,
             &self.metadata,
             &partition_type,
+            PARQUET_MANIFEST_WRITE_CHUNK,
         )?;
 
         let length = content.len();
@@ -531,7 +544,7 @@ impl ManifestWriter {
     }
 }
 
-struct PartitionFieldStats {
+pub(super) struct PartitionFieldStats {
     partition_type: PrimitiveType,
 
     contains_null: bool,

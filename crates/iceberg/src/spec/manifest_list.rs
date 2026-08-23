@@ -55,9 +55,57 @@ pub const UNASSIGNED_SEQUENCE_NUMBER: i64 = -1;
 pub struct ManifestList {
     /// Entries in a manifest list.
     entries: Vec<ManifestFile>,
+    /// V4 inline entries from root manifest. These bypass ManifestFile::load_manifest()
+    /// and are injected directly into the scan pipeline.
+    inline_entries: Vec<super::ManifestEntryRef>,
+    /// V4 manifest delete vectors keyed by manifest_path. When present, entries
+    /// at the marked row indices in the referenced manifest should be skipped
+    /// during scan planning.
+    mdv_bitmaps: HashMap<String, Vec<u8>>,
+    /// V4 incremental path tombstones: data-file paths removed by a delta but
+    /// still physically present inside a referenced manifest. The scan skips any
+    /// data file whose path is in this set (the file-level analogue of an MDV).
+    removed_paths: std::collections::HashSet<String>,
 }
 
 impl ManifestList {
+    /// Construct a ManifestList from a vec of ManifestFile entries.
+    pub fn new(entries: Vec<ManifestFile>) -> Self {
+        Self {
+            entries,
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
+        }
+    }
+
+    /// Construct a ManifestList with V4 inline entries, MDV bitmaps, and the
+    /// incremental path-tombstone set.
+    pub fn with_inline_entries(
+        entries: Vec<ManifestFile>,
+        inline_entries: Vec<super::ManifestEntryRef>,
+        mdv_bitmaps: HashMap<String, Vec<u8>>,
+        removed_paths: std::collections::HashSet<String>,
+    ) -> Self {
+        Self {
+            entries,
+            inline_entries,
+            mdv_bitmaps,
+            removed_paths,
+        }
+    }
+
+    /// Whether a data-file path is tombstoned by an incremental removal (the scan
+    /// must skip it). Always `false` when there are no tombstones.
+    pub fn is_removed(&self, data_file_path: &str) -> bool {
+        !self.removed_paths.is_empty() && self.removed_paths.contains(data_file_path)
+    }
+
+    /// The incremental path-tombstone set (data files the scan must skip).
+    pub fn removed_paths(&self) -> &std::collections::HashSet<String> {
+        &self.removed_paths
+    }
+
     /// Parse manifest list from bytes.
     pub fn parse_with_version(bs: &[u8], version: FormatVersion) -> Result<ManifestList> {
         match version {
@@ -71,7 +119,7 @@ impl ManifestList {
                 let values = Value::Array(reader.collect::<std::result::Result<Vec<Value>, _>>()?);
                 from_value::<_serde::ManifestListV2>(&values)?.try_into()
             }
-            FormatVersion::V3 => {
+            FormatVersion::V3 | FormatVersion::V4 => {
                 let reader = Reader::new(bs)?;
                 let values = Value::Array(reader.collect::<std::result::Result<Vec<Value>, _>>()?);
                 from_value::<_serde::ManifestListV3>(&values)?.try_into()
@@ -84,9 +132,27 @@ impl ManifestList {
         &self.entries
     }
 
+    /// Get V4 inline entries (empty for V2/V3 manifest lists).
+    pub fn inline_entries(&self) -> &[super::ManifestEntryRef] {
+        &self.inline_entries
+    }
+
+    /// Get V4 MDV bitmap for a manifest path (None if no MDV exists).
+    pub fn mdv_for(&self, manifest_path: &str) -> Option<&[u8]> {
+        self.mdv_bitmaps.get(manifest_path).map(|v| v.as_slice())
+    }
+
     /// Take ownership of the entries in the manifest list, consuming it
     pub fn consume_entries(self) -> impl IntoIterator<Item = ManifestFile> {
         Box::new(self.entries.into_iter())
+    }
+
+    /// Estimated heap size in bytes for cache weighing.
+    pub fn estimated_size(&self) -> usize {
+        let entries_size = self.entries.len() * std::mem::size_of::<ManifestFile>();
+        let inline_size = self.inline_entries.len() * 1024;
+        let mdv_size: usize = self.mdv_bitmaps.values().map(|v| v.len()).sum();
+        std::mem::size_of::<Self>() + entries_size + inline_size + mdv_size
     }
 }
 
@@ -212,7 +278,7 @@ impl ManifestListWriter {
         let avro_schema = match format_version {
             FormatVersion::V1 => &MANIFEST_LIST_AVRO_SCHEMA_V1,
             FormatVersion::V2 => &MANIFEST_LIST_AVRO_SCHEMA_V2,
-            FormatVersion::V3 => &MANIFEST_LIST_AVRO_SCHEMA_V3,
+            FormatVersion::V3 | FormatVersion::V4 => &MANIFEST_LIST_AVRO_SCHEMA_V3,
         };
         let mut avro_writer = Writer::new(avro_schema, Vec::new());
         for (key, value) in metadata {
@@ -243,7 +309,7 @@ impl ManifestListWriter {
                     self.avro_writer.append_ser(manifests)?;
                 }
             }
-            FormatVersion::V2 | FormatVersion::V3 => {
+            FormatVersion::V2 | FormatVersion::V3 | FormatVersion::V4 => {
                 for mut manifest in manifests {
                     self.assign_sequence_numbers(&mut manifest)?;
 
@@ -963,6 +1029,9 @@ pub(super) mod _serde {
                     .into_iter()
                     .map(|v| v.try_into())
                     .collect::<Result<Vec<_>>>()?,
+                inline_entries: vec![],
+                mdv_bitmaps: Default::default(),
+                removed_paths: Default::default(),
             })
         }
     }
@@ -990,6 +1059,9 @@ pub(super) mod _serde {
                     .into_iter()
                     .map(|v| v.try_into())
                     .collect::<Result<Vec<_>>>()?,
+                inline_entries: vec![],
+                mdv_bitmaps: Default::default(),
+                removed_paths: Default::default(),
             })
         }
     }
@@ -1017,6 +1089,9 @@ pub(super) mod _serde {
                     .into_iter()
                     .map(|v| v.try_into())
                     .collect::<Result<Vec<_>>>()?,
+                inline_entries: vec![],
+                mdv_bitmaps: Default::default(),
+                removed_paths: Default::default(),
             })
         }
     }
@@ -1415,6 +1490,9 @@ mod test {
     #[tokio::test]
     async fn test_parse_manifest_list_v1() {
         let manifest_list = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![
                 ManifestFile {
                     manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
@@ -1465,6 +1543,9 @@ mod test {
     #[tokio::test]
     async fn test_parse_manifest_list_v2() {
         let manifest_list = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![
                 ManifestFile {
                     manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
@@ -1538,6 +1619,9 @@ mod test {
     #[tokio::test]
     async fn test_parse_manifest_list_v3() {
         let manifest_list = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![
                 ManifestFile {
                     manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
@@ -1612,6 +1696,9 @@ mod test {
     #[test]
     fn test_serialize_manifest_list_v1() {
         let manifest_list:ManifestListV1 = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
                 manifest_length: 5806,
@@ -1641,6 +1728,9 @@ mod test {
     #[test]
     fn test_serialize_manifest_list_v2() {
         let manifest_list:ManifestListV2 = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,
@@ -1672,6 +1762,9 @@ mod test {
     #[test]
     fn test_serialize_manifest_list_v3() {
         let manifest_list: ManifestListV3 = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,
@@ -1703,6 +1796,9 @@ mod test {
     #[tokio::test]
     async fn test_manifest_list_writer_v1() {
         let expected_manifest_list = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
                 manifest_length: 5806,
@@ -1750,6 +1846,9 @@ mod test {
         let snapshot_id = 377075049360453639;
         let seq_num = 1;
         let mut expected_manifest_list = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,
@@ -1798,6 +1897,9 @@ mod test {
         let snapshot_id = 377075049360453639;
         let seq_num = 1;
         let mut expected_manifest_list = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,
@@ -1846,6 +1948,9 @@ mod test {
     #[tokio::test]
     async fn test_manifest_list_writer_v1_as_v2() {
         let expected_manifest_list = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
                 manifest_length: 5806,
@@ -1891,6 +1996,9 @@ mod test {
     #[tokio::test]
     async fn test_manifest_list_writer_v1_as_v3() {
         let expected_manifest_list = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "/opt/bitnami/spark/warehouse/db/table/metadata/10d28031-9739-484c-92db-cdf2975cead4-m0.avro".to_string(),
                 manifest_length: 5806,
@@ -1938,6 +2046,9 @@ mod test {
         let snapshot_id = 377075049360453639;
         let seq_num = 1;
         let mut expected_manifest_list = ManifestList {
+            inline_entries: vec![],
+            mdv_bitmaps: Default::default(),
+            removed_paths: Default::default(),
             entries: vec![ManifestFile {
                 manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m0.avro".to_string(),
                 manifest_length: 6926,

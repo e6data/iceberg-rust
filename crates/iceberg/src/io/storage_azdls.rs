@@ -218,7 +218,71 @@ fn match_path_with_config(
     Ok(())
 }
 
+/// Placeholder shared key installed alongside the WI bearer-token wrap.
+///
+/// It is never used to authenticate anything — see [`azdls_config_build`] for
+/// why a syntactically valid key has to be present at all. reqsign
+/// base64-decodes the account key before HMAC-ing the string-to-sign
+/// (`sign_request.rs`, "failed to decode account key"), so this MUST stay
+/// valid base64. It decodes to the ASCII text "workload-identity-placeholder".
+const WI_PLACEHOLDER_ACCOUNT_KEY: &str = "d29ya2xvYWQtaWRlbnRpdHktcGxhY2Vob2xkZXI=";
+
+/// Whether this config leaves the credential up to the environment.
+///
+/// An explicitly configured `adls.account-key` / `adls.sas-token` /
+/// `adls.client-secret` always wins: the caller asked for a specific
+/// credential and workload identity must not silently override it.
+fn credential_comes_from_environment(config: &AzdlsConfig) -> bool {
+    config.client_secret.is_none() && config.account_key.is_none() && config.sas_token.is_none()
+}
+
 fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<opendal::Operator> {
+    // Detect AKS workload identity BEFORE building: the operator has to be
+    // constructed differently in that case (see below).
+    let wi_env = if credential_comes_from_environment(config) {
+        read_wi_env()
+    } else {
+        None
+    };
+
+    let mut config = config.clone();
+
+    // Why a placeholder key is needed, and why the HTTP wrap alone was not
+    // enough:
+    //
+    // opendal-service-azdls 0.57 signs EVERY request before dispatching it
+    // (`AzdlsCore::sign` → `reqsign_core::Signer::sign`). reqsign 3.0.1 does
+    // ship a WorkloadIdentityCredentialProvider, but it reads
+    // AZURE_FEDERATED_TOKEN_FILE out of the Context's `StaticEnv`, and
+    // AzdlsBuilder::build only ever puts seven values in that env — the ones
+    // derived from adls.* config. The federated token file is not one of
+    // them, so on AKS the provider returns None, AzureCli returns None (no
+    // `az` in the container), IMDS fails ("Identity not found" — AKS nodes
+    // carry no node-managed-identity), the chain yields no credential and
+    // signing fails with:
+    //
+    //     failed to load signing credential
+    //
+    // That happens BEFORE the request reaches the HTTP client, so wrapping
+    // the client to inject `Authorization: Bearer` never got a chance to
+    // run — which is why every V2 compaction write/commit phase was a no-op
+    // on Azure while the same build worked on AWS (there IMDS resolves to
+    // the EC2 instance profile).
+    //
+    // So: hand the signer a syntactically valid shared key it can complete
+    // signing with, then overwrite the Authorization header it produced with
+    // the real federated token in `WiHttpFetch`. The placeholder signature
+    // never reaches Azure. Pinning a static credential also short-circuits
+    // the chain, so the AzureCli/IMDS probes (and their error logs) stop
+    // firing on every request.
+    //
+    // This whole dance disappears once we are on opendal 0.58 / reqsign 3.3,
+    // where the federated token is forwarded natively: drop the placeholder
+    // and the wrap, and let the credential chain do its job.
+    if wi_env.is_some() {
+        config.account_key = Some(WI_PLACEHOLDER_ACCOUNT_KEY.to_string());
+    }
+
     let mut builder = config.clone().into_builder();
 
     if config.endpoint.is_none() {
@@ -229,19 +293,8 @@ fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<o
 
     let op = opendal::Operator::new(builder)?.finish();
 
-    // opendal-service-azdls 0.57's AzdlsBuilder pipes only the explicit
-    // adls.* config fields into its credential-chain StaticEnv — it never
-    // forwards AZURE_FEDERATED_TOKEN_FILE from the OS env. The result on
-    // AKS workload identity is that reqsign's WorkloadIdentityCredentialProvider
-    // returns None, the IMDS provider falls through to the node-VM identity
-    // (wrong principal), and writes 403 with AuthorizationPermissionMismatch.
-    //
-    // When we detect the standard WI env vars, do the federated → AAD
-    // exchange ourselves and wrap the HTTP client so every request carries
-    // an Authorization: Bearer header for the right UAMI.
-    if config.client_secret.is_none() && config.account_key.is_none() && config.sas_token.is_none()
-    {
-        if let Some(env) = read_wi_env() {
+    match wi_env {
+        Some(env) => {
             log::info!(
                 "azdls: enabling WI bearer-token http-client wrap (client_id={}, tenant_id={}, federated_token_file={})",
                 env.client_id,
@@ -252,6 +305,19 @@ fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<o
             opendal::raw::AccessDyn::info_dyn(&**op.inner())
                 .update_http_client(|c| wrap_http_client(c, fetcher));
         }
+        None if credential_comes_from_environment(&config) => {
+            // Nothing configured and no workload identity: the chain is left
+            // with AzureCli + IMDS, neither of which exists on AKS. Say so
+            // once at build time instead of leaving only a per-request
+            // "failed to load signing credential" to work backwards from.
+            log::warn!(
+                "azdls: no adls.account-key / adls.sas-token / adls.client-secret configured and \
+                 no workload-identity env (AZURE_TENANT_ID, AZURE_CLIENT_ID, \
+                 AZURE_FEDERATED_TOKEN_FILE) — requests will fail to sign unless the process can \
+                 reach Azure CLI or IMDS credentials"
+            );
+        }
+        None => {}
     }
 
     Ok(op)
@@ -372,10 +438,85 @@ fn validate_storage_and_scheme(
 mod tests {
     use std::collections::HashMap;
 
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use opendal::services::AzdlsConfig;
 
-    use super::{AzureStoragePath, AzureStorageScheme, azdls_create_operator};
+    use super::{
+        AzureStoragePath, AzureStorageScheme, WI_PLACEHOLDER_ACCOUNT_KEY, azdls_create_operator,
+        credential_comes_from_environment,
+    };
     use crate::io::azdls_config_parse;
+
+    /// reqsign base64-decodes the account key before HMAC-ing the
+    /// string-to-sign, so an invalid placeholder would turn "no credential"
+    /// into "failed to decode account key" — same dead compaction, new error
+    /// message.
+    #[test]
+    fn test_wi_placeholder_account_key_decodes() {
+        let decoded = BASE64
+            .decode(WI_PLACEHOLDER_ACCOUNT_KEY)
+            .expect("placeholder account key must be valid base64");
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            "workload-identity-placeholder"
+        );
+    }
+
+    /// The placeholder + WI wrap must only engage when the caller left the
+    /// credential to the environment. An explicitly configured key, SAS or
+    /// client secret always wins — silently overriding it would swap the
+    /// credential a caller asked for.
+    #[test]
+    fn test_credential_comes_from_environment() {
+        let cases = vec![
+            ("nothing configured", AzdlsConfig::default(), true),
+            (
+                "account key configured",
+                AzdlsConfig {
+                    account_key: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "sas token configured",
+                AzdlsConfig {
+                    sas_token: Some("token".to_string()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "client secret configured",
+                AzdlsConfig {
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                // client-id/tenant-id alone still needs a credential from
+                // the environment — they are only half of a service
+                // principal.
+                "client id and tenant id only",
+                AzdlsConfig {
+                    client_id: Some("abcdef".to_string()),
+                    tenant_id: Some("12345".to_string()),
+                    ..Default::default()
+                },
+                true,
+            ),
+        ];
+
+        for (name, config, expected) in cases {
+            assert_eq!(
+                credential_comes_from_environment(&config),
+                expected,
+                "Test case: {name}"
+            );
+        }
+    }
 
     #[test]
     fn test_azdls_config_parse() {

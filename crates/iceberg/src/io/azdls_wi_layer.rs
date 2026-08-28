@@ -21,10 +21,10 @@
 //! chain with a `StaticEnv` that contains only the explicitly-set
 //! `adls.client-id` / `adls.tenant-id` / `adls.authority-host` properties —
 //! it never propagates `AZURE_FEDERATED_TOKEN_FILE` from the OS env, which
-//! reqsign's `WorkloadIdentityCredentialProvider` requires. The result on
-//! AKS is that opendal's IMDS provider returns a node-VM identity (wrong
-//! principal), and ADLS rejects writes with 403
-//! `AuthorizationPermissionMismatch`.
+//! reqsign's `WorkloadIdentityCredentialProvider` requires. On AKS the
+//! provider therefore returns `None`, Azure CLI is absent from the
+//! container, and IMDS fails ("Identity not found" — AKS nodes carry no
+//! node-managed-identity), so the chain produces no credential at all.
 //!
 //! Rather than patch upstream opendal, this module performs the federated
 //! → AAD token exchange ourselves and wraps the operator's `HttpClient` so
@@ -32,6 +32,14 @@
 //! header for the WI managed identity. We hook in via the public
 //! `Operator::inner().info().update_http_client(..)` surface, so nothing in
 //! the opendal stack needs to change.
+//!
+//! This wrap only works PAIRED with the placeholder shared key that
+//! [`super::storage_azdls`] installs. opendal signs every request before it
+//! reaches the HTTP client, and with an empty credential chain that signing
+//! step fails outright ("failed to load signing credential") — the request
+//! is never dispatched, so this layer never runs. The placeholder lets
+//! signing complete; the header it produces is then replaced here. Do not
+//! remove one without the other.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

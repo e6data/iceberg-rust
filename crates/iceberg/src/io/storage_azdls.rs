@@ -219,6 +219,51 @@ fn match_path_with_config(
 }
 
 fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<opendal::Operator> {
+    // Workload identity cannot authenticate through the azdls service at all,
+    // so take it out of that service's hands entirely.
+    //
+    // The bearer-token wrap below was the earlier attempt at this. It fires --
+    // "enabling WI bearer-token http-client wrap" appears once per operator in
+    // the tessellate logs -- but the operation still fails, because opendal
+    // invokes reqsign's signer BEFORE the request reaches the HTTP client the
+    // wrap replaced. Observed on AKS: 26 wraps enabled and 26 failures in the
+    // same run:
+    //
+    //   called: reqsign::Sign, service: azdls
+    //   => signing http request, source: failed to load signing credential
+    //
+    // The wrap patches a request on its way out; the failure happens before
+    // there is a request to patch.
+    //
+    // The cause is the one the comment below already describes: azdls builds
+    // reqsign's context from a StaticEnv populated solely out of AzdlsConfig,
+    // which has no field able to carry AZURE_FEDERATED_TOKEN_FILE, so
+    // WorkloadIdentityCredentialProvider is structurally blind.
+    //
+    // opendal's azblob service builds the same context with `OsEnv` -- the real
+    // process environment -- so the identical provider resolves the federated
+    // token unaided. An ADLS Gen2 account serves both protocols, so routing
+    // this case through azblob authenticates correctly against the same
+    // storage, using the library's own working path instead of signing by hand.
+    //
+    // Verified against opendal 0.57.0 core/services/{azdls,azblob}/src/backend.rs
+    // and reqsign-azure-storage 3.0.1 provide_credential/{default,workload_identity}.rs.
+    //
+    // The wrap below is now unreachable for workload identity and can be
+    // removed once this route is confirmed in production.
+    let has_static_creds = config.account_key.is_some()
+        || config.sas_token.is_some()
+        || config.client_secret.is_some();
+
+    if !has_static_creds && std::env::var_os("AZURE_FEDERATED_TOKEN_FILE").is_some() {
+        log::info!(
+            "azdls: workload identity detected; routing container {} via the azblob \
+             service so the federated token is visible to the credential chain",
+            path.filesystem
+        );
+        return azdls_config_build_via_azblob(config, path);
+    }
+
     let mut builder = config.clone().into_builder();
 
     if config.endpoint.is_none() {
@@ -255,6 +300,49 @@ fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<o
     }
 
     Ok(op)
+}
+
+/// Builds the operator through the azblob service rather than azdls, for the
+/// workload-identity case. See [`azdls_config_build`] for why.
+///
+/// The container maps to azdls's filesystem, and the endpoint is rewritten from
+/// the DFS host to the Blob host: an ADLS Gen2 account exposes both, but each
+/// speaks only its own API. Addressing the DFS host with Blob requests is
+/// rejected with 400 MissingRequiredHeader -- authentication succeeds and the
+/// write still fails, which is a confusing way to learn this.
+fn azdls_config_build_via_azblob(
+    config: &AzdlsConfig,
+    path: &AzureStoragePath,
+) -> Result<opendal::Operator> {
+    let endpoint = blob_endpoint_for(
+        &config
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| path.as_endpoint()),
+    );
+    let mut builder = opendal::services::Azblob::default()
+        .endpoint(&endpoint)
+        .container(&path.filesystem);
+
+    if let Some(ref account_name) = config.account_name {
+        builder = builder.account_name(account_name);
+    }
+
+    Ok(opendal::Operator::new(builder)?.finish())
+}
+
+/// Rewrites an ADLS Gen2 DFS endpoint to its Blob equivalent.
+///
+/// `https://acct.dfs.core.windows.net` -> `https://acct.blob.core.windows.net`
+///
+/// Only the first `.dfs.` is replaced, so an account whose name happens to
+/// contain "dfs" is left intact. An endpoint that is already a Blob host, or
+/// any other shape, is returned unchanged.
+fn blob_endpoint_for(endpoint: &str) -> String {
+    match endpoint.find(".dfs.") {
+        Some(i) => format!("{}.blob.{}", &endpoint[..i], &endpoint[i + ".dfs.".len()..]),
+        None => endpoint.to_string(),
+    }
 }
 
 /// Represents a fully qualified path to blob/ file in Azure Storage.
@@ -374,7 +462,40 @@ mod tests {
 
     use opendal::services::AzdlsConfig;
 
-    use super::{AzureStoragePath, AzureStorageScheme, azdls_create_operator};
+    use super::{AzureStoragePath, AzureStorageScheme, azdls_create_operator, blob_endpoint_for};
+
+    // The workload-identity path talks to the Blob API, which the DFS host
+    // rejects with 400 MissingRequiredHeader -- authentication succeeds and the
+    // write fails anyway, so this rewrite is load-bearing.
+    #[test]
+    fn test_blob_endpoint_for() {
+        assert_eq!(
+            blob_endpoint_for("https://acct.dfs.core.windows.net"),
+            "https://acct.blob.core.windows.net"
+        );
+        // Already a Blob host: unchanged.
+        assert_eq!(
+            blob_endpoint_for("https://acct.blob.core.windows.net"),
+            "https://acct.blob.core.windows.net"
+        );
+        // Only the first `.dfs.` is rewritten, so an account whose own name
+        // contains "dfs" survives intact.
+        assert_eq!(
+            blob_endpoint_for("https://dfsaccount.dfs.core.windows.net"),
+            "https://dfsaccount.blob.core.windows.net"
+        );
+        // Sovereign clouds carry a different suffix; the rewrite is
+        // suffix-agnostic.
+        assert_eq!(
+            blob_endpoint_for("https://acct.dfs.core.chinacloudapi.cn"),
+            "https://acct.blob.core.chinacloudapi.cn"
+        );
+        // Nothing to rewrite: returned as-is rather than mangled.
+        assert_eq!(
+            blob_endpoint_for("http://127.0.0.1:10000"),
+            "http://127.0.0.1:10000"
+        );
+    }
     use crate::io::azdls_config_parse;
 
     #[test]
